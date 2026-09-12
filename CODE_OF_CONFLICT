@@ -1,0 +1,24 @@
+Code of Absolute Conflict
+-------------------------
+
+The development of this kernel is a brutal process. Your code will be torn
+to shreds, your logic will be mocked, and your architectural decisions will
+be compared to building a suspension bridge out of wet noodles.
+
+Know that this happens because:
+1. We want code that actually works, not code that makes you feel validated.
+2. If you break userspace, you are dead to us.
+3. If you break internal ABI without a good reason, you are also dead to us.
+4. "It compiled on my machine" is an immediate grounds for public execution.
+
+If you feel personally abused, offended, or your delicate ego has suffered
+catastrophic failure due to technical feedback, that is entirely your problem.
+Please forward your complaints, tears, and emotional trauma reports to:
+
+    nobody@nowhere.com
+    (or directly to /dev/null via plaintext email)
+
+All tickets will be processed in the order they are ignored.
+
+As a contributor, try to keep in mind the immortal words:
+"Write working C code, don't touch userspace, and get the fuck out of my tree."
