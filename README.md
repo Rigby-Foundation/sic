@@ -1,79 +1,47 @@
 # sic
 
-A small x86_64 kernel in C, booted by [zaeboot](https://github.com/Rigby-Foundation/zaeboot) over the
-`zaeboot` boot protocol (`include/zaeboot.h`). The C library ([libc](https://github.com/Rigby-Foundation/musl),
-a musl port) and the userland ([ZAE](https://github.com/Rigby-Foundation/zae)) are separate projects; what ties
-them together is the sic system call ABI: `abi/syscall.tbl` (numbers, generated
-into `include/abi/syscall_nr.h` and musl's `bits/syscall.h`) and
-`include/abi/abi.h` (struct layouts and constants).
+sic is a monolithic x86_64 kernel written in C: SMP, preemptive scheduling of
+processes and threads, POSIX signals and pipes, a VFS with tmpfs, its own
+on-disk filesystem (zaefs) and FAT, NVMe/AHCI/IDE disks with GPT and MBR
+partitions, an IPv4 network stack (Ethernet, ARP, ICMP, UDP, TCP, BSD sockets,
+Intel e1000 driver), loadable modules, and a framebuffer/serial console. It
+runs on real hardware, booted by zaeboot from UEFI or legacy BIOS.
 
-Layout: `kernel/{arch/x86_64,mm,fs,drivers,proc,lib,core}` with matching
-`include/` subdirectories; `include/abi/` is the public ABI (syscall table,
-struct layouts, zaefs format) that libc and userland build against.
+It is one of four projects that make up the system, each in its own repo:
 
-What it does today:
+| Repo | Role |
+|------|------|
+| **sic** (this one) | the kernel |
+| [zaeboot](https://github.com/Rigby-Foundation/zaeboot) | bootloader (UEFI and legacy BIOS) that loads the kernel and the initrd |
+| [musl](https://github.com/Rigby-Foundation/musl) | the C library: musl, ported to sic's system call ABI |
+| [ZAE](https://github.com/Rigby-Foundation/zae) | userland: init, shell, tools, ports |
 
-- 64-bit entry (`kernel/arch/x86_64/entry.S`) that sets up its own stack and calls `kernel_main`
-- Framebuffer text console (`kernel/drivers/fb.c`, scaled 8x8 font) + COM1 serial
-- `kprintf` (`%d %u %x %X %p %c %s`, `l` modifier, zero padding)
-- Its own GDT (`kernel/gdt.c`) and IDT with all 32 exception handlers (`kernel/arch/x86_64/idt.c`, `kernel/arch/x86_64/isr.S`)
-- ACPI (`kernel/arch/x86_64/acpi.c`): RSDP -> XSDT/RSDT with checksums, `acpi_find_table()`, MADT
-  parsing (LAPIC address/override, CPUs, IOAPICs, interrupt source overrides)
-- APIC (`kernel/arch/x86_64/apic.c`): LAPIC enabled with spurious vector 0xFF, IOAPIC redirection
-  honouring MADT overrides, LAPIC timer calibrated against the PIT; the 8259 PIC
-  (`kernel/arch/x86_64/pic.c`) is remapped then fully masked, and stays as the fallback path
-- IRQ layer (`kernel/arch/x86_64/idt.c`): `irq_install/irq_mask/irq_unmask` work the same on either
-  controller; 1000 Hz tick (`kernel/arch/x86_64/timer.c`), PS/2 keyboard with echo (`kernel/drivers/keyboard.c`)
-- SMP (`kernel/arch/x86_64/smp.c`, `kernel/arch/x86_64/ap_trampoline.S`, `kernel/arch/x86_64/cpu.c`): APs from the MADT are
-  started with INIT/SIPI through a real-mode trampoline at 0x8000; each CPU has its own
-  GDT/TSS and a per-CPU block reachable via `%gs`; TLB shootdowns via IPI
-- Scheduler (`kernel/proc/sched.c`, `kernel/arch/x86_64/switch.S`): preemptive round-robin over one global
-  run queue shared by all CPUs, 10 ms slices, `task_create/yield/sleep_ms/exit/join/block/wake`,
-  per-CPU idle tasks that reap zombies; preemption happens in the IRQ epilogue after EOI
-- VFS (`kernel/fs/vfs.c`): vnode tree with per-filesystem `vnode_ops`, mount points,
-  refcounted file objects shared across fork, per-process fd tables and cwd. Filesystems:
-  `tmpfs` (`kernel/fs/tmpfs.c`, the root, populated from the USTAR initrd zaeboot loads) and
-  **zaefs** (`kernel/fs/zaefs.c`, sic's on-disk filesystem: 4 KiB blocks, bitmaps, 128-byte
-  inodes with direct/indirect/double-indirect pointers, ext2-style directories, write-through
-  block cache; format in `include/abi/zaefs.h`, shared with `mkfs.zaefs`). `/dev/console`
-  is the keyboard (blocking reads, wake-on-IRQ) + framebuffer/serial output
-- Storage: PCI enumeration (`kernel/drivers/pci.c`), a polled NVMe driver (`kernel/drivers/nvme.c`, admin +
-  one I/O queue pair), and a block layer (`kernel/fs/blkdev.c`) exposing `/dev/nvme0n1` with
-  byte-addressed, seekable reads/writes for user-space tools
-- Loadable kernel modules (`kernel/core/module.c`): an in-kernel ELF64 relocatable linker
-  (`R_X86_64_64/PC32/PLT32/32/32S/PC64`) resolving against the exported symbol table
-  (`EXPORT_SYMBOL` in `kernel/core/ksyms.c`, collected into `.ksymtab` by the linker script);
-  modules live in low identity-mapped memory within ±2 GiB of the kernel. Modules are
-  `modules/<name>/*.c` built to `build/modules/<name>.ko` (`ld.lld -r`) and must define
-  `module_name`, `init_module` and optionally `cleanup_module`. `modules/hello` is the example
-- Processes (`kernel/proc/elf.c`, `kernel/proc/syscall.c`, `kernel/arch/x86_64/syscall_entry.S`): per-process
-  address spaces (user half at `0x8000000000+`, kernel mappings shared), static ELF64 loader
-  with argc/argv on the user stack, `fork` (address-space copy, fd inheritance, child
-  returns through a copied syscall frame), `exec` (image replaced in place), `waitpid`
-  (zombies held until collected), ring 3 entry via `iretq`, syscalls via `syscall`/`sysret`;
-  a faulting process is killed, not the kernel
-- System calls (`kernel/proc/syscall.c`): sic's own numbering with POSIX semantics as musl
-  expects them — read/write/readv/writev, open(at)/close/lseek/(new)fstat(at)/getdents64,
-  mkdir/unlink/rmdir/chdir/getcwd/dup/dup2/dup3/fcntl/ioctl(TIOCGWINSZ)/access, mmap
-  (anonymous)/munmap/brk, fork/execve/wait4/exit_group/getpid/getppid, arch_prctl (TLS),
-  clock_gettime/nanosleep, uname/getrandom, mprotect (real, incl. PROT_EXEC), private file
-  mmap; sic extensions: mount/umount2, init_module/delete_module/query_module. Signals
-  are accepted but not delivered.
-  The initial process stack carries argc/argv/envp/auxv (AT_PHDR, AT_RANDOM, ...).
-  Per-task x87/SSE state (fxsave) and FS_BASE are switched with the task
-- The userland itself (libc, `/bin/sh` and friends) is [ZAE](https://github.com/Rigby-Foundation/zae); the kernel only
-  needs `/bin/init` to exist in the initrd and will run `/bin/test` + `/bin/crash` as a
-  self test when they're present
-- PMM (`kernel/mm/pmm.c`): frame bitmap built from the boot memory map; firmware/loader
-  memory is reclaimed once the kernel is off UEFI's page tables
-- VMM (`kernel/mm/vmm.c`): own 4-level page tables, 2 MiB identity map + higher-half
-  direct map (`HHDM_BASE`) of all RAM (min 4 GiB for MMIO), NX enabled,
-  `vmm_map_page` / `vmm_unmap_page` / `vmm_translate`
-- Heap (`kernel/mm/heap.c`): slab allocator with size classes 16..2048 on 16 KiB slabs,
-  large allocations straight from pages, per-page owner table for O(1) `kfree`;
-  `kmalloc` / `kzalloc` / `krealloc` / `kfree`, plus `heap_alloc_pages` for page-granular needs
-- Boot-time self tests for PMM, VMM, heap, timer, scheduler, SMP, VFS and userspace,
-  then `/bin/init` starts a shell on the console
+The contract between them is sic's system call ABI — deliberately its own
+numbering, not Linux's: `abi/syscall.tbl` (generated into
+`include/abi/syscall_nr.h` and musl's `bits/syscall.h`) and `include/abi/abi.h`
+(structure layouts and constants). sic executables are ELF64 stamped with
+OS/ABI byte `0x53`.
+
+Source layout: `kernel/{arch/x86_64,mm,fs,drivers,proc,lib,core}` with matching
+`include/` subdirectories, `modules/` for loadable modules, `include/abi/` for
+the public ABI.
+
+## Configuring
+
+`configs/defconfig` lists every option (`CONFIG_<NAME>=y|n`): SMP, the
+framebuffer/serial consoles and keyboard, PCI, the NVMe/AHCI (SATA)/legacy IDE
+disk drivers, the network stack and the e1000 NIC driver, the zaefs and FAT
+filesystems, loadable modules, signals, pipes, and the boot-time self tests.
+
+```bash
+make defconfig            # copy it to .config, then edit .config
+make CONFIG_FAT=n         # or override on the command line
+make config               # show the effective configuration
+```
+
+Options select which sources are compiled and are visible to the code as
+`CONFIG_*` macros (`include/generated/config.h`). Turning a subsystem off
+makes its system calls return `ENOSYS`.
 
 ## Building
 
