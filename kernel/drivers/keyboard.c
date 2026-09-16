@@ -7,6 +7,9 @@
 #include "printf.h"
 #include "proc/sched.h"
 #include "spinlock.h"
+#include "proc/wait.h"
+#include "proc/signal.h"
+#include "abi/abi.h"
 #include "fs/vfs.h"
 
 #define KBD_DATA 0x60
@@ -24,14 +27,15 @@ static const char map_upper[128] = {
     'Z','X','C','V','B','N','M','<','>','?', 0,'*', 0,' ',
 };
 
-static int shift, caps;
+static int shift, caps, ctrl;
 
 /* Input ring buffer; one blocked reader at a time is plenty for a console. */
 #define RING 256
 static char ring[RING];
 static volatile uint32_t rhead, rtail;
-static struct task *reader;
 static spinlock_t kbd_lock = SPINLOCK_INIT;
+static struct waitqueue readers = WAITQUEUE_INIT;
+static volatile uint32_t fg_pid;            /* foreground process for ^C (TIOCSPGRP) */
 
 static void push_char(char c)
 {
@@ -40,17 +44,42 @@ static void push_char(char c)
         ring[rhead % RING] = c;
         rhead++;
     }
-    struct task *t = reader;
-    reader = NULL;
     spin_unlock_irqrestore(&kbd_lock, f);
-    if (t)
-        task_wake(t);
+    waitqueue_wake_all(&readers);
 }
 
-/* Block until at least one character is available, then drain up to len. */
-long keyboard_read(char *buf, size_t len)
+#include "drivers/fb.h"
+
+void keyboard_push_char(char c)
+{
+    if (c == 3) {                                       /* ^C from serial */
+        kputs("^C\n");
+        struct task *t = fg_pid ? task_find(fg_pid) : NULL;
+        if (t)
+            task_send_signal(t, SIGINT);
+        return;
+    }
+    if (!fb_is_graphics_mode())
+        kputc(c);                                       /* echo */
+    push_char(c);
+}
+
+static void poll_serial_input(void)
+{
+    while (inb(0x3F8 + 5) & 0x01) {
+        char c = (char)inb(0x3F8);
+        if (c == '\r') c = '\n';
+        if (c == 0x7F) c = '\b';
+        keyboard_push_char(c);
+    }
+}
+
+/* Drain up to len characters. If nonblock is set and no input is available,
+ * returns -EAGAIN. Otherwise blocks until input arrives. Returns -EINTR on signal. */
+long keyboard_read(char *buf, size_t len, int nonblock)
 {
     for (;;) {
+        poll_serial_input();
         uint64_t f = spin_lock_irqsave(&kbd_lock);
         if (rhead != rtail) {
             size_t n = 0;
@@ -61,21 +90,82 @@ long keyboard_read(char *buf, size_t len)
             spin_unlock_irqrestore(&kbd_lock, f);
             return (long)n;
         }
-        reader = task_current();
         spin_unlock_irqrestore(&kbd_lock, f);
-        task_block();
+        if (nonblock)
+            return -EAGAIN;
+        if (wait_event_interruptible(&readers, (poll_serial_input(), rhead != rtail)) != 0)
+            return -EINTR;
     }
+}
+
+int keyboard_poll(struct waitqueue **wq)
+{
+    poll_serial_input();
+    *wq = &readers;
+    return rhead != rtail ? POLLIN : 0;
+}
+
+void keyboard_set_foreground(uint32_t pid) { fg_pid = pid; }
+uint32_t keyboard_get_foreground(void)     { return fg_pid; }
+
+static int e0;
+
+static int kbd_mode = K_XLATE;
+static struct file *kbd_owner;              /* the fd that set K_RAW */
+
+int keyboard_set_mode(struct file *f, int mode)
+{
+    if (mode != K_RAW && mode != K_XLATE)
+        return -EINVAL;
+    uint64_t fl = spin_lock_irqsave(&kbd_lock);
+    kbd_mode = mode;
+    kbd_owner = mode == K_RAW ? f : NULL;
+    shift = ctrl = 0;
+    rhead = rtail = 0;                      /* don't mix cooked and raw bytes */
+    spin_unlock_irqrestore(&kbd_lock, fl);
+    return 0;
+}
+
+int keyboard_get_mode(void) { return kbd_mode; }
+
+/* The raw-mode owner closed (or died): back to cooked characters. */
+void keyboard_release(struct file *f)
+{
+    if (f == kbd_owner)
+        keyboard_set_mode(NULL, K_XLATE);
 }
 
 static void keyboard_irq(struct interrupt_frame *f)
 {
     (void)f;
-    uint8_t sc = inb(KBD_DATA);
-    int released = sc & 0x80;
-    sc &= 0x7F;
+    uint8_t raw = inb(KBD_DATA);
+    if (kbd_mode == K_RAW) {
+        push_char((char)raw);
+        return;
+    }
+    if (raw == 0xE0) {
+        e0 = 1;
+        return;
+    }
+    int released = raw & 0x80;
+    uint8_t sc = raw & 0x7F;
+
+    if (e0) {
+        e0 = 0;
+        if (!released) {
+            switch (sc) {
+            case 0x48: push_char('\033'); push_char('['); push_char('A'); return; /* Up */
+            case 0x50: push_char('\033'); push_char('['); push_char('B'); return; /* Down */
+            case 0x4D: push_char('\033'); push_char('['); push_char('C'); return; /* Right */
+            case 0x4B: push_char('\033'); push_char('['); push_char('D'); return; /* Left */
+            }
+        }
+        return;
+    }
 
     switch (sc) {
     case 0x2A: case 0x36: shift = !released; return;   /* L/R shift */
+    case 0x1D: ctrl = !released; return;               /* ctrl */
     case 0x3A: if (!released) caps = !caps; return;     /* caps lock */
     }
     if (released || sc >= 128)
@@ -84,31 +174,30 @@ static void keyboard_irq(struct interrupt_frame *f)
     char c = map_lower[sc];
     if (!c)
         return;
+    if (ctrl && c == 'c') {                             /* ^C -> SIGINT to the foreground process */
+        kputs("^C\n");
+        struct task *t = fg_pid ? task_find(fg_pid) : NULL;
+        if (t)
+            task_send_signal(t, SIGINT);
+        return;
+    }
     int upper = shift;
     if (caps && c >= 'a' && c <= 'z')
         upper = !upper;
     if (upper)
         c = map_upper[sc];
-    kputc(c);                   /* echo */
+    if (!fb_is_graphics_mode())
+        kputc(c);                   /* echo */
     push_char(c);
 }
 
-static long console_read(struct file *f, void *buf, size_t len)
+
+
+static void serial_irq(struct interrupt_frame *f)
 {
     (void)f;
-    return keyboard_read(buf, len);
+    poll_serial_input();
 }
-
-static long console_write(struct file *f, const void *buf, size_t len)
-{
-    (void)f;
-    const char *s = buf;
-    for (size_t i = 0; i < len; i++)
-        kputc(s[i]);
-    return (long)len;
-}
-
-const struct dev_ops console_ops = { console_read, console_write };
 
 void keyboard_init(void)
 {
@@ -116,4 +205,9 @@ void keyboard_init(void)
         inb(KBD_DATA);
     irq_install(1, keyboard_irq);
     irq_unmask(1);
+
+    outb(0x3F8 + 1, 0x01);      /* COM1 RX interrupt */
+    irq_install(4, serial_irq);
+    irq_unmask(4);
 }
+
