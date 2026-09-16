@@ -19,6 +19,8 @@ syscall_entry:
         push    %rcx                    /* rip */
 
         push    %rax
+        push    %rcx                    /* = user rip */
+        push    %r11                    /* = user rflags */
         push    %rdi
         push    %rsi
         push    %rdx
@@ -36,6 +38,8 @@ syscall_entry:
         mov     %rsp, %rdi
         call    syscall_dispatch
         cli
+        test    %eax, %eax
+        jnz     syscall_return_iret
 
 /* Return to user mode from a struct syscall_frame at %rsp. Also the entry
  * point for a forked child, which gets a copied frame with rax = 0. */
@@ -53,6 +57,8 @@ syscall_return:
         pop     %rdx
         pop     %rsi
         pop     %rdi
+        pop     %r11
+        pop     %rcx
         pop     %rax
 
         pop     %rcx                    /* rip */
@@ -61,6 +67,26 @@ syscall_return:
         pop     %rsp                    /* back onto the user stack */
         swapgs
         sysretq
+
+/* Same frame, but every register is restored exactly (sigreturn). */
+syscall_return_iret:
+        pop     %r15
+        pop     %r14
+        pop     %r13
+        pop     %r12
+        pop     %rbp
+        pop     %rbx
+        pop     %r9
+        pop     %r8
+        pop     %r10
+        pop     %rdx
+        pop     %rsi
+        pop     %rdi
+        pop     %r11
+        pop     %rcx
+        pop     %rax
+        swapgs
+        iretq
 
 /* void fork_return(struct syscall_frame *f): never returns. */
 .global fork_return
