@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 Rigby Foundation
+#
+# sic default configuration. `make defconfig` copies this to .config;
+# without a .config the build uses this file directly.
+# edit .config (or pass CONFIG_FOO=n on the make command line) to change
+# what gets built. Each option is CONFIG_<NAME>=y or =n.
+
+# --- processors -------------------------------------------------------------
+CONFIG_SMP=y            # start the application processors listed in the MADT
+
+# --- console ----------------------------------------------------------------
+CONFIG_FB_CONSOLE=y     # text console on the framebuffer
+CONFIG_SERIAL=y         # COM1 output (and the only console if FB_CONSOLE=n)
+CONFIG_KEYBOARD=y       # PS/2 keyboard -> /dev/console input
+
+# --- buses & storage --------------------------------------------------------
+CONFIG_PCI=y            # PCI enumeration (needed by every PCI driver below)
+CONFIG_NVME=y           # NVMe controllers -> /dev/nvmeXnY  (needs PCI)
+CONFIG_AHCI=y           # SATA (AHCI) controllers -> /dev/sdX (needs PCI)
+CONFIG_IDE=y            # legacy IDE/ATA, PIO -> /dev/hdX (needs PCI)
+
+# --- networking -------------------------------------------------------------
+CONFIG_NET=y            # IPv4 stack, sockets, loopback
+CONFIG_E1000=y          # Intel 8254x (e1000) Ethernet (needs PCI, NET)
+
+# --- filesystems (tmpfs is always built: it is the root) --------------------
+CONFIG_ZAEFS=y          # sic's own on-disk filesystem
+CONFIG_FAT=y            # FAT12/16/32 (read/write, 8.3 + long names read-only)
+
+# --- kernel features --------------------------------------------------------
+CONFIG_MODULES=y        # loadable kernel modules (init_module & co.)
+CONFIG_SIGNALS=y        # POSIX signals; =n makes kill() ENOSYS and faults fatal
+CONFIG_PIPES=y          # pipe2()
+
+# --- debugging --------------------------------------------------------------
+CONFIG_SELFTEST=y       # run the boot-time self tests before starting init

@@ -17,30 +17,103 @@ endif
 BUILD   := build
 TARGET  := $(BUILD)/sic.elf
 
+# --- configuration ------------------------------------------------------------
+# .config holds CONFIG_<NAME>=y/n (see defconfig for the list). Any CONFIG_*
+# variable given on the command line overrides it. include/generated/config.h
+# is produced from the result and included by every kernel source.
+CONFIG_FILE := $(wildcard .config)
+ifeq ($(CONFIG_FILE),)
+CONFIG_FILE := configs/defconfig
+endif
+CONFIG_OVERRIDES := $(foreach v,$(filter CONFIG_%,$(.VARIABLES)),$(if $(filter command line,$(origin $(v))),$(v)=$($(v))))
+cfg = $(strip $(shell python3 scripts/genconfig.py $(CONFIG_FILE) $(CONFIG_OVERRIDES) | grep -q "define $(1) " && echo y))
+CONFIG_SMP        := $(call cfg,CONFIG_SMP)
+CONFIG_FB_CONSOLE := $(call cfg,CONFIG_FB_CONSOLE)
+CONFIG_SERIAL     := $(call cfg,CONFIG_SERIAL)
+CONFIG_KEYBOARD   := $(call cfg,CONFIG_KEYBOARD)
+CONFIG_PCI        := $(call cfg,CONFIG_PCI)
+CONFIG_NVME       := $(call cfg,CONFIG_NVME)
+CONFIG_AHCI       := $(call cfg,CONFIG_AHCI)
+CONFIG_IDE        := $(call cfg,CONFIG_IDE)
+CONFIG_NET        := $(call cfg,CONFIG_NET)
+CONFIG_E1000      := $(call cfg,CONFIG_E1000)
+CONFIG_ZAEFS      := $(call cfg,CONFIG_ZAEFS)
+CONFIG_FAT        := $(call cfg,CONFIG_FAT)
+CONFIG_MODULES    := $(call cfg,CONFIG_MODULES)
+CONFIG_SIGNALS    := $(call cfg,CONFIG_SIGNALS)
+CONFIG_PIPES      := $(call cfg,CONFIG_PIPES)
+CONFIG_SELFTEST   := $(call cfg,CONFIG_SELFTEST)
+
 # Where the other projects (libc, ZAE, zaeboot) find what the kernel provides.
 SYSROOT ?= $(if $(SIC_SYSROOT),$(SIC_SYSROOT),$(HOME)/.sic/sysroot)
 
 CFLAGS  := --target=x86_64-elf -std=c11 -ffreestanding -fno-stack-protector \
            -fno-pic -fno-pie -mno-red-zone -mgeneral-regs-only -mcmodel=small \
-           -fno-asynchronous-unwind-tables -fno-builtin -nostdlib \
-           -O2 -g -Wall -Wextra -Iinclude -DSIC_KERNEL
+           -fno-asynchronous-unwind-tables -fno-builtin -nostdlib -fno-omit-frame-pointer \
+           -O2 -g -Wall -Wextra -Iinclude -DSIC_KERNEL -include generated/config.h $(CFLAGS_EXTRA)
 ASFLAGS := --target=x86_64-elf -g
 LDFLAGS := -T linker.ld -nostdlib -static -z max-page-size=0x1000
 
 # Sources live in kernel/<subsystem>/ (arch/x86_64, mm, fs, drivers, proc, lib, core).
-CSRC := $(shell find kernel -name '*.c')
-SSRC := $(shell find kernel -name '*.S')
+# Optional pieces are listed per config option; everything else is always built.
+OPTIONAL := kernel/arch/x86_64/smp.c kernel/arch/x86_64/ap_trampoline.S \
+            kernel/drivers/fb.c kernel/drivers/font.c kernel/drivers/serial.c kernel/drivers/keyboard.c \
+            kernel/drivers/pci.c kernel/drivers/nvme.c kernel/drivers/ahci.c kernel/drivers/ide.c \
+            kernel/fs/zaefs.c kernel/fs/fat.c \
+            kernel/net/core.c kernel/net/arp.c kernel/net/ip.c kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c \
+            kernel/drivers/e1000.c \
+            kernel/core/module.c kernel/core/ksyms.c kernel/proc/signal.c kernel/fs/pipe.c \
+            kernel/core/selftest.c
+SRC-y :=
+SRC-$(CONFIG_SMP)        += kernel/arch/x86_64/smp.c kernel/arch/x86_64/ap_trampoline.S
+SRC-$(CONFIG_FB_CONSOLE) += kernel/drivers/fb.c kernel/drivers/font.c
+SRC-$(CONFIG_SERIAL)     += kernel/drivers/serial.c
+SRC-$(CONFIG_KEYBOARD)   += kernel/drivers/keyboard.c
+SRC-$(CONFIG_PCI)        += kernel/drivers/pci.c
+SRC-$(CONFIG_NVME)       += kernel/drivers/nvme.c
+SRC-$(CONFIG_AHCI)       += kernel/drivers/ahci.c
+SRC-$(CONFIG_IDE)        += kernel/drivers/ide.c
+SRC-$(CONFIG_NET)        += kernel/net/core.c kernel/net/arp.c kernel/net/ip.c kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c
+SRC-$(CONFIG_E1000)      += kernel/drivers/e1000.c
+SRC-$(CONFIG_ZAEFS)      += kernel/fs/zaefs.c
+SRC-$(CONFIG_FAT)        += kernel/fs/fat.c
+SRC-$(CONFIG_MODULES)    += kernel/core/module.c kernel/core/ksyms.c
+SRC-$(CONFIG_SIGNALS)    += kernel/proc/signal.c
+SRC-$(CONFIG_PIPES)      += kernel/fs/pipe.c
+SRC-$(CONFIG_SELFTEST)   += kernel/core/selftest.c
+ALWAYS := $(filter-out $(OPTIONAL),$(shell find kernel -name '*.c' -o -name '*.S'))
+CSRC := $(filter %.c,$(ALWAYS) $(SRC-y))
+SSRC := $(filter %.S,$(ALWAYS) $(SRC-y))
 OBJS := $(patsubst %.c,$(BUILD)/%.o,$(CSRC)) $(patsubst %.S,$(BUILD)/%.o,$(SSRC))
+CONFIG_H := include/generated/config.h
 
 # Loadable modules: modules/<name>/*.c -> build/modules/<name>.ko (ET_REL, ld -r).
-MODULES  := $(patsubst modules/%,%,$(wildcard modules/*))
+MODULES  := $(if $(CONFIG_MODULES),$(patsubst modules/%,%,$(wildcard modules/*)),)
 MOD_KOS  := $(patsubst %,$(BUILD)/modules/%.ko,$(MODULES))
 MOD_CFLAGS := $(CFLAGS) -fno-common
 
-.PHONY: all clean modules install
+.PHONY: all clean modules install defconfig config
 
 all: $(TARGET) modules
 modules: $(MOD_KOS)
+
+defconfig:
+	cp configs/defconfig .config
+	@echo "wrote .config from configs/defconfig"
+
+# Show the effective configuration.
+config: $(CONFIG_H)
+	@grep -E "define|not set" $(CONFIG_H) | sed 's|/\* \(.*\) is not set \*/|\1=n|; s|#define \(.*\) 1|\1=y|'
+
+# Regenerated on every make (overrides on the command line don't touch any
+# file), but only rewritten when the content changes so objects stay fresh.
+$(CONFIG_H): $(CONFIG_FILE) scripts/genconfig.py Makefile FORCE
+	@mkdir -p $(dir $@)
+	@python3 scripts/genconfig.py $(CONFIG_FILE) $(CONFIG_OVERRIDES) > $@.tmp
+	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@ && echo "config: regenerated $@"; fi
+
+FORCE:
+.PHONY: FORCE
 
 # install: the kernel image, its loadable modules, the public ABI headers and
 # the syscall table (for the libc's generator) into the sysroot.
@@ -59,20 +132,42 @@ $(BUILD)/modules/$(1).ko: $(patsubst modules/%.c,$(BUILD)/modules/%.o,$(wildcard
 endef
 $(foreach m,$(MODULES),$(eval $(call MODULE_RULE,$(m))))
 
-$(BUILD)/modules/%.o: modules/%.c include/module.h
+$(BUILD)/modules/%.o: modules/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(MOD_CFLAGS) -c $< -o $@
+	$(CC) $(MOD_CFLAGS) -MMD -MP -c $< -o $@
 
-$(TARGET): $(OBJS) linker.ld
-	$(LD) $(LDFLAGS) -o $@ $(OBJS)
-
-$(BUILD)/%.o: %.c
+# Two-pass link: the first pass with an empty symbol table fixes every text
+# address (the table itself is data and lands after .text), the second links
+# in the table generated from the first image so crash dumps can name code.
+NM := $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-nm,llvm-nm)
+$(BUILD)/syms0.c:
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	@echo '/* empty first-pass table */' > $@
+	@echo '#include "types.h"' >> $@
+	@echo 'const struct kernel_sym { uint64_t addr; const char *name; } kernel_syms[] = { { 0, 0 } };' >> $@
+	@echo 'const unsigned kernel_sym_count = 0;' >> $@
+$(BUILD)/syms0.o: $(BUILD)/syms0.c $(CONFIG_H)
+	$(CC) $(CFLAGS) -c -o $@ $<
+$(BUILD)/sic-pass1.elf: $(OBJS) $(BUILD)/syms0.o linker.ld
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(BUILD)/syms0.o
+$(BUILD)/syms.c: $(BUILD)/sic-pass1.elf scripts/gensyms.py
+	$(NM) -n $< | python3 scripts/gensyms.py > $@
+$(BUILD)/syms.o: $(BUILD)/syms.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+$(TARGET): $(OBJS) $(BUILD)/syms.o linker.ld
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(BUILD)/syms.o
 
-$(BUILD)/%.o: %.S
+# -MMD writes build/x.d next to each object so header changes (struct
+# layouts!) recompile everything that includes them.
+$(BUILD)/%.o: %.c $(CONFIG_H)
 	@mkdir -p $(dir $@)
-	$(CC) $(ASFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/%.o: %.S $(CONFIG_H)
+	@mkdir -p $(dir $@)
+	$(CC) $(ASFLAGS) -MMD -MP -c $< -o $@
+
+-include $(OBJS:.o=.d) $(patsubst %.ko,%.d,$(MOD_KOS)) $(shell find $(BUILD)/modules -name '*.d' 2>/dev/null)
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD) include/generated
