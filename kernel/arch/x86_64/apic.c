@@ -181,10 +181,12 @@ static uint32_t irq_to_gsi(uint8_t irq, uint32_t *flags)
     return irq;
 }
 
-int ioapic_route_irq(uint8_t irq, uint8_t vector)
+int ioapic_route_irq_flags(uint8_t irq, uint8_t vector, int level_low)
 {
     uint32_t flags;
     uint32_t gsi = irq_to_gsi(irq, &flags);
+    if (level_low)
+        flags = RED_LEVEL | RED_ACTIVE_LOW;
     struct ioapic *io = ioapic_for_gsi(gsi);
     if (!io)
         return -1;
@@ -192,6 +194,11 @@ int ioapic_route_irq(uint8_t irq, uint8_t vector)
     ioapic_write(io, IOAPIC_REDTBL + 2 * e + 1, lapic_id() << 24);          /* physical dest */
     ioapic_write(io, IOAPIC_REDTBL + 2 * e, vector | flags | RED_MASKED);   /* fixed, unmasked later */
     return 0;
+}
+
+int ioapic_route_irq(uint8_t irq, uint8_t vector)
+{
+    return ioapic_route_irq_flags(irq, vector, 0);
 }
 
 static void ioapic_set_mask(uint8_t irq, int masked)

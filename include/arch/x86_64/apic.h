@@ -24,5 +24,6 @@ void     lapic_broadcast_ipi(uint8_t vector);   /* all CPUs except self */
 
 /* Route legacy ISA IRQ `irq` (honouring MADT overrides) to `vector` on this CPU. */
 int      ioapic_route_irq(uint8_t irq, uint8_t vector);
+int      ioapic_route_irq_flags(uint8_t irq, uint8_t vector, int level_low);
 void     ioapic_mask_irq(uint8_t irq);
 void     ioapic_unmask_irq(uint8_t irq);

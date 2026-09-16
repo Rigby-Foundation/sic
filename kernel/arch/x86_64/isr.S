@@ -70,6 +70,15 @@ ISR_NOERR 44
 ISR_NOERR 45
 ISR_NOERR 46
 ISR_NOERR 47
+/* GSIs 16-23 (PCI INTx on the I/O APIC), vectors 48-55 */
+ISR_NOERR 48
+ISR_NOERR 49
+ISR_NOERR 50
+ISR_NOERR 51
+ISR_NOERR 52
+ISR_NOERR 53
+ISR_NOERR 54
+ISR_NOERR 55
 ISR_NOERR 240                          /* TLB shootdown IPI */
 ISR_NOERR 255                          /* LAPIC spurious */
 
@@ -112,6 +121,12 @@ isr_common:
         add     $16, %rsp               /* vector + error code */
         testl   $3, 8(%rsp)
         jz      2f
+        /* Back to ring 3: pin the frame's CS/SS to the user selectors. Real
+         * AMD parts (K8 at least) were seen returning from sysret with an SS
+         * whose RPL isn't 3; the CPU then pushes that on the next interrupt
+         * and iretq refuses it with #GP(SS). QEMU never shows this. */
+        movq    $0x23, 8(%rsp)
+        movq    $0x1B, 32(%rsp)
         swapgs
 2:      iretq
 
