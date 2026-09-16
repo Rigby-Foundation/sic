@@ -5,7 +5,7 @@
 
 #define VFS_NAME_MAX 64
 #define VFS_PATH_MAX 256
-#define MAX_FDS      16
+#define MAX_FDS      64
 
 enum vnode_type { VNODE_FILE = 1, VNODE_DIR = 2, VNODE_DEV = 3 };
 
@@ -13,11 +13,16 @@ struct vnode;
 struct file;
 struct vfs_mount;
 struct dirent;
+struct waitqueue;
 
 /* Character/block device hooks (VNODE_DEV). */
 struct dev_ops {
     long (*read)(struct file *f, void *buf, size_t len);
     long (*write)(struct file *f, const void *buf, size_t len);
+    int  (*poll)(struct file *f, struct waitqueue **wq);   /* optional, see file_ops */
+    long (*ioctl)(struct file *f, long req, uint64_t arg);  /* optional */
+    int  (*mmap)(struct file *f, uint64_t virt, size_t pages, uint64_t off, int prot); /* optional */
+    void (*release)(struct file *f);   /* optional: last reference to an open file dropped */
 };
 
 /* Per-filesystem operations. Directory entries are cached as child vnodes
@@ -45,6 +50,9 @@ struct vnode {
     uint64_t ino;
     uint64_t size;
     void    *priv;                  /* filesystem private data (tmpfs buffer, on-disk inode, ...) */
+    int      is_block;              /* VNODE_DEV backed by a block device */
+    int      is_sock;               /* VNODE_DEV that is a socket (priv = struct socket) */
+    int      seekable;              /* VNODE_DEV with a position (framebuffer, initrd) */
     struct vnode *mounted;          /* a filesystem's root mounted on this directory */
     struct vnode *mountpoint;       /* for a mounted root: the directory it sits on */
 };
@@ -71,11 +79,20 @@ struct fs_type {
 #define O_TRUNC  0x200
 #define O_APPEND 0x400
 
+/* Per-file hooks for objects that aren't plain vnodes (pipes, sockets). */
+struct file_ops {
+    void (*release)(struct file *f);    /* last reference dropped */
+    /* poll: return the POLL* bits that are ready now and, in *wq, the wait
+     * queue that is woken when they change (NULL if the state never changes). */
+    int  (*poll)(struct file *f, struct waitqueue **wq);
+};
+
 struct file {
     struct vnode *node;
     uint64_t pos;
     int      flags;
     int      refs;
+    const struct file_ops *fops;
 };
 
 struct stat {
@@ -118,6 +135,7 @@ void          file_close(struct file *f);
 long          file_read(struct file *f, void *buf, size_t len);
 long          file_write(struct file *f, const void *buf, size_t len);
 long          file_seek(struct file *f, long off, int whence);
+int           file_poll(struct file *f, struct waitqueue **wq);   /* POLL* bits ready now */
 int           file_readdir(struct file *f, size_t index, struct dirent *out);
 void          vnode_stat(struct vnode *n, struct stat *st);
 

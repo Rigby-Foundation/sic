@@ -175,26 +175,29 @@
 228  query_module
 229  reboot
 
+# sockets (CONFIG_NET)
+240  socket
+241  socketpair
+242  bind
+243  listen
+244  accept
+245  accept4
+246  connect
+247  shutdown
+248  getsockname
+249  getpeername
+250  setsockopt
+251  getsockopt
+252  sendto
+253  recvfrom
+254  sendmsg
+255  recvmsg
+
 # reserved names (ENOSYS)
 512  shmget
 513  shmat
 514  shmctl
 515  sendfile
-516  socket
-517  connect
-518  accept
-519  sendto
-520  recvfrom
-521  sendmsg
-522  recvmsg
-523  shutdown
-524  bind
-525  listen
-526  getsockname
-527  getpeername
-528  socketpair
-529  setsockopt
-530  getsockopt
 531  semget
 532  semop
 533  semctl
@@ -320,7 +323,6 @@
 659  fallocate
 660  timerfd_settime
 661  timerfd_gettime
-662  accept4
 663  signalfd4
 664  eventfd2
 665  epoll_create1

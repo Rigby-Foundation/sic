@@ -44,3 +44,24 @@ int strcmp(const char *a, const char *b)
     }
     return (uint8_t)*a - (uint8_t)*b;
 }
+
+void *memmove(void *dst, const void *src, size_t n)
+{
+    uint8_t *d = dst;
+    const uint8_t *s = src;
+    if (d < s || d >= s + n) {
+        while (n--) *d++ = *s++;
+    } else {
+        d += n; s += n;
+        while (n--) *--d = *--s;
+    }
+    return dst;
+}
+
+char *strcpy(char *dst, const char *src)
+{
+    char *r = dst;
+    while ((*dst++ = *src++))
+        ;
+    return r;
+}

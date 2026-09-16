@@ -8,6 +8,7 @@
 #include <stdint.h>
 #endif
 #include "abi/syscall_nr.h"
+#include "abi/fb.h"
 
 /* ELF e_ident[EI_OSABI] for sic executables. The kernel only runs ELFs
  * stamped with this; binaries for other systems fail with ENOEXEC up front
@@ -41,6 +42,10 @@
 #define ENOSYS      38
 #define ENOTEMPTY   39
 #define EBUSY       16
+#define EPIPE       32
+#define ETIMEDOUT  110
+#define ENOTSUP     95
+#define EWOULDBLOCK EAGAIN
 #define ENODEV      19
 #define ENOEXEC      8
 #define E2BIG        7
@@ -65,6 +70,10 @@
 /* ioctl */
 #define TCGETS     0x5401
 #define TIOCGWINSZ 0x5413
+#define BLKRRPART  0x125F
+#define BLKGETSIZE64 0x80081272
+#define TIOCGPGRP  0x540F
+#define TIOCSPGRP  0x5410
 
 struct winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; };
 
@@ -91,6 +100,9 @@ struct abi_stat {
 #define S_IFREG 0100000
 #define S_IFDIR 0040000
 #define S_IFCHR 0020000
+#define S_IFBLK 0060000
+#define S_IFSOCK 0140000
+#define S_IFIFO 0010000
 
 /* getdents64 */
 struct abi_dirent64 {
@@ -151,3 +163,116 @@ struct abi_utsname { char sysname[65], nodename[65], release[65], version[65], m
 #define AT_CLKTCK 17
 #define AT_SECURE 23
 #define AT_RANDOM 25
+
+/* ---- networking (CONFIG_NET) ---------------------------------------------------- */
+/* errno values musl's socket code expects (Linux numbering, as the rest of errno) */
+#define ENOTSOCK        88
+#define EDESTADDRREQ    89
+#define EMSGSIZE        90
+#define ENOPROTOOPT     92
+#define EPROTONOSUPPORT 93
+#define EOPNOTSUPP      95
+#define EAFNOSUPPORT    97
+#define EADDRINUSE      98
+#define EADDRNOTAVAIL   99
+#define ENETUNREACH    101
+#define ECONNABORTED   103
+#define ECONNRESET     104
+#define ENOBUFS        105
+#define EISCONN        106
+#define ENOTCONN       107
+#define ECONNREFUSED   111
+#define EHOSTUNREACH   113
+#define EALREADY       114
+#define EINPROGRESS    115
+
+#define O_NONBLOCK  04000
+
+/* poll */
+#define POLLIN   0x001
+#define POLLPRI  0x002
+#define POLLOUT  0x004
+#define POLLERR  0x008
+#define POLLHUP  0x010
+#define POLLNVAL 0x020
+struct abi_pollfd { int32_t fd; int16_t events; int16_t revents; };
+
+/* sockets: musl's generic bits/socket.h layouts */
+#define AF_UNSPEC 0
+#define AF_UNIX   1
+#define AF_INET   2
+#define SOCK_STREAM   1
+#define SOCK_DGRAM    2
+#define SOCK_RAW      3
+#define SOCK_TYPE_MASK 0xF
+#define SOCK_NONBLOCK 04000
+#define SOCK_CLOEXEC  02000000
+#define IPPROTO_IP   0
+#define IPPROTO_ICMP 1
+#define IPPROTO_TCP  6
+#define IPPROTO_UDP  17
+#define SOL_SOCKET   1
+#define SO_REUSEADDR 2
+#define SO_ERROR     4
+#define SO_BROADCAST 6
+#define SO_SNDBUF    7
+#define SO_RCVBUF    8
+#define SO_KEEPALIVE 9
+#define SO_RCVTIMEO  20
+#define SO_SNDTIMEO  21
+#define SOL_TCP      6
+#define TCP_NODELAY  1
+#define MSG_PEEK     0x02
+#define MSG_DONTWAIT 0x40
+#define MSG_NOSIGNAL 0x4000
+#define SHUT_RD   0
+#define SHUT_WR   1
+#define SHUT_RDWR 2
+
+struct abi_sockaddr_in {
+    uint16_t sin_family;
+    uint16_t sin_port;              /* network byte order */
+    uint32_t sin_addr;              /* network byte order */
+    uint8_t  sin_zero[8];
+};
+
+struct abi_msghdr {                 /* musl x86_64 */
+    uint64_t msg_name;
+    uint32_t msg_namelen, __pad1;
+    uint64_t msg_iov;
+    int32_t  msg_iovlen, __pad2;
+    uint64_t msg_control;
+    uint32_t msg_controllen, __pad3;
+    int32_t  msg_flags;
+};
+
+/* interface configuration: ioctl on any socket with a Linux-shaped ifreq */
+#define IFNAMSIZ 16
+struct abi_ifreq {
+    char ifr_name[IFNAMSIZ];
+    union {
+        struct abi_sockaddr_in ifr_addr;    /* SIOC[GS]IF{ADDR,NETMASK,GATEWAY,BRDADDR} */
+        uint8_t ifr_hwaddr[16];             /* SIOCGIFHWADDR: sa_family(2) + MAC(6) */
+        int16_t ifr_flags;                  /* SIOC[GS]IFFLAGS */
+        int32_t ifr_ifindex;                /* SIOCGIFINDEX, SIOCGIFNAME */
+        int32_t ifr_mtu;                    /* SIOCGIFMTU */
+        uint8_t ifr_pad[24];
+    };
+};
+#define SIOCGIFNAME    0x8910
+#define SIOCGIFFLAGS   0x8913
+#define SIOCSIFFLAGS   0x8914
+#define SIOCGIFADDR    0x8915
+#define SIOCSIFADDR    0x8916
+#define SIOCGIFBRDADDR 0x8919
+#define SIOCGIFNETMASK 0x891b
+#define SIOCSIFNETMASK 0x891c
+#define SIOCGIFMTU     0x8921
+#define SIOCGIFHWADDR  0x8927
+#define SIOCGIFINDEX   0x8933
+#define SIOCGIFGATEWAY 0x89F0       /* sic: default gateway of this interface */
+#define SIOCSIFGATEWAY 0x89F1
+#define IFF_UP        0x1
+#define IFF_BROADCAST 0x2
+#define IFF_LOOPBACK  0x8
+#define IFF_RUNNING   0x40

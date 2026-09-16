@@ -3,6 +3,7 @@
 /* Virtual filesystem: a tree of vnodes, filesystem drivers behind vnode_ops,
  * mount points, and refcounted open files. One big lock for the tree. */
 #include "fs/vfs.h"
+#include "abi/abi.h"
 #include "mm/heap.h"
 #include "string.h"
 #include "printf.h"
@@ -13,7 +14,7 @@ static struct vfs_mount root_mount;
 static struct fs_type *fs_types;
 static spinlock_t vfs_lock = SPINLOCK_INIT;
 
-extern struct fs_type tmpfs_type, zaefs_type;
+extern struct fs_type tmpfs_type, zaefs_type, fat_type;
 
 /* ---- vnode helpers ------------------------------------------------------------ */
 
@@ -152,7 +153,12 @@ static struct fs_type *find_fs(const char *name)
 void vfs_init(void)
 {
     vfs_register_fs(&tmpfs_type);
+#ifdef CONFIG_ZAEFS
     vfs_register_fs(&zaefs_type);
+#endif
+#ifdef CONFIG_FAT
+    vfs_register_fs(&fat_type);
+#endif
     root_mount.type = &tmpfs_type;
     root = tmpfs_type.mount(&root_mount, NULL, NULL);
     root_mount.root = root;
@@ -311,7 +317,11 @@ struct file *file_dup(struct file *f)
 void file_close(struct file *f)
 {
     if (f && __atomic_sub_fetch(&f->refs, 1, __ATOMIC_SEQ_CST) == 0) {
-        if (f->node->ops && f->node->ops->sync)
+        if (f->fops && f->fops->release)
+            f->fops->release(f);
+        else if (f->node->type == VNODE_DEV && f->node->dev && f->node->dev->release)
+            f->node->dev->release(f);
+        else if (f->node->ops && f->node->ops->sync)
             f->node->ops->sync(f->node);
         kfree(f);
     }
@@ -360,6 +370,20 @@ long file_seek(struct file *f, long off, int whence)
         return -1;
     f->pos = (uint64_t)(base + off);
     return (long)f->pos;
+}
+
+/* Readiness for poll(). Plain files and directories never block; devices
+ * with a dev_ops.poll hook report their own state; everything else is
+ * always readable and writable. */
+int file_poll(struct file *f, struct waitqueue **wq)
+{
+    *wq = NULL;
+    if (f->fops && f->fops->poll)
+        return f->fops->poll(f, wq);
+    struct vnode *n = f->node;
+    if (n->type == VNODE_DEV && n->dev && n->dev->poll)
+        return n->dev->poll(f, wq);
+    return POLLIN | POLLOUT;
 }
 
 int file_readdir(struct file *f, size_t index, struct dirent *out)
