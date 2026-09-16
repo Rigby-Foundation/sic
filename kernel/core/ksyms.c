@@ -14,6 +14,8 @@
 #include "drivers/pci.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
+#include "proc/wait.h"
+#include "proc/signal.h"
 
 EXPORT_SYMBOL(kprintf);
 EXPORT_SYMBOL(kputc);
@@ -49,10 +51,20 @@ EXPORT_SYMBOL(timer_ms);
 EXPORT_SYMBOL(irq_install);
 EXPORT_SYMBOL(irq_mask);
 EXPORT_SYMBOL(irq_unmask);
+#ifdef CONFIG_PCI
 EXPORT_SYMBOL(pci_find_class);
 EXPORT_SYMBOL(pci_read32);
 EXPORT_SYMBOL(pci_write32);
 EXPORT_SYMBOL(pci_enable_busmaster);
+#endif
+#ifdef CONFIG_SIGNALS
+EXPORT_SYMBOL(task_send_signal);
+#endif
+EXPORT_SYMBOL(waitqueue_wake_all);
+EXPORT_SYMBOL(__wait_add);
+EXPORT_SYMBOL(__wait_remove);
+EXPORT_SYMBOL(task_block);
+EXPORT_SYMBOL(task_wake);
 EXPORT_SYMBOL(vmm_map_mmio);
 EXPORT_SYMBOL(pmm_alloc_page);
 EXPORT_SYMBOL(pmm_free_page);

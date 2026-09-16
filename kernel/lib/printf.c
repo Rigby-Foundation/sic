@@ -11,8 +11,15 @@ static spinlock_t console_lock = SPINLOCK_INIT;
 
 static void raw_putc(char c)
 {
+#ifdef CONFIG_FB_CONSOLE
     fb_putc(c);
+#endif
+#ifdef CONFIG_SERIAL
     serial_putc(c);
+#endif
+#if !defined(CONFIG_FB_CONSOLE) && !defined(CONFIG_SERIAL)
+    (void)c;
+#endif
 }
 
 void kputc(char c)

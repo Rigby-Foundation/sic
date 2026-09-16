@@ -37,7 +37,7 @@ static long hello_read(struct file *f, void *buf, size_t len)
     return (long)len;
 }
 
-static const struct dev_ops hello_ops = { hello_read, NULL };
+static const struct dev_ops hello_ops = { .read = hello_read };
 
 int init_module(void)
 {
