@@ -142,7 +142,8 @@ static uint64_t unmap_in(uint64_t pml4_phys, uint64_t virt)
     uint64_t *pt   = pd   ? next_level(pd,   IDX(virt, 1), 0, 0) : NULL;
     uint64_t phys = 0;
     if (pt && (pt[IDX(virt, 0)] & PTE_PRESENT)) {
-        phys = pt[IDX(virt, 0)] & PTE_ADDR_MASK;
+        if (!(pt[IDX(virt, 0)] & PTE_DEV))
+            phys = pt[IDX(virt, 0)] & PTE_ADDR_MASK;
         pt[IDX(virt, 0)] = 0;
     }
     spin_unlock(&vmm_lock);
@@ -264,10 +265,12 @@ static void free_table_recursive(uint64_t phys, int level)
         uint64_t e = t[i];
         if (!(e & PTE_PRESENT))
             continue;
-        if (level == 1)
-            pmm_free_page(e & PTE_ADDR_MASK);        /* a user frame */
-        else
+        if (level == 1) {
+            if (!(e & PTE_DEV))
+                pmm_free_page(e & PTE_ADDR_MASK);        /* a user frame */
+        } else {
             free_table_recursive(e & PTE_ADDR_MASK, level - 1);
+        }
     }
     pmm_free_page(phys);
 }
@@ -300,6 +303,14 @@ uint64_t vmm_clone_address_space(uint64_t src)
                     if (!(pt[l] & PTE_PRESENT)) continue;
                     uint64_t virt = ((uint64_t)i << 39) | ((uint64_t)j << 30) |
                                     ((uint64_t)k << 21) | ((uint64_t)l << 12);
+                    if (pt[l] & PTE_DEV) {
+                        uint64_t flags = pt[l] & (PTE_WRITE | PTE_NX | PTE_USER | PTE_DEV);
+                        if (vmm_map_user_page(dst, virt, pt[l] & PTE_ADDR_MASK, flags) != 0) {
+                            vmm_destroy_address_space(dst);
+                            return 0;
+                        }
+                        continue;
+                    }
                     uint64_t phys = pmm_alloc_page();
                     if (!phys) {
                         vmm_destroy_address_space(dst);

@@ -29,6 +29,7 @@
 #define PTE_PCD     (1UL << 4)
 #define PTE_HUGE    (1UL << 7)
 #define PTE_GLOBAL  (1UL << 8)
+#define PTE_DEV     (1UL << 9)
 #define PTE_NX      (1UL << 63)
 #define PTE_ADDR_MASK 0x000FFFFFFFFFF000UL
 

@@ -13,7 +13,7 @@
 #include "types.h"
 
 #define ZAEBOOT_MAGIC   0x00544F4F4245415AULL   /* "ZAEBOOT\0" */
-#define ZAEBOOT_VERSION 2
+#define ZAEBOOT_VERSION 3
 
 enum zaeboot_mem_type {
     ZAEBOOT_MEM_USABLE           = 1,
@@ -63,4 +63,12 @@ struct zaeboot_info {
     /* v2+: optional initial ramdisk (USTAR), 0/0 if absent. Check `size`. */
     uint64_t initrd_addr;
     uint64_t initrd_size;
+
+    /* v3+: which firmware we came from (ZAEBOOT_FW_*). */
+    uint32_t firmware;
+    uint32_t reserved;
 } __attribute__((packed));
+
+#define ZAEBOOT_FW_UNKNOWN 0
+#define ZAEBOOT_FW_UEFI    1
+#define ZAEBOOT_FW_BIOS    2
