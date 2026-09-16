@@ -4,5 +4,9 @@
 #include "types.h"
 
 void     smp_init(void);            /* start every AP listed in the MADT */
+#ifdef CONFIG_SMP
 uint32_t smp_cpu_count(void);       /* CPUs online */
+#else
+static inline uint32_t smp_cpu_count(void) { return 1; }
+#endif
 void     smp_ap_ready(void);        /* called by each AP once it can schedule */

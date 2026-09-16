@@ -10,6 +10,7 @@
 #include "string.h"
 #include "printf.h"
 #include "spinlock.h"
+#include "proc/futex.h"
 
 #define STACK_PAGES 16      /* 64 KiB: filesystem code keeps 4 KiB blocks on the stack */
 #define TIME_SLICE  (TIMER_HZ / 100)     /* 10 ms */
@@ -18,7 +19,7 @@ extern void switch_context(uint64_t *old_rsp, uint64_t new_rsp);
 extern void task_trampoline(void);
 extern char stack_top[];                 /* boot stack, entry.S */
 
-static struct task boot_task = { .id = 0, .name = "main", .state = TASK_RUNNING };
+static struct task boot_task = { .id = 0, .tgid = 0, .name = "main", .state = TASK_RUNNING };
 static struct task *all_tasks = &boot_task;
 static struct task *rq_head, *rq_tail;
 static uint32_t next_id = 1;
@@ -72,9 +73,10 @@ static void reap_zombies(void)
             if (cpus[i].current == t)
                 busy = 1;
         /* User zombies wait to be collected by their parent (waitpid, or
-         * task_collect_child from the kernel), unless the parent is gone. */
+         * task_collect_child from the kernel), unless the parent is gone.
+         * Threads are not waitable and go straight away. */
         int waiting_parent = 0;
-        if (t->state == TASK_ZOMBIE && t->is_user && !t->reaped)
+        if (t->state == TASK_ZOMBIE && t->is_user && !t->is_thread && !t->reaped)
             for (struct task *p = all_tasks; p; p = p->next)
                 if (p->id == t->parent_id && p->state != TASK_ZOMBIE)
                     waiting_parent = 1;
@@ -92,10 +94,9 @@ static void reap_zombies(void)
     while (dead) {
         struct task *t = dead;
         dead = t->next;
-        for (int i = 0; i < MAX_FDS; i++)
-            file_close(t->files[i]);
-        if (t->is_user)
-            vmm_destroy_address_space(t->pml4);
+        fdt_put(t->fdt);
+        signal_release(t);
+        mm_put(t->mm);
         if (t->stack)
             heap_free_pages(t->stack, t->stack_pages);
         kfree(t);
@@ -104,9 +105,20 @@ static void reap_zombies(void)
 
 static void wake_sleepers(uint64_t now)
 {
-    for (struct task *t = all_tasks; t; t = t->next)
+    for (struct task *t = all_tasks; t; t = t->next) {
         if (t->state == TASK_SLEEPING && t->wake_at <= now)
             rq_push(t);
+#ifdef CONFIG_SIGNALS
+        if (t->alarm_at && t->alarm_at <= now && t->state != TASK_ZOMBIE) {
+            t->alarm_at = t->alarm_interval ? now + t->alarm_interval : 0;
+            __atomic_fetch_or(&t->sig_pending, 1UL << (SIGALRM - 1), __ATOMIC_SEQ_CST);
+            if (t->state == TASK_SLEEPING || t->state == TASK_BLOCKED)
+                rq_push(t);
+            else
+                t->wake_pending = 1;
+        }
+#endif
+    }
 }
 
 /* ---- core switch (sched_lock held, interrupts off) ---------------------------------- */
@@ -184,6 +196,11 @@ struct task *task_alloc_reserve(const char *name, task_entry_t entry, void *arg,
     t->kstack_top = (uint64_t)t->stack + STACK_PAGES * 4096;
     t->pml4 = vmm_kernel_pml4();
     memcpy(t->fpu, fpu_initial_state, sizeof(t->fpu));
+    if (signal_init_task(t) != 0) {
+        heap_free_pages(t->stack, STACK_PAGES);
+        kfree(t);
+        return NULL;
+    }
 
     size_t n = strlen(name);
     if (n >= sizeof(t->name))
@@ -209,6 +226,8 @@ void task_start(struct task *t)
 {
     uint64_t f = spin_lock_irqsave(&sched_lock);
     t->id = next_id++;
+    if (!t->is_thread)
+        t->tgid = t->id;
     t->next = all_tasks;
     all_tasks = t;
     rq_push(t);
@@ -278,6 +297,11 @@ void task_yield(void)
 void task_sleep_ms(uint64_t ms)
 {
     uint64_t f = spin_lock_irqsave(&sched_lock);
+    if (CUR->wake_pending) {                /* a wake raced ahead of us: don't sleep */
+        CUR->wake_pending = 0;
+        spin_unlock_irqrestore(&sched_lock, f);
+        return;
+    }
     CUR->wake_at = timer_ticks() + (ms * TIMER_HZ + 999) / 1000;
     CUR->state = TASK_SLEEPING;
     schedule();
@@ -314,12 +338,20 @@ struct task *task_find(uint32_t id)
     return NULL;
 }
 
+void task_foreach(void (*fn)(struct task *t, void *arg), void *arg)
+{
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    for (struct task *t = all_tasks; t; t = t->next)
+        fn(t, arg);
+    spin_unlock_irqrestore(&sched_lock, f);
+}
+
 long task_collect_child(long pid, int *status)
 {
     uint64_t f = spin_lock_irqsave(&sched_lock);
     long ret = -1;
     for (struct task *t = all_tasks; t; t = t->next) {
-        if (t->parent_id != CUR->id || t->reaped || t == CUR)
+        if (t->parent_id != CUR->tgid || t->reaped || t == CUR || t->is_thread)
             continue;
         if (pid > 0 && t->id != (uint32_t)pid)
             continue;
@@ -335,10 +367,26 @@ long task_collect_child(long pid, int *status)
     return ret;
 }
 
+/* CLONE_CHILD_CLEARTID: tell a joiner we're gone. */
+static void clear_child_tid(struct task *t)
+{
+    if (!t->clear_child_tid || !t->mm)
+        return;
+    uint64_t phys = vmm_translate_in(t->mm->pml4, t->clear_child_tid);
+    if (phys) {
+        *(volatile uint32_t *)P2V(phys) = 0;
+        futex_wake_phys(phys, 1);
+    }
+}
+
 void task_exit_code(int code)
 {
+    struct task *t = CUR;
+    if (t->is_user && !t->is_thread && !t->group_exit)
+        task_exit_group(code);              /* the leader leaving ends the process */
+    clear_child_tid(t);
     spin_lock_irqsave(&sched_lock);
-    CUR->exit_code = code;
+    t->exit_code = code;
     CUR->state = TASK_ZOMBIE;
     schedule();
     kprintf("sched: zombie %s resumed?!\n", CUR->name);
@@ -346,6 +394,49 @@ void task_exit_code(int code)
 }
 
 void task_exit(void) { task_exit_code(0); }
+
+static void group_exit_cb(struct task *t, void *arg)
+{
+    struct task *self = arg;
+    if (t == self || t->tgid != self->tgid || t->state == TASK_ZOMBIE || t->group_exit)
+        return;
+    t->exit_code = self->exit_code;
+    t->group_exit = 1;
+    if (t->state == TASK_SLEEPING || t->state == TASK_BLOCKED)
+        rq_push(t);                         /* interrupt whatever it's waiting on */
+    else
+        t->wake_pending = 1;
+}
+
+/* exec: everyone else in the group must go, but we carry on. */
+void task_kill_other_threads(void)
+{
+    struct task *self = CUR;
+    task_foreach(group_exit_cb, self);
+}
+
+void task_exit_group(int code)
+{
+    struct task *self = CUR;
+    self->exit_code = code;
+    self->group_exit = 1;
+    task_foreach(group_exit_cb, self);
+#ifdef CONFIG_SIGNALS
+    if (self->is_user) {
+        struct task *parent = task_find(self->parent_id);
+        if (parent && parent->is_user && parent->state != TASK_ZOMBIE)
+            task_send_signal(parent, SIGCHLD);
+    }
+#endif
+    /* The leader's zombie is what the parent waits for; a thread that called
+     * exit_group ends itself here, and the leader dies at its next delivery point. */
+    clear_child_tid(self);
+    spin_lock_irqsave(&sched_lock);
+    self->state = TASK_ZOMBIE;
+    schedule();
+    kprintf("sched: zombie %s resumed?!\n", CUR->name);
+    for (;;) __asm__ volatile("cli; hlt");
+}
 
 int task_alive(uint32_t id)
 {

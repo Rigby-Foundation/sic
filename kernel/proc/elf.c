@@ -16,6 +16,7 @@
 #include "arch/x86_64/cpu.h"
 #include "string.h"
 #include "printf.h"
+#include "spinlock.h"
 
 struct elf64_ehdr {
     uint8_t  ident[16];
@@ -48,8 +49,10 @@ static int map_zeroed(uint64_t pml4, uint64_t virt, size_t pages, uint64_t flags
 {
     for (size_t i = 0; i < pages; i++) {
         uint64_t phys = pmm_alloc_page();
-        if (!phys)
+        if (!phys) {
+            kprintf("%s: out of physical memory (%lu/%lu pages used)\n", task_current()->name, pmm_used_pages(), pmm_total_pages());
             return -1;
+        }
         memset(P2V(phys), 0, PAGE_SIZE);
         int rc = vmm_map_user_page(pml4, virt + i * PAGE_SIZE, phys, flags);
         if (rc == -2)                       /* already mapped: keep the existing page */
@@ -69,13 +72,13 @@ static uint64_t prot_to_pte(int prot)
 
 int process_map_anon(struct task *t, uint64_t virt, size_t pages, int prot)
 {
-    return map_zeroed(t->pml4, virt, pages, prot_to_pte(prot));
+    return map_zeroed(t->mm->pml4, virt, pages, prot_to_pte(prot));
 }
 
 int process_protect(struct task *t, uint64_t virt, size_t pages, int prot)
 {
     for (size_t i = 0; i < pages; i++)
-        if (vmm_protect_user_page(t->pml4, virt + i * PAGE_SIZE, prot_to_pte(prot)) != 0)
+        if (vmm_protect_user_page(t->mm->pml4, virt + i * PAGE_SIZE, prot_to_pte(prot)) != 0)
             return -1;
     return 0;
 }
@@ -83,7 +86,7 @@ int process_protect(struct task *t, uint64_t virt, size_t pages, int prot)
 void process_unmap(struct task *t, uint64_t virt, size_t pages)
 {
     for (size_t i = 0; i < pages; i++) {
-        uint64_t phys = vmm_unmap_user_page(t->pml4, virt + i * PAGE_SIZE);
+        uint64_t phys = vmm_unmap_user_page(t->mm->pml4, virt + i * PAGE_SIZE);
         if (phys)
             pmm_free_page(phys);
     }
@@ -306,13 +309,21 @@ static void set_name(struct task *t, const char *path)
     memcpy(t->name, base, n);
 }
 
-static void apply_image(struct task *t, const struct image *im)
+/* Give `t` a fresh mm for `im`; returns the old mm (to be put) or NULL. */
+static struct mm *apply_image(struct task *t, const struct image *im)
 {
-    t->pml4 = im->pml4;
-    t->brk_start = t->brk_end = im->brk;
-    t->mmap_next = MMAP_BASE;
+    struct mm *mm = mm_create(im->pml4);
+    if (!mm)
+        return NULL;
+    mm->brk_start = mm->brk_end = im->brk;
+    mm->mmap_next = MMAP_BASE;
+    struct mm *old = t->mm;
+    t->mm = mm;
+    t->pml4 = mm->pml4;
     t->fs_base = 0;
+    t->clear_child_tid = 0;
     memcpy(t->fpu, fpu_initial_state, sizeof(t->fpu));
+    return old;
 }
 
 /* ---- spawn -------------------------------------------------------------------------- */
@@ -357,13 +368,23 @@ struct task *process_spawn(const char *path, const char *const argv[], const cha
         return NULL;
     }
     set_name(t, path);
-    apply_image(t, &im);
+    t->fdt = fdt_create();
+    apply_image(t, &im);                /* a fresh task has no old mm to return */
+    if (!t->fdt || !t->mm) {
+        if (!t->mm) vmm_destroy_address_space(im.pml4); else mm_put(t->mm);
+        fdt_put(t->fdt);
+        signal_release(t);
+        heap_free_pages(t->stack, t->stack_pages);
+        kfree(t);
+        kfree(sa);
+        return NULL;
+    }
     t->is_user = 1;
-    t->parent_id = task_current()->id;
+    t->parent_id = task_current()->tgid;
     t->cwd = vfs_root();
-    t->files[0] = vfs_open(vfs_root(), "/dev/console", O_RDONLY);
-    t->files[1] = vfs_open(vfs_root(), "/dev/console", O_WRONLY);
-    t->files[2] = vfs_open(vfs_root(), "/dev/console", O_WRONLY);
+    t->fdt->files[0] = vfs_open(vfs_root(), "/dev/console", O_RDONLY);
+    t->fdt->files[1] = vfs_open(vfs_root(), "/dev/console", O_WRONLY);
+    t->fdt->files[2] = vfs_open(vfs_root(), "/dev/console", O_WRONLY);
     task_start(t);
     return t;
 }
@@ -389,13 +410,23 @@ long process_exec(const char *path, const char *const argv[], const char *const 
     if (rc != 0)
         return rc;
 
-    /* Point of no return: swap address spaces and restart in user mode. */
-    uint64_t old = t->pml4;
+    /* Point of no return: swap address spaces and restart in user mode.
+     * Other threads of the process, if any, are told to exit. */
     set_name(t, path);
-    apply_image(t, &im);
+    struct mm *old = apply_image(t, &im);
+    if (!t->mm || t->mm->pml4 != im.pml4) {
+        vmm_destroy_address_space(im.pml4);
+        return -ENOMEM;
+    }
+    task_kill_other_threads();
+    if (t->is_thread) {
+        t->is_thread = 0;               /* the exec'ing thread becomes the process */
+        t->tgid = t->id;
+    }
+    signal_exec(t);
     write_cr3(im.pml4);
     wrmsr(MSR_FS_BASE, 0);
-    vmm_destroy_address_space(old);
+    mm_put(old);
     enter_usermode(im.entry, rsp, 0, 0);
 }
 
@@ -411,35 +442,99 @@ long process_fork(struct syscall_frame *f)
 {
     struct task *parent = task_current();
 
-    uint64_t pml4 = vmm_clone_address_space(parent->pml4);
+    uint64_t pml4 = vmm_clone_address_space(parent->mm->pml4);
     if (!pml4)
         return -ENOMEM;
-
-    struct task *child = task_alloc_reserve(parent->name, fork_thunk, NULL, sizeof(struct syscall_frame));
-    if (!child) {
-        vmm_destroy_address_space(pml4);
+    struct mm *mm = mm_create(pml4);
+    struct task *child = mm ? task_alloc_reserve(parent->name, fork_thunk, NULL, sizeof(struct syscall_frame)) : NULL;
+    struct fdtable *fdt = child ? fdt_clone(parent->fdt) : NULL;
+    if (!mm || !child || !fdt || signal_fork(child, parent) != 0) {
+        if (fdt) fdt_put(fdt);
+        if (child) { signal_release(child); heap_free_pages(child->stack, child->stack_pages); kfree(child); }
+        if (mm) mm_put(mm); else vmm_destroy_address_space(pml4);
         return -ENOMEM;
     }
+    spin_lock(&parent->mm->lock);
+    mm->brk_start = parent->mm->brk_start;
+    mm->brk_end = parent->mm->brk_end;
+    mm->mmap_next = parent->mm->mmap_next;
+    spin_unlock(&parent->mm->lock);
 
     /* The child resumes right after the syscall instruction with rax = 0. */
     struct syscall_frame *cf = (struct syscall_frame *)(child->kstack_top - sizeof(*cf));
     *cf = *f;
     cf->rax = 0;
 
+    child->mm = mm;
     child->pml4 = pml4;
+    child->fdt = fdt;
     child->is_user = 1;
-    child->parent_id = parent->id;
+    child->parent_id = parent->tgid;
     child->cwd = parent->cwd;
     child->fs_base = parent->fs_base;
-    child->brk_start = parent->brk_start;
-    child->brk_end = parent->brk_end;
-    child->mmap_next = parent->mmap_next;
+    child->clear_child_tid = 0;
     fpu_save(parent->fpu);                  /* the parent's live state is in the registers */
     memcpy(child->fpu, parent->fpu, sizeof(child->fpu));
-    for (int i = 0; i < MAX_FDS; i++)
-        if (parent->files[i])
-            child->files[i] = file_dup(parent->files[i]);
 
     task_start(child);
     return child->id;
+}
+
+/* ---- clone (threads) ---------------------------------------------------------------- */
+
+#define CLONE_VM             0x00000100
+#define CLONE_FS             0x00000200
+#define CLONE_FILES          0x00000400
+#define CLONE_SIGHAND        0x00000800
+#define CLONE_THREAD         0x00010000
+#define CLONE_SETTLS         0x00080000
+#define CLONE_PARENT_SETTID  0x00100000
+#define CLONE_CHILD_CLEARTID 0x00200000
+#define CLONE_CHILD_SETTID   0x01000000
+
+long process_clone(struct syscall_frame *f, uint64_t flags, uint64_t stack, uint64_t ptid, uint64_t ctid, uint64_t tls)
+{
+    struct task *parent = task_current();
+    if (!(flags & CLONE_VM))
+        return process_fork(f);         /* plain clone(SIGCHLD) is fork */
+    if (!(flags & CLONE_THREAD) || !stack)
+        return -EINVAL;                 /* shared-VM non-thread clones: not supported */
+
+    struct task *t = task_alloc_reserve(parent->name, fork_thunk, NULL, sizeof(struct syscall_frame));
+    if (!t)
+        return -ENOMEM;
+    signal_release(t);                  /* task_alloc gave it a private sighand */
+
+    struct syscall_frame *cf = (struct syscall_frame *)(t->kstack_top - sizeof(*cf));
+    *cf = *f;
+    cf->rax = 0;
+    cf->rsp = stack;
+
+    t->mm = mm_get(parent->mm);
+    t->pml4 = t->mm->pml4;
+    t->fdt = (flags & CLONE_FILES) ? fdt_get(parent->fdt) : fdt_clone(parent->fdt);
+    if (flags & CLONE_SIGHAND)
+        signal_clone(t, parent);
+    else if (signal_fork(t, parent) != 0) {
+        mm_put(t->mm); fdt_put(t->fdt); heap_free_pages(t->stack, t->stack_pages); kfree(t);
+        return -ENOMEM;
+    }
+    t->is_user = 1;
+    t->is_thread = 1;
+    t->tgid = parent->tgid;
+    t->parent_id = parent->parent_id;
+    t->cwd = parent->cwd;
+    t->fs_base = (flags & CLONE_SETTLS) ? tls : parent->fs_base;
+    t->clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? ctid : 0;
+    fpu_save(parent->fpu);
+    memcpy(t->fpu, parent->fpu, sizeof(t->fpu));
+
+    task_start(t);                      /* assigns the tid */
+    if ((flags & CLONE_PARENT_SETTID) && ptid >= USER_BASE && ptid + 4 <= USER_END &&
+        vmm_translate_in(parent->mm->pml4, ptid))
+        *(volatile uint32_t *)ptid = t->id;
+    if ((flags & CLONE_CHILD_SETTID) && ctid >= USER_BASE && ctid + 4 <= USER_END &&
+        vmm_translate_in(parent->mm->pml4, ctid))
+        *(volatile uint32_t *)ctid = t->id;
+    return t->id;
 }
