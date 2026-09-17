@@ -56,8 +56,12 @@
 /* open flags (O_RDONLY/O_WRONLY/O_RDWR/O_CREAT/O_TRUNC/O_APPEND are in vfs.h with the same values) */
 #define O_ACCMODE   03
 #define O_EXCL      0200
-#define O_DIRECTORY 0200000
 #define O_CLOEXEC   02000000
+#ifdef __powerpc__
+#define O_DIRECTORY 040000
+#else
+#define O_DIRECTORY 0200000
+#endif
 
 /* fcntl */
 #define F_DUPFD         0
@@ -67,20 +71,44 @@
 #define F_SETFL         4
 #define F_DUPFD_CLOEXEC 1030
 
-/* ioctl */
+/* ioctl: the tty and block numbers are _IOC()-encoded, and PowerPC encodes
+ * them differently (13 size bits, direction bits NONE=1 READ=2 WRITE=4). */
+#ifdef __powerpc__
+#define TCGETS     0x402C7413
+#define TIOCGWINSZ 0x40087468
+#define BLKRRPART  0x2000125F
+#define BLKGETSIZE64 0x40041272
+#define TIOCGPGRP  0x40047477
+#define TIOCSPGRP  0x80047476
+#else
 #define TCGETS     0x5401
 #define TIOCGWINSZ 0x5413
 #define BLKRRPART  0x125F
 #define BLKGETSIZE64 0x80081272
 #define TIOCGPGRP  0x540F
 #define TIOCSPGRP  0x5410
+#endif
 
 struct winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; };
 
 /* stat: musl arch/x86_64/bits/stat.h, 144 bytes */
+/* musl's struct timespec: 64-bit time_t everywhere (sic's ABI is
+ * time64-only, the *_time64 syscall spellings don't exist), tv_nsec a long
+ * padded to 8 bytes with the padding on the big-endian side. */
+#if BITS_PER_LONG == 64
 struct abi_timespec { int64_t tv_sec; int64_t tv_nsec; };
+struct abi_timeval  { int64_t tv_sec; int64_t tv_usec; };
+struct abi_ktimeval { int64_t tv_sec; int64_t tv_usec; };     /* same thing on 64-bit */
+#else
+struct abi_timespec { int64_t tv_sec; int32_t __pad; int32_t tv_nsec; };
+struct abi_timeval  { int64_t tv_sec; int32_t tv_usec; int32_t __pad; };
+/* The interfaces musl still speaks to a 32-bit kernel in native longs
+ * (setitimer/getitimer, SO_RCVTIMEO/SO_SNDTIMEO): two words per timeval. */
+struct abi_ktimeval  { long tv_sec, tv_usec; };
+#endif
 
-struct abi_stat {
+#if defined(__x86_64__)
+struct abi_stat {                       /* musl arch/x86_64/bits/stat.h, 144 bytes */
     uint64_t st_dev;
     uint64_t st_ino;
     uint64_t st_nlink;
@@ -95,6 +123,27 @@ struct abi_stat {
     struct abi_timespec st_atim, st_mtim, st_ctim;
     int64_t  __unused[3];
 };
+#elif defined(__powerpc__)
+struct abi_stat {                       /* musl arch/powerpc/kstat.h, 104 bytes */
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint32_t st_mode;
+    uint32_t st_nlink;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint64_t st_rdev;
+    int16_t  __rdev_pad;
+    int16_t  __pad0[3];
+    int64_t  st_size;
+    int32_t  st_blksize;
+    int32_t  __pad1;
+    int64_t  st_blocks;
+    int32_t  st_atime_sec, st_atime_nsec;
+    int32_t  st_mtime_sec, st_mtime_nsec;
+    int32_t  st_ctime_sec, st_ctime_nsec;
+    uint32_t __unused[2];
+};
+#endif
 
 #define S_IFMT  0170000
 #define S_IFREG 0100000
@@ -116,7 +165,7 @@ struct abi_dirent64 {
 #define DT_REG 8
 #define DT_CHR 2
 
-struct abi_iovec { uint64_t iov_base; uint64_t iov_len; };
+struct abi_iovec { unsigned long iov_base; unsigned long iov_len; };
 
 struct abi_utsname { char sysname[65], nodename[65], release[65], version[65], machine[65], domainname[65]; };
 
@@ -218,8 +267,13 @@ struct abi_pollfd { int32_t fd; int16_t events; int16_t revents; };
 #define SO_SNDBUF    7
 #define SO_RCVBUF    8
 #define SO_KEEPALIVE 9
+#ifdef __powerpc__
+#define SO_RCVTIMEO  18
+#define SO_SNDTIMEO  19
+#else
 #define SO_RCVTIMEO  20
 #define SO_SNDTIMEO  21
+#endif
 #define SOL_TCP      6
 #define TCP_NODELAY  1
 #define MSG_PEEK     0x02
@@ -236,13 +290,13 @@ struct abi_sockaddr_in {
     uint8_t  sin_zero[8];
 };
 
-struct abi_msghdr {                 /* musl x86_64 */
-    uint64_t msg_name;
-    uint32_t msg_namelen, __pad1;
-    uint64_t msg_iov;
-    int32_t  msg_iovlen, __pad2;
-    uint64_t msg_control;
-    uint32_t msg_controllen, __pad3;
+struct abi_msghdr {                 /* musl: pointers and ints, naturally aligned */
+    unsigned long msg_name;
+    uint32_t msg_namelen;
+    unsigned long msg_iov;
+    int32_t  msg_iovlen;
+    unsigned long msg_control;
+    uint32_t msg_controllen;
     int32_t  msg_flags;
 };
 

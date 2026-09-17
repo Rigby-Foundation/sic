@@ -291,7 +291,6 @@
 #define SYS_unshare 649
 #define SYS_splice 650
 #define SYS_tee 651
-#define SYS_sync_file_range 652
 #define SYS_vmsplice 653
 #define SYS_move_pages 654
 #define SYS_epoll_pwait 655

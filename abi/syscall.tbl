@@ -313,7 +313,6 @@
 649  unshare
 650  splice
 651  tee
-652  sync_file_range
 653  vmsplice
 654  move_pages
 655  epoll_pwait

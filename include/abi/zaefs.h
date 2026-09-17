@@ -74,3 +74,40 @@ struct zaefs_dirent {
 };
 
 #define ZAEFS_DIRENT_SIZE(name_len) (((8 + (name_len)) + 7) & ~7u)
+
+/* Byte order: the disk is little-endian. On a big-endian CPU the kernel and
+ * the tools swap the superblock and inodes at the disk boundary with these
+ * (each swap is its own inverse); dirents and block pointers are handled
+ * field by field where they are read. */
+#define ZAEFS_HOST_IS_BE (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+
+static inline uint16_t zaefs_bswap16(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
+static inline uint32_t zaefs_bswap32(uint32_t v) { return __builtin_bswap32(v); }
+static inline uint64_t zaefs_bswap64(uint64_t v) { return __builtin_bswap64(v); }
+
+static inline void zaefs_sb_swap(struct zaefs_superblock *sb)
+{
+    sb->magic = zaefs_bswap64(sb->magic);
+    sb->version = zaefs_bswap32(sb->version);
+    sb->block_size = zaefs_bswap32(sb->block_size);
+    uint64_t *f = &sb->total_blocks;
+    for (int i = 0; i < 12; i++) f[i] = zaefs_bswap64(f[i]);      /* total_blocks .. root_ino */
+}
+
+static inline void zaefs_inode_swap(struct zaefs_inode *di)
+{
+    di->type = zaefs_bswap16(di->type);
+    di->links = zaefs_bswap16(di->links);
+    di->mode = zaefs_bswap32(di->mode);
+    di->size = zaefs_bswap64(di->size);
+    di->ctime = zaefs_bswap64(di->ctime);
+    di->mtime = zaefs_bswap64(di->mtime);
+    di->nblocks = zaefs_bswap32(di->nblocks);
+    for (int i = 0; i < ZAEFS_NDIRECT; i++) di->direct[i] = zaefs_bswap32(di->direct[i]);
+    di->indirect = zaefs_bswap32(di->indirect);
+    di->dindirect = zaefs_bswap32(di->dindirect);
+}
+
+/* Host <-> disk for the superblock and an inode: a no-op on little-endian CPUs. */
+#define ZAEFS_SB_SWAP(sb)    do { if (ZAEFS_HOST_IS_BE) zaefs_sb_swap(sb); } while (0)
+#define ZAEFS_INODE_SWAP(di) do { if (ZAEFS_HOST_IS_BE) zaefs_inode_swap(di); } while (0)
