@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
 #include "drivers/serial.h"
-#include "arch/x86_64/io.h"
+#include "asm/io.h"
 
 #define COM1 0x3F8
 
@@ -23,6 +23,19 @@ void serial_putc(char c)
     while (!(inb(COM1 + 5) & 0x20))
         ;
     outb(COM1, (uint8_t)c);
+}
+
+int serial_getc(void)
+{
+    if (!(inb(COM1 + 5) & 0x01))
+        return -1;
+    return inb(COM1);
+}
+
+int serial_rx_irq(void)
+{
+    outb(COM1 + 1, 0x01);   /* IER: received data available */
+    return 4;
 }
 
 void serial_puts(const char *s)
