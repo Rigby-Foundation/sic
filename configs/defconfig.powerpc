@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 Rigby Foundation
+#
+# sic default configuration for powerpc (32-bit PowerMac / QEMU mac99).
+CONFIG_SMP=n
+CONFIG_FB_CONSOLE=y
+CONFIG_SERIAL=y            # ESCC channel A (COM1 equivalent)
+CONFIG_KEYBOARD=y          # console input: the serial port (ADB / USB keyboards: not yet)
+CONFIG_PCI=y
+CONFIG_NVME=y             # PCI NVMe (QEMU -device nvme; a real Mac would need a PCIe adapter)
+CONFIG_AHCI=n
+CONFIG_IDE=y               # the mac-io ATA cells (QEMU: -drive if=ide / -hda)
+CONFIG_NET=y
+CONFIG_E1000=y             # a PCI e1000 in QEMU
+CONFIG_ZAEFS=y
+CONFIG_FAT=y
+CONFIG_MODULES=y
+CONFIG_SIGNALS=y
+CONFIG_PIPES=y
+CONFIG_SELFTEST=y
