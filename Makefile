@@ -14,16 +14,26 @@ ifeq ($(origin LD),default)
 LD := $(if $(LLD_PREFIX),$(LLD_PREFIX)/bin/ld.lld,ld.lld)
 endif
 
-BUILD   := build
+# Target architecture: x86_64 (default) or powerpc (32-bit big-endian, G4).
+# Each has kernel/arch/<arch>/ (code, linker script, arch.mk with the flags)
+# and include/arch/<arch>/asm/ (the headers the generic code includes as asm/*).
+ARCH    ?= x86_64
+BUILD   := build/$(ARCH)
 TARGET  := $(BUILD)/sic.elf
+include kernel/arch/$(ARCH)/arch.mk
 
 # --- configuration ------------------------------------------------------------
 # .config holds CONFIG_<NAME>=y/n (see defconfig for the list). Any CONFIG_*
 # variable given on the command line overrides it. include/generated/config.h
 # is produced from the result and included by every kernel source.
-CONFIG_FILE := $(wildcard .config)
+CONFIG_FILE := $(wildcard .config.$(ARCH))
 ifeq ($(CONFIG_FILE),)
-CONFIG_FILE := configs/defconfig
+ifeq ($(ARCH),x86_64)
+CONFIG_FILE := $(wildcard .config)
+endif
+endif
+ifeq ($(CONFIG_FILE),)
+CONFIG_FILE := $(firstword $(wildcard configs/defconfig.$(ARCH)) configs/defconfig)
 endif
 CONFIG_OVERRIDES := $(foreach v,$(filter CONFIG_%,$(.VARIABLES)),$(if $(filter command line,$(origin $(v))),$(v)=$($(v))))
 cfg = $(strip $(shell python3 scripts/genconfig.py $(CONFIG_FILE) $(CONFIG_OVERRIDES) | grep -q "define $(1) " && echo y))
@@ -47,16 +57,17 @@ CONFIG_SELFTEST   := $(call cfg,CONFIG_SELFTEST)
 # Where the other projects (libc, ZAE, zaeboot) find what the kernel provides.
 SYSROOT ?= $(if $(SIC_SYSROOT),$(SIC_SYSROOT),$(HOME)/.sic/sysroot)
 
-CFLAGS  := --target=x86_64-elf -std=c11 -ffreestanding -fno-stack-protector \
-           -fno-pic -fno-pie -mno-red-zone -mgeneral-regs-only -mcmodel=small \
+CFLAGS  := $(ARCH_CFLAGS) -std=c11 -ffreestanding -fno-stack-protector \
            -fno-asynchronous-unwind-tables -fno-builtin -nostdlib -fno-omit-frame-pointer \
-           -O2 -g -Wall -Wextra -Iinclude -DSIC_KERNEL -include generated/config.h $(CFLAGS_EXTRA)
-ASFLAGS := --target=x86_64-elf -g
-LDFLAGS := -T linker.ld -nostdlib -static -z max-page-size=0x1000
+           -O2 -g -Wall -Wextra -Iinclude -Iinclude/arch/$(ARCH) -DSIC_KERNEL -include generated/config.h $(CFLAGS_EXTRA)
+ASFLAGS := $(ARCH_ASFLAGS) -g -Iinclude -Iinclude/arch/$(ARCH)
+LINKER_SCRIPT := kernel/arch/$(ARCH)/linker.ld
+LDFLAGS := $(ARCH_LDFLAGS) -T $(LINKER_SCRIPT) -nostdlib -static -z max-page-size=0x1000
 
 # Sources live in kernel/<subsystem>/ (arch/x86_64, mm, fs, drivers, proc, lib, core).
 # Optional pieces are listed per config option; everything else is always built.
-OPTIONAL := kernel/arch/x86_64/smp.c kernel/arch/x86_64/ap_trampoline.S \
+OPTIONAL := kernel/arch/x86_64/smp.c kernel/arch/x86_64/ap_trampoline.S kernel/arch/powerpc/escc.c \
+            kernel/arch/x86_64/module.c kernel/arch/powerpc/module.c \
             kernel/drivers/fb.c kernel/drivers/font.c kernel/drivers/serial.c kernel/drivers/keyboard.c \
             kernel/drivers/pci.c kernel/drivers/nvme.c kernel/drivers/ahci.c kernel/drivers/ide.c \
             kernel/fs/zaefs.c kernel/fs/fat.c \
@@ -67,7 +78,7 @@ OPTIONAL := kernel/arch/x86_64/smp.c kernel/arch/x86_64/ap_trampoline.S \
 SRC-y :=
 SRC-$(CONFIG_SMP)        += kernel/arch/x86_64/smp.c kernel/arch/x86_64/ap_trampoline.S
 SRC-$(CONFIG_FB_CONSOLE) += kernel/drivers/fb.c kernel/drivers/font.c
-SRC-$(CONFIG_SERIAL)     += kernel/drivers/serial.c
+SRC-$(CONFIG_SERIAL)     += $(ARCH_SERIAL_SRC)
 SRC-$(CONFIG_KEYBOARD)   += kernel/drivers/keyboard.c
 SRC-$(CONFIG_PCI)        += kernel/drivers/pci.c
 SRC-$(CONFIG_NVME)       += kernel/drivers/nvme.c
@@ -77,11 +88,14 @@ SRC-$(CONFIG_NET)        += kernel/net/core.c kernel/net/arp.c kernel/net/ip.c k
 SRC-$(CONFIG_E1000)      += kernel/drivers/e1000.c
 SRC-$(CONFIG_ZAEFS)      += kernel/fs/zaefs.c
 SRC-$(CONFIG_FAT)        += kernel/fs/fat.c
-SRC-$(CONFIG_MODULES)    += kernel/core/module.c kernel/core/ksyms.c
+SRC-$(CONFIG_MODULES)    += kernel/core/module.c kernel/core/ksyms.c kernel/arch/$(ARCH)/module.c
 SRC-$(CONFIG_SIGNALS)    += kernel/proc/signal.c
 SRC-$(CONFIG_PIPES)      += kernel/fs/pipe.c
 SRC-$(CONFIG_SELFTEST)   += kernel/core/selftest.c
-ALWAYS := $(filter-out $(OPTIONAL),$(shell find kernel -name '*.c' -o -name '*.S'))
+# Everything under kernel/ except other architectures' directories.
+ALL_SRC := $(shell find kernel -not -path 'kernel/arch/*' \( -name '*.c' -o -name '*.S' \)) \
+           $(wildcard kernel/arch/$(ARCH)/*.c kernel/arch/$(ARCH)/*.S)
+ALWAYS := $(filter-out $(OPTIONAL),$(ALL_SRC))
 CSRC := $(filter %.c,$(ALWAYS) $(SRC-y))
 SSRC := $(filter %.S,$(ALWAYS) $(SRC-y))
 OBJS := $(patsubst %.c,$(BUILD)/%.o,$(CSRC)) $(patsubst %.S,$(BUILD)/%.o,$(SSRC))
@@ -148,13 +162,13 @@ $(BUILD)/syms0.c:
 	@echo 'const unsigned kernel_sym_count = 0;' >> $@
 $(BUILD)/syms0.o: $(BUILD)/syms0.c $(CONFIG_H)
 	$(CC) $(CFLAGS) -c -o $@ $<
-$(BUILD)/sic-pass1.elf: $(OBJS) $(BUILD)/syms0.o linker.ld
+$(BUILD)/sic-pass1.elf: $(OBJS) $(BUILD)/syms0.o $(LINKER_SCRIPT)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(BUILD)/syms0.o
 $(BUILD)/syms.c: $(BUILD)/sic-pass1.elf scripts/gensyms.py
 	$(NM) -n $< | python3 scripts/gensyms.py > $@
 $(BUILD)/syms.o: $(BUILD)/syms.c
 	$(CC) $(CFLAGS) -c -o $@ $<
-$(TARGET): $(OBJS) $(BUILD)/syms.o linker.ld
+$(TARGET): $(OBJS) $(BUILD)/syms.o $(LINKER_SCRIPT)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(BUILD)/syms.o
 
 # -MMD writes build/x.d next to each object so header changes (struct

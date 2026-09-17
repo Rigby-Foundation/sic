@@ -4,12 +4,12 @@
 #include "mm/vmm.h"
 #include "mm/heap.h"
 
-struct mm *mm_create(uint64_t pml4)
+struct mm *mm_create(uint64_t pgd)
 {
     struct mm *mm = kzalloc(sizeof(*mm));
     if (!mm)
         return NULL;
-    mm->pml4 = pml4;
+    mm->pgd = pgd;
     mm->refs = 1;
     return mm;
 }
@@ -23,7 +23,7 @@ struct mm *mm_get(struct mm *mm)
 void mm_put(struct mm *mm)
 {
     if (mm && __atomic_sub_fetch(&mm->refs, 1, __ATOMIC_SEQ_CST) == 0) {
-        vmm_destroy_address_space(mm->pml4);
+        vmm_destroy_address_space(mm->pgd);
         kfree(mm);
     }
 }

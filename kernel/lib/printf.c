@@ -89,31 +89,34 @@ void kprintf(const char *fmt, ...)
         }
         while (*fmt >= '0' && *fmt <= '9')
             width = width * 10 + (*fmt++ - '0');
-        while (*fmt == 'l') {
-            longflag = 1;
+        /* l = long (native word), ll = 64-bit, z = size_t (a long) */
+        while (*fmt == 'l' || *fmt == 'z') {
+            longflag++;
             fmt++;
         }
+        if (longflag == 1 && sizeof(long) == 8)
+            longflag = 2;
 
         switch (*fmt) {
         case 'd': {
-            int64_t v = longflag ? __builtin_va_arg(ap, int64_t) : __builtin_va_arg(ap, int32_t);
+            int64_t v = longflag >= 2 ? __builtin_va_arg(ap, int64_t) : longflag ? __builtin_va_arg(ap, long) : __builtin_va_arg(ap, int32_t);
             print_num((uint64_t)v, 10, 1, width, pad, 0);
             break;
         }
         case 'u': {
-            uint64_t v = longflag ? __builtin_va_arg(ap, uint64_t) : __builtin_va_arg(ap, uint32_t);
+            uint64_t v = longflag >= 2 ? __builtin_va_arg(ap, uint64_t) : longflag ? __builtin_va_arg(ap, unsigned long) : __builtin_va_arg(ap, uint32_t);
             print_num(v, 10, 0, width, pad, 0);
             break;
         }
         case 'x':
         case 'X': {
-            uint64_t v = longflag ? __builtin_va_arg(ap, uint64_t) : __builtin_va_arg(ap, uint32_t);
+            uint64_t v = longflag >= 2 ? __builtin_va_arg(ap, uint64_t) : longflag ? __builtin_va_arg(ap, unsigned long) : __builtin_va_arg(ap, uint32_t);
             print_num(v, 16, 0, width, pad, *fmt == 'X');
             break;
         }
         case 'p':
             raw_puts("0x");
-            print_num((uint64_t)__builtin_va_arg(ap, void *), 16, 0, 16, '0', 0);
+            print_num((uintptr_t)__builtin_va_arg(ap, void *), 16, 0, 2 * (int)sizeof(void *), '0', 0);
             break;
         case 'c':
             raw_putc((char)__builtin_va_arg(ap, int));

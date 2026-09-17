@@ -3,12 +3,13 @@
 /* AHCI (SATA): polled, one command slot, READ/WRITE DMA EXT through a
  * bounce buffer of one page per transfer. Registers /dev/sdX per port. */
 #include "drivers/ahci.h"
+#include "endian.h"
 #include "drivers/pci.h"
 #include "fs/blkdev.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "mm/heap.h"
-#include "arch/x86_64/timer.h"
+#include "asm/timer.h"
 #include "string.h"
 #include "printf.h"
 #include "spinlock.h"
@@ -84,8 +85,8 @@ struct ahci_port {
     struct blkdev bdev;
 };
 
-static inline uint32_t rd(volatile uint8_t *base, uint32_t r) { return *(volatile uint32_t *)(base + r); }
-static inline void wr(volatile uint8_t *base, uint32_t r, uint32_t v) { *(volatile uint32_t *)(base + r) = v; }
+static inline uint32_t rd(volatile uint8_t *base, uint32_t r) { return mmio_read32(base + r); }
+static inline void wr(volatile uint8_t *base, uint32_t r, uint32_t v) { mmio_write32(base + r, v); }
 
 static int wait_clear(volatile uint8_t *p, uint32_t r, uint32_t mask, uint64_t ms)
 {
@@ -129,12 +130,12 @@ static int issue(struct ahci_port *ap, uint8_t command, uint64_t lba, uint16_t c
     fis->count_lo = (uint8_t)count;
     fis->count_hi = (uint8_t)(count >> 8);
     if (bytes) {
-        ct->prdt[0].dba = (uint32_t)ap->buf_phys;
-        ct->prdt[0].dbau = (uint32_t)(ap->buf_phys >> 32);
-        ct->prdt[0].dbc = bytes - 1;
+        ct->prdt[0].dba = htole32((uint32_t)ap->buf_phys);
+        ct->prdt[0].dbau = htole32((uint32_t)(ap->buf_phys >> 32));
+        ct->prdt[0].dbc = htole32(bytes - 1);
     }
-    hdr[0].flags = (uint16_t)((sizeof(*fis) / 4) | (write ? (1 << 6) : 0));
-    hdr[0].prdtl = bytes ? 1 : 0;
+    hdr[0].flags = htole16((uint16_t)((sizeof(*fis) / 4) | (write ? (1 << 6) : 0)));
+    hdr[0].prdtl = htole16(bytes ? 1 : 0);
     hdr[0].prdbc = 0;
 
     if (wait_clear(p, PX_TFD, TFD_BSY | TFD_DRQ, 1000) != 0)
@@ -145,7 +146,7 @@ static int issue(struct ahci_port *ap, uint8_t command, uint64_t lba, uint16_t c
     while (rd(p, PX_CI) & 1) {
         if (rd(p, PX_IS) & (1u << 30)) return -1;       /* task file error */
         if (timer_ticks() > deadline) return -1;
-        __asm__ volatile("pause");
+        cpu_relax();
     }
     return (rd(p, PX_TFD) & 1) ? -1 : 0;              /* ERR bit */
 }
@@ -169,7 +170,7 @@ static int ahci_rw(struct blkdev *d, uint64_t lba, uint32_t count, void *buf, in
     }
     spin_unlock(&ap->lock);
     if (rc)
-        kprintf("ahci: %s: %s error at lba %lu\n", d->name, write ? "write" : "read", lba);
+        kprintf("ahci: %s: %s error at lba %llu\n", d->name, write ? "write" : "read", lba);
     return rc;
 }
 
@@ -179,8 +180,9 @@ static int ahci_write(struct blkdev *d, uint64_t lba, uint32_t count, const void
 static void ata_string(char *dst, const uint16_t *src, int words)
 {
     for (int i = 0; i < words; i++) {
-        dst[i * 2] = (char)(src[i] >> 8);
-        dst[i * 2 + 1] = (char)src[i];
+        uint16_t w = le16toh(src[i]);       /* identify data is little-endian words */
+        dst[i * 2] = (char)(w >> 8);
+        dst[i * 2 + 1] = (char)w;
     }
     dst[words * 2] = 0;
     for (int i = words * 2 - 1; i >= 0 && (dst[i] == ' ' || dst[i] == 0); i--) dst[i] = 0;
@@ -211,8 +213,8 @@ static void port_init(volatile uint8_t *hba, int idx)
     wr(p, PX_CLB, (uint32_t)ap->clb_phys);  wr(p, PX_CLBU, (uint32_t)(ap->clb_phys >> 32));
     wr(p, PX_FB, (uint32_t)ap->fb_phys);    wr(p, PX_FBU, (uint32_t)(ap->fb_phys >> 32));
     struct cmd_header *hdr = P2V(ap->clb_phys);
-    hdr[0].ctba = (uint32_t)ap->ct_phys;
-    hdr[0].ctbau = (uint32_t)(ap->ct_phys >> 32);
+    hdr[0].ctba = htole32((uint32_t)ap->ct_phys);
+    hdr[0].ctbau = htole32((uint32_t)(ap->ct_phys >> 32));
     wr(p, PX_SERR, 0xFFFFFFFF);
     wr(p, PX_IE, 0);
     port_start(p);
@@ -223,8 +225,8 @@ static void port_init(volatile uint8_t *hba, int idx)
     }
     const uint16_t *id = P2V(ap->buf_phys);
     uint64_t sectors;
-    memcpy(&sectors, id + 100, 8);                      /* words 100-103: LBA48 count */
-    if (!sectors) sectors = (uint32_t)id[60] | ((uint32_t)id[61] << 16);
+    sectors = get_le64(id + 100);                       /* words 100-103: LBA48 count */
+    if (!sectors) sectors = get_le32(id + 60);
     char model[41];
     ata_string(model, id + 27, 20);
 

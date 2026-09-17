@@ -8,3 +8,4 @@
 void     timer_init(void);      /* LAPIC timer if available, else PIT via the PIC */
 uint64_t timer_ticks(void);
 uint64_t timer_ms(void);
+const char *timer_source(void);   /* "lapic", "pit", "decrementer": for diagnostics */

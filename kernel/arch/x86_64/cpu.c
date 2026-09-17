@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
-#include "arch/x86_64/cpu.h"
+#include "asm/cpu.h"
 #include "string.h"
 
 #define MSR_GS_BASE        0xC0000101

@@ -13,15 +13,15 @@ struct ksym {
 #define EXPORT_SYMBOL(sym) \
     static const struct ksym __ksym_##sym __attribute__((section(".ksymtab"), used)) = { #sym, (void *)&sym }
 
-/* A module is an ET_REL x86_64 object (built with the kernel's flags and
- * `ld.lld -r`) that defines:
+/* A module is an ET_REL object for the kernel's architecture (built with
+ * the kernel's flags and `ld.lld -r`) that defines:
  *   const char module_name[];
  *   int  init_module(void);      returns 0 on success
  *   void cleanup_module(void);   optional
  */
 struct module {
     char     name[32];
-    void    *base;              /* identity-mapped, below 2 GiB */
+    void    *base;              /* kernel virtual (arch_module_alloc) */
     size_t   size;
     int    (*init)(void);
     void   (*exit)(void);

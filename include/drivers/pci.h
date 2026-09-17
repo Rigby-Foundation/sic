@@ -17,6 +17,7 @@ void     pci_init(void);        /* enumerate bus 0..255 via config ports */
 uint32_t pci_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off);
 void     pci_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint32_t v);
 void     pci_enable_busmaster(const struct pci_dev *d);
+int      pci_irq(const struct pci_dev *d);   /* the interrupt line as the platform wired it, or -1 */
 size_t   pci_count(void);
 const struct pci_dev *pci_get(size_t i);
 const struct pci_dev *pci_find_class(uint8_t class, uint8_t subclass, size_t nth);

@@ -1,11 +1,13 @@
 # sic
 
-sic is a monolithic x86_64 kernel written in C: SMP, preemptive scheduling of
+sic is a monolithic kernel written in C for x86_64 and 32-bit big-endian
+PowerPC (G4 PowerMacs): SMP, preemptive scheduling of
 processes and threads, POSIX signals and pipes, a VFS with tmpfs, its own
 on-disk filesystem (zaefs) and FAT, NVMe/AHCI/IDE disks with GPT and MBR
 partitions, an IPv4 network stack (Ethernet, ARP, ICMP, UDP, TCP, BSD sockets,
-Intel e1000 driver), loadable modules, and a framebuffer/serial console. It
-runs on real hardware, booted by zaeboot from UEFI or legacy BIOS.
+Intel e1000 driver), loadable modules, and a framebuffer/serial console. On
+x86_64 it runs on real hardware, booted by zaeboot from UEFI or legacy BIOS;
+the PowerPC port is loaded by OpenFirmware and so far runs on QEMU's mac99.
 
 It is one of four projects that make up the system, each in its own repo:
 
@@ -19,12 +21,39 @@ It is one of four projects that make up the system, each in its own repo:
 The contract between them is sic's system call ABI — deliberately its own
 numbering, not Linux's: `abi/syscall.tbl` (generated into
 `include/abi/syscall_nr.h` and musl's `bits/syscall.h`) and `include/abi/abi.h`
-(structure layouts and constants). sic executables are ELF64 stamped with
-OS/ABI byte `0x53`.
+(structure layouts and constants; a few layouts differ per architecture, as
+they do in musl). sic executables are ELF stamped with OS/ABI byte `0x53`.
+The ABI is "time64-only" on every width: a 32-bit port speaks 64-bit time to
+the kernel in every call, so there are no `*_time64` or `_llseek` spellings
+in the table (`abi/gen.py musl32` emits the aliases musl expects).
 
-Source layout: `kernel/{arch/x86_64,mm,fs,drivers,proc,lib,core}` with matching
+Source layout: `kernel/{arch/<arch>,mm,fs,drivers,proc,lib,core}` with matching
 `include/` subdirectories, `modules/` for loadable modules, `include/abi/` for
-the public ABI.
+the public ABI. Everything an architecture has to provide is declared in
+`include/arch/<arch>/asm/*.h` (included as `"asm/x.h"`): interrupts and
+exception frames, the MMU behind `mm/vmm.h`, task switching and user entry,
+signal frames, timers, PCI access, the memory layout, and the module
+loader's relocations (`module_arch.h`). The generic code is
+width- and endian-clean: on-disk and on-wire structures go through
+`include/endian.h`.
+
+### Architectures
+
+| `ARCH`    | Target                                       | Boots via                    |
+|-----------|----------------------------------------------|------------------------------|
+| `x86_64`  | any 64-bit PC (default)                       | zaeboot (UEFI, legacy BIOS)  |
+| `powerpc` | 32-bit big-endian, G4 (7450); QEMU `-M mac99` | OpenFirmware `-kernel`       |
+
+`make ARCH=powerpc` builds into `build/powerpc/` with
+`configs/defconfig.powerpc`. The PowerPC kernel is linked at `0xC1000000`
+(load address `0x01000000`), maps the kernel and PCI space with BATs, user
+space with the hash page table from its own two-level page tables, takes
+interrupts from the mac-io OpenPIC and time from the decrementer, talks on the
+ESCC serial port (console input too), to PCI through Uni-North and to disks
+on the mac-io ATA cells or NVMe. FP and AltiVec state are enabled lazily per
+task and carried across switches, fork and signal frames. Modules are ELF32
+objects with branch stubs for the ±32 MiB `bl` reach. Not yet: ADB/USB
+input, SMP.
 
 ## Configuring
 
@@ -52,8 +81,9 @@ them via `brew --prefix`; override with `make CC=... LD=...`.
 make
 ```
 
-Produces `build/sic.elf`, a static ELF64 linked at physical `0x100000`
-(`linker.ld`) and the modules under `build/modules/`.
+Produces `build/<arch>/sic.elf`, a static ELF (x86_64: linked at physical
+`0x100000`; `kernel/arch/<arch>/linker.ld`) and the modules under
+`build/<arch>/modules/`.
 
 All four sic projects meet in a **sysroot** rather than knowing each other's
 paths: `$SIC_SYSROOT`, default `~/.sic/sysroot` (or `make SYSROOT=...`).

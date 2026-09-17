@@ -6,7 +6,7 @@
 #include "proc/sched.h"
 #include "proc/signal.h"
 #include "mm/vmm.h"
-#include "arch/x86_64/timer.h"
+#include "asm/timer.h"
 #include "spinlock.h"
 #include "abi/abi.h"
 
@@ -24,7 +24,7 @@ static uint64_t key_of(uint64_t uaddr)
 {
     if (uaddr & 3 || uaddr < USER_BASE || uaddr >= USER_END)
         return 0;
-    uint64_t phys = vmm_translate_in(task_current()->mm->pml4, uaddr);
+    uint64_t phys = vmm_translate_in(task_current()->mm->pgd, uaddr);
     return phys;
 }
 
@@ -51,7 +51,7 @@ static long futex_wait(uint64_t uaddr, uint32_t val, uint64_t utimeout, int abso
 
     uint64_t deadline = 0;
     if (utimeout) {
-        if (utimeout < USER_BASE || utimeout + 16 > USER_END || !vmm_translate_in(task_current()->mm->pml4, utimeout))
+        if (utimeout < USER_BASE || utimeout + 16 > USER_END || !vmm_translate_in(task_current()->mm->pgd, utimeout))
             return -EFAULT;
         const struct abi_timespec *ts = (const void *)utimeout;
         if (ts->tv_sec < 0 || ts->tv_nsec < 0) return -EINVAL;

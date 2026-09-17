@@ -421,8 +421,6 @@ long sys_getpeername(long fd, uint64_t uaddr, uint64_t ulenp)
     return addr_out(uaddr, ulenp, s->remote_ip, s->remote_port);
 }
 
-struct abi_timeval { int64_t tv_sec, tv_usec; };
-
 long sys_setsockopt(long fd, long level, long name, uint64_t uval, uint64_t len)
 {
     struct file *f;
@@ -436,8 +434,8 @@ long sys_setsockopt(long fd, long level, long name, uint64_t uval, uint64_t len)
         case SO_BROADCAST: s->broadcast = v != 0; return 0;
         case SO_KEEPALIVE: case SO_SNDBUF: case SO_RCVBUF: return 0;
         case SO_RCVTIMEO: case SO_SNDTIMEO: {
-            if (len < sizeof(struct abi_timeval)) return -EINVAL;
-            const struct abi_timeval *tv = (const void *)uval;
+            if (len < sizeof(struct abi_ktimeval)) return -EINVAL;
+            const struct abi_ktimeval *tv = (const void *)uval;
             long ms = tv->tv_sec * 1000 + tv->tv_usec / 1000;
             if (name == SO_RCVTIMEO) s->rcvtimeo_ms = ms; else s->sndtimeo_ms = ms;
             return 0;

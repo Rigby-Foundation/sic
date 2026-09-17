@@ -1,12 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
-#include "arch/x86_64/timer.h"
-#include "arch/x86_64/idt.h"
-#include "arch/x86_64/apic.h"
-#include "arch/x86_64/pit.h"
+#include "asm/timer.h"
+#include "asm/idt.h"
+#include "asm/apic.h"
+#include "asm/pit.h"
 #include "proc/sched.h"
 #include "printf.h"
-#include "arch/x86_64/cpu.h"
+#include "asm/cpu.h"
 
 static volatile uint64_t ticks;
 
@@ -32,3 +32,8 @@ void timer_init(void)
 
 uint64_t timer_ticks(void) { return ticks; }
 uint64_t timer_ms(void)    { return ticks * 1000 / TIMER_HZ; }
+
+const char *timer_source(void)
+{
+    return apic_enabled() ? "lapic" : "pit";
+}

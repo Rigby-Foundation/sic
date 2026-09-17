@@ -4,8 +4,7 @@
 #include "drivers/fb.h"
 #include "drivers/serial.h"
 #include "printf.h"
-#include "arch/x86_64/cpu.h"
-#include "arch/x86_64/smp.h"
+#include "asm/arch.h"
 #include "proc/syscall.h"
 #include "proc/elf.h"
 #include "fs/vfs.h"
@@ -16,12 +15,7 @@
 #include "net/net.h"
 #include "drivers/e1000.h"
 #include "module.h"
-#include "arch/x86_64/idt.h"
-#include "arch/x86_64/pic.h"
-#include "arch/x86_64/timer.h"
 #include "drivers/keyboard.h"
-#include "arch/x86_64/acpi.h"
-#include "arch/x86_64/apic.h"
 #include "proc/sched.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
@@ -68,12 +62,6 @@ static void initrd_expose(const void *data, size_t len)
     if (n) { n->size = len; n->seekable = 1; }
 }
 
-static void halt_forever(void)
-{
-    for (;;)
-        __asm__ volatile("cli; hlt");
-}
-
 void kernel_main(struct zaeboot_info *info)
 {
 #ifdef CONFIG_SERIAL
@@ -82,7 +70,7 @@ void kernel_main(struct zaeboot_info *info)
 
     if (info == NULL || info->magic != ZAEBOOT_MAGIC) {
         kputs("sic: bad boot info magic, halting\n");
-        halt_forever();
+        arch_halt_forever();
     }
 
 #ifdef CONFIG_FB_CONSOLE
@@ -94,21 +82,16 @@ void kernel_main(struct zaeboot_info *info)
     fb_clear();
 #endif
 
-    cpus[0].index = 0;
-    cpu_count = 1;
-    cpu_init(&cpus[0], 0);
-    cpu_enable_fpu();
-    idt_init();
-    syscall_init_cpu();
+    arch_cpu_init_boot();
 
-    kprintf("sic kernel booting (zaeboot protocol v%u)\n", info->version);
+    kprintf("sic/%s booting (zaeboot protocol v%u)\n", ARCH_NAME, info->version);
     kprintf("framebuffer %ux%u @ %p, rsdp %p\n\n",
             info->fb.width, info->fb.height, (void *)info->fb.base, (void *)info->rsdp);
 
-    kprintf("memory map (%lu entries):\n", info->mmap_count);
+    kprintf("memory map (%llu entries):\n", info->mmap_count);
     const struct zaeboot_mmap_entry *mm = (const void *)info->mmap;
     for (uint64_t i = 0; i < info->mmap_count; i++)
-        kprintf("  %016lx - %016lx  %s\n",
+        kprintf("  %016llx - %016llx  %s\n",
                 mm[i].base, mm[i].base + mm[i].length, mem_type_name(mm[i].type));
     kprintf("\n");
 
@@ -152,20 +135,13 @@ void kernel_main(struct zaeboot_info *info)
     module_init_ksyms();
 #endif
 
-    /* Interrupts: PIC remapped and masked, then APICs from the MADT if we
-     * have them, then the timer (LAPIC or PIT) and the keyboard. */
-    pic_init();
-    if (acpi_init(info->rsdp) == 0 && apic_init() == 0)
-        irq_use_apic();
-    timer_init();
+    arch_init_interrupts(info);
 #ifdef CONFIG_KEYBOARD
     keyboard_init();
 #endif
     sched_init();
     interrupts_enable();
-#ifdef CONFIG_SMP
-    smp_init();
-#endif
+    arch_init_smp();
 #ifdef CONFIG_NVME
     nvme_init();
 #endif
@@ -190,5 +166,5 @@ void kernel_main(struct zaeboot_info *info)
     if (!process_spawn("/bin/init", NULL, NULL))
         kprintf("could not start init\n");
     for (;;)
-        __asm__ volatile("sti; hlt");
+        arch_idle();
 }

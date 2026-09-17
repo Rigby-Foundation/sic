@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
 /* ACPI: RSDP -> RSDT/XSDT -> tables. We only interpret the MADT for now. */
-#include "arch/x86_64/acpi.h"
+#include "asm/acpi.h"
 #include "mm/vmm.h"
 #include "printf.h"
 #include "string.h"
@@ -157,7 +157,7 @@ int acpi_init(uint64_t rsdp_phys)
     }
     parse_madt(m);
 
-    kprintf("acpi: lapic @ %lx, %u cpu(s), %u ioapic(s), %u override(s)\n",
+    kprintf("acpi: lapic @ %llx, %u cpu(s), %u ioapic(s), %u override(s)\n",
             madt_info.lapic_addr, madt_info.cpu_count, madt_info.ioapic_count, madt_info.iso_count);
     for (uint32_t i = 0; i < madt_info.ioapic_count; i++)
         kprintf("  ioapic %u @ %x, gsi base %u\n",

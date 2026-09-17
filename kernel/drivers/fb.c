@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 Rigby Foundation */
 #include "drivers/fb.h"
 #include "string.h"
+#include "asm/io.h"
 #include "fs/vfs.h"
 #include "abi/abi.h"
 #include "abi/fb.h"
@@ -47,10 +48,10 @@ static struct {
 static void vga_cursor(void)
 {
     uint16_t pos = (uint16_t)(con.cy * VGA_COLS + con.cx);
-    __asm__ volatile("outb %0, %1" : : "a"((uint8_t)0x0F), "Nd"((uint16_t)0x3D4));
-    __asm__ volatile("outb %0, %1" : : "a"((uint8_t)pos), "Nd"((uint16_t)0x3D5));
-    __asm__ volatile("outb %0, %1" : : "a"((uint8_t)0x0E), "Nd"((uint16_t)0x3D4));
-    __asm__ volatile("outb %0, %1" : : "a"((uint8_t)(pos >> 8)), "Nd"((uint16_t)0x3D5));
+    outb(0x3D4, 0x0F);
+    outb(0x3D5, (uint8_t)pos);
+    outb(0x3D4, 0x0E);
+    outb(0x3D5, (uint8_t)(pos >> 8));
 }
 
 static void vga_putc(char c)
@@ -310,7 +311,7 @@ static int fb_dev_mmap(struct file *f, uint64_t virt, size_t pages, uint64_t off
     for (size_t i = 0; i < pages; i++) {
         uint64_t paddr = raw_fb.base + off + i * PAGE_SIZE;
         uint64_t vaddr = virt + i * PAGE_SIZE;
-        if (vmm_map_user_page(t->mm->pml4, vaddr, paddr, PTE_WRITE | PTE_DEV | PTE_PCD | PTE_PWT) != 0)
+        if (vmm_map_user_page(t->mm->pgd, vaddr, paddr, PTE_WRITE | PTE_DEV | PTE_PCD | PTE_PWT) != 0)
             return -ENOMEM;
     }
     return 0;

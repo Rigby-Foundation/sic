@@ -5,14 +5,15 @@
  * on the user stack, with a Linux-shaped rt frame so musl's restorer works. */
 #include "proc/signal.h"
 #include "proc/sched.h"
-#include "arch/x86_64/timer.h"
+#include "asm/timer.h"
 #include "mm/vmm.h"
 #include "string.h"
 #include "printf.h"
 #include "abi/abi.h"
 #include "mm/heap.h"
+#include "asm/signal.h"
 
-#define BIT(s) (1UL << ((s) - 1))
+#define BIT(s) (1ULL << ((s) - 1))
 #define UNCATCHABLE (BIT(SIGKILL) | BIT(SIGSTOP))
 
 /* ---- per-task state ---------------------------------------------------------- */
@@ -104,80 +105,12 @@ int task_signal_pending(struct task *t)
     return t->group_exit || (t->sig_pending & ~(t->sig_blocked & ~UNCATCHABLE)) != 0;
 }
 
-/* ---- frames --------------------------------------------------------------------- */
-
-static void regs_from_syscall(struct sigregs *r, const struct syscall_frame *f)
-{
-    r->r15 = f->r15; r->r14 = f->r14; r->r13 = f->r13; r->r12 = f->r12;
-    r->r11 = f->r11; r->r10 = f->r10; r->r9 = f->r9; r->r8 = f->r8;
-    r->rbp = f->rbp; r->rbx = f->rbx; r->rdi = f->rdi; r->rsi = f->rsi;
-    r->rdx = f->rdx; r->rcx = f->rcx; r->rax = f->rax;
-    r->rip = f->rip; r->rflags = f->rflags; r->rsp = f->rsp;
-}
-
-static void regs_to_syscall(const struct sigregs *r, struct syscall_frame *f)
-{
-    f->r15 = r->r15; f->r14 = r->r14; f->r13 = r->r13; f->r12 = r->r12;
-    f->r11 = r->r11; f->r10 = r->r10; f->r9 = r->r9; f->r8 = r->r8;
-    f->rbp = r->rbp; f->rbx = r->rbx; f->rdi = r->rdi; f->rsi = r->rsi;
-    f->rdx = r->rdx; f->rcx = r->rcx; f->rax = r->rax;
-    f->rip = r->rip; f->rflags = (r->rflags & 0x3C7FD7) | 0x202; f->rsp = r->rsp;
-}
-
-static void regs_from_irq(struct sigregs *r, const struct interrupt_frame *f)
-{
-    r->r15 = f->r15; r->r14 = f->r14; r->r13 = f->r13; r->r12 = f->r12;
-    r->r11 = f->r11; r->r10 = f->r10; r->r9 = f->r9; r->r8 = f->r8;
-    r->rbp = f->rbp; r->rbx = f->rbx; r->rdi = f->rdi; r->rsi = f->rsi;
-    r->rdx = f->rdx; r->rcx = f->rcx; r->rax = f->rax;
-    r->rip = f->rip; r->rflags = f->rflags; r->rsp = f->rsp;
-}
-
-static void regs_to_irq(const struct sigregs *r, struct interrupt_frame *f)
-{
-    f->r15 = r->r15; f->r14 = r->r14; f->r13 = r->r13; f->r12 = r->r12;
-    f->r11 = r->r11; f->r10 = r->r10; f->r9 = r->r9; f->r8 = r->r8;
-    f->rbp = r->rbp; f->rbx = r->rbx; f->rdi = r->rdi; f->rsi = r->rsi;
-    f->rdx = r->rdx; f->rcx = r->rcx; f->rax = r->rax;
-    f->rip = r->rip; f->rflags = (r->rflags & 0x3C7FD7) | 0x202; f->rsp = r->rsp;
-}
-
-/* What lands on the user stack. The ucontext/siginfo layouts follow Linux
- * x86_64 so musl-built handlers can look at them; restoration uses `saved`. */
-struct abi_siginfo {
-    int32_t si_signo, si_errno, si_code;
-    int32_t pad;
-    uint64_t si_addr;                   /* union: si_addr for faults, si_pid for kill */
-    uint8_t rest[128 - 24];
-};
-
-struct abi_ucontext {
-    uint64_t uc_flags;
-    uint64_t uc_link;
-    uint64_t ss_sp; int32_t ss_flags; int32_t pad0; uint64_t ss_size;
-    uint64_t gregs[23];
-    uint64_t fpregs;
-    uint64_t reserved[8];
-    uint64_t uc_sigmask[16];
-};
-
-struct sigframe {
-    uint64_t retaddr;                   /* the restorer */
-    struct abi_siginfo info;
-    struct abi_ucontext uc;
-    /* private: exact state to resume */
-    struct sigregs saved;
-    uint64_t saved_mask;
-    uint64_t magic;
-};
-#define SIGFRAME_MAGIC 0x5349474652414d45UL
-
-static int user_range_ok(uint64_t p, uint64_t len)
+int user_range_ok(uint64_t p, uint64_t len)
 {
     if (p < USER_BASE || p + len > USER_END) return 0;
-    uint64_t pml4 = task_current()->mm->pml4;
-    for (uint64_t a = p & ~0xFFFUL; a < p + len; a += 4096)
-        if (!vmm_translate_in(pml4, a))
+    uint64_t pgd = task_current()->mm->pgd;
+    for (uint64_t a = p & ~0xFFFULL; a < p + len; a += 4096)
+        if (!vmm_translate_in(pgd, a))
             return 0;
     return 1;
 }
@@ -199,41 +132,11 @@ static int setup_frame(struct task *t, int sig, uint64_t fault_addr, struct sigr
     uint64_t saved_mask = t->sig_saved_mask_valid ? t->sig_saved_mask : t->sig_blocked;
     t->sig_saved_mask_valid = 0;
 
-    uint64_t sp = r->rsp - 128;                       /* skip the red zone */
-    sp = (sp - sizeof(struct sigframe)) & ~15UL;
-    sp -= 8;                                          /* retaddr slot: sp+8 is 16-aligned */
-    if (!user_range_ok(sp, sizeof(struct sigframe))) {
+    if (arch_signal_setup_frame(t, sig, fault_addr, a->handler, a->restorer, saved_mask, r) != 0) {
         kprintf("[%s (pid %u): no user stack for signal %d, killing]\n", t->name, t->id, sig);
         t->killed_sig = SIGSEGV;
         task_exit_code(128 + SIGSEGV);
     }
-
-    struct sigframe *fr = (struct sigframe *)sp;
-    memset(fr, 0, sizeof(*fr));
-    fr->retaddr = a->restorer;
-    fr->info.si_signo = sig;
-    fr->info.si_addr = fault_addr;
-    fr->info.si_code = fault_addr ? 1 : 0;            /* SEGV_MAPERR-ish vs SI_USER */
-    static const int greg_order[] = { 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 };
-    (void)greg_order;
-    fr->uc.gregs[0] = r->r8;  fr->uc.gregs[1] = r->r9;  fr->uc.gregs[2] = r->r10; fr->uc.gregs[3] = r->r11;
-    fr->uc.gregs[4] = r->r12; fr->uc.gregs[5] = r->r13; fr->uc.gregs[6] = r->r14; fr->uc.gregs[7] = r->r15;
-    fr->uc.gregs[8] = r->rdi; fr->uc.gregs[9] = r->rsi; fr->uc.gregs[10] = r->rbp; fr->uc.gregs[11] = r->rbx;
-    fr->uc.gregs[12] = r->rdx; fr->uc.gregs[13] = r->rax; fr->uc.gregs[14] = r->rcx; fr->uc.gregs[15] = r->rsp;
-    fr->uc.gregs[16] = r->rip; fr->uc.gregs[17] = r->rflags; fr->uc.gregs[22] = fault_addr;
-    fr->uc.uc_sigmask[0] = saved_mask;
-    fr->saved = *r;
-    fr->saved_mask = saved_mask;
-    fr->magic = SIGFRAME_MAGIC;
-
-    /* Run the handler: handler(sig, &info, &uc) on the new stack. */
-    r->rip = a->handler;
-    r->rsp = sp;
-    r->rdi = (uint64_t)sig;
-    r->rsi = (uint64_t)&fr->info;
-    r->rdx = (uint64_t)&fr->uc;
-    r->rax = 0;
-    r->rflags &= ~(1UL << 10);                        /* DF clear per ABI */
 
     t->sig_blocked |= (((uint64_t)a->mask[1] << 32) | a->mask[0]);
     if (!(a->flags & SA_NODEFER))
@@ -278,19 +181,19 @@ void signal_deliver_syscall(struct syscall_frame *f)
     if (!task_signal_pending(task_current()))
         return;
     struct sigregs r;
-    regs_from_syscall(&r, f);
+    arch_sigregs_from_syscall(&r, f);
     deliver(&r, 0);
-    regs_to_syscall(&r, f);
+    arch_sigregs_to_syscall(&r, f);
 }
 
 void signal_deliver_irq(struct interrupt_frame *f)
 {
-    if (!(f->cs & 3) || !task_signal_pending(task_current()))
+    if (!FRAME_FROM_USER(f) || !task_signal_pending(task_current()))
         return;
     struct sigregs r;
-    regs_from_irq(&r, f);
+    arch_sigregs_from_irq(&r, f);
     deliver(&r, 0);
-    regs_to_irq(&r, f);
+    arch_sigregs_to_irq(&r, f);
 }
 
 int signal_fault(struct interrupt_frame *f, int sig, uint64_t addr)
@@ -302,9 +205,9 @@ int signal_fault(struct interrupt_frame *f, int sig, uint64_t addr)
         return 0;
     __atomic_fetch_or(&t->sig_pending, BIT(sig), __ATOMIC_SEQ_CST);
     struct sigregs r;
-    regs_from_irq(&r, f);
+    arch_sigregs_from_irq(&r, f);
     deliver(&r, addr);
-    regs_to_irq(&r, f);
+    arch_sigregs_to_irq(&r, f);
     return 1;
 }
 
@@ -326,17 +229,41 @@ long sys_rt_sigaction(int sig, uint64_t uact, uint64_t uoact, uint64_t setsize)
     return 0;
 }
 
+/* A user sigset_t is unsigned long[]: one word of 64 signals on 64-bit
+ * targets, two words (1-32, 33-64) on 32-bit ones, so it is not simply a
+ * uint64_t in memory there. */
+static uint64_t sigset_get(uint64_t uaddr)
+{
+#if BITS_PER_LONG == 64
+    return *(const uint64_t *)(uintptr_t)uaddr;
+#else
+    const uint32_t *w = (const uint32_t *)(uintptr_t)uaddr;
+    return ((uint64_t)w[1] << 32) | w[0];
+#endif
+}
+
+static void sigset_put(uint64_t uaddr, uint64_t set)
+{
+#if BITS_PER_LONG == 64
+    *(uint64_t *)(uintptr_t)uaddr = set;
+#else
+    uint32_t *w = (uint32_t *)(uintptr_t)uaddr;
+    w[0] = (uint32_t)set;
+    w[1] = (uint32_t)(set >> 32);
+#endif
+}
+
 long sys_rt_sigprocmask(int how, uint64_t uset, uint64_t uoset, uint64_t setsize)
 {
     struct task *t = task_current();
     if (setsize != 8) return -EINVAL;
     if (uoset) {
         if (!user_range_ok(uoset, 8)) return -EFAULT;
-        *(uint64_t *)uoset = t->sig_blocked;
+        sigset_put(uoset, t->sig_blocked);
     }
     if (uset) {
         if (!user_range_ok(uset, 8)) return -EFAULT;
-        uint64_t set = *(const uint64_t *)uset;
+        uint64_t set = sigset_get(uset);
         switch (how) {
         case SIG_BLOCK:   t->sig_blocked |= set; break;
         case SIG_UNBLOCK: t->sig_blocked &= ~set; break;
@@ -351,7 +278,7 @@ long sys_rt_sigprocmask(int how, uint64_t uset, uint64_t uoset, uint64_t setsize
 long sys_rt_sigpending(uint64_t uset, uint64_t setsize)
 {
     if (setsize != 8 || !user_range_ok(uset, 8)) return -EINVAL;
-    *(uint64_t *)uset = task_current()->sig_pending;
+    sigset_put(uset, task_current()->sig_pending);
     return 0;
 }
 
@@ -368,7 +295,7 @@ long sys_rt_sigsuspend(uint64_t uset, uint64_t setsize)
     struct task *t = task_current();
     if (setsize != 8 || !user_range_ok(uset, 8)) return -EINVAL;
     uint64_t old = t->sig_blocked;
-    t->sig_blocked = *(const uint64_t *)uset & ~UNCATCHABLE;
+    t->sig_blocked = sigset_get(uset) & ~UNCATCHABLE;
     while (!task_signal_pending(t))
         task_block();
     /* The handler frame must restore the pre-suspend mask, not the temporary one. */
@@ -380,16 +307,15 @@ long sys_rt_sigsuspend(uint64_t uset, uint64_t setsize)
 long sys_rt_sigreturn(struct syscall_frame *f)
 {
     struct task *t = task_current();
-    struct sigframe *fr = (struct sigframe *)f->rsp;   /* `ret` popped retaddr; rsp points at info */
-    fr = (struct sigframe *)((uint8_t *)fr - 8);
-    if (!user_range_ok((uint64_t)fr, sizeof(*fr)) || fr->magic != SIGFRAME_MAGIC) {
+    struct sigregs r;
+    uint64_t saved_mask;
+    if (arch_signal_restore_frame(f, &r, &saved_mask) != 0) {
         kprintf("[%s (pid %u): bad sigreturn frame, killing]\n", t->name, t->id);
         t->killed_sig = SIGSEGV;
         task_exit_code(128 + SIGSEGV);
     }
-    struct sigregs r = fr->saved;
-    t->sig_blocked = fr->saved_mask & ~UNCATCHABLE;
-    regs_to_syscall(&r, f);
+    t->sig_blocked = saved_mask & ~UNCATCHABLE;
+    arch_sigregs_to_syscall(&r, f);
     return 0;
 }
 
@@ -440,15 +366,14 @@ long sys_alarm(uint64_t secs)
     return left;
 }
 
-struct abi_timeval { int64_t tv_sec, tv_usec; };
-struct abi_itimerval { struct abi_timeval it_interval, it_value; };
+struct abi_itimerval { struct abi_ktimeval it_interval, it_value; };
 
-static uint64_t tv_to_ticks(const struct abi_timeval *tv)
+static uint64_t tv_to_ticks(const struct abi_ktimeval *tv)
 {
     return (uint64_t)tv->tv_sec * TIMER_HZ + (uint64_t)tv->tv_usec * TIMER_HZ / 1000000;
 }
 
-static void ticks_to_tv(uint64_t ticks, struct abi_timeval *tv)
+static void ticks_to_tv(uint64_t ticks, struct abi_ktimeval *tv)
 {
     tv->tv_sec = (int64_t)(ticks / TIMER_HZ);
     tv->tv_usec = (int64_t)((ticks % TIMER_HZ) * 1000000 / TIMER_HZ);

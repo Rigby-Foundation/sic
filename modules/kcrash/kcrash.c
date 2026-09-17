@@ -16,7 +16,7 @@ static void __attribute__((noinline)) boom(volatile int *p)
 
 int init_module(void)
 {
-    boom((volatile int *)0xFFFFD00000000010);   /* nothing is mapped there */
+    boom((volatile int *)(uintptr_t)-16);       /* the top of the address space: nothing is mapped there */
     return 0;
 }
 

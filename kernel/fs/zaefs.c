@@ -5,8 +5,9 @@
 #include "fs/blkdev.h"
 #include "mm/heap.h"
 #include "string.h"
+#include "endian.h"
 #include "printf.h"
-#include "arch/x86_64/timer.h"
+#include "asm/timer.h"
 #include "abi/zaefs.h"
 
 #define BS ZAEFS_BLOCK_SIZE
@@ -62,10 +63,23 @@ static int write_block(struct zaefs *fs, uint64_t block, const void *buf)
     return fs->dev->write(fs->dev, block * fs->sectors_per_block, fs->sectors_per_block, buf);
 }
 
+/* ---- on-disk byte order ----------------------------------------------------------- */
+/* zaefs is little-endian on disk; the in-memory superblock and inodes are
+ * host order. Conversions happen exactly here (abi/zaefs.h has the swaps). */
+#define SB_TO_HOST(sb)    ZAEFS_SB_SWAP(sb)
+#define INODE_TO_HOST(di) ZAEFS_INODE_SWAP(di)
+
 static int write_sb(struct zaefs *fs)
 {
-    return write_block(fs, 0, &fs->sb);
+    struct zaefs_superblock *copy = kmalloc(sizeof(*copy));
+    if (!copy) return -1;
+    memcpy(copy, &fs->sb, sizeof(*copy));
+    SB_TO_HOST(copy);                   /* the swap is its own inverse: host -> disk */
+    int rc = write_block(fs, 0, copy);
+    kfree(copy);
+    return rc;
 }
+
 
 /* ---- bitmaps ----------------------------------------------------------------------- */
 
@@ -156,8 +170,10 @@ static int inode_read(struct zaefs *fs, uint32_t ino, struct zaefs_inode *out)
     if (!buf) return -1;
     uint64_t off = (uint64_t)ino * ZAEFS_INODE_SIZE;
     int rc = read_block(fs, fs->sb.itable_start + off / BS, buf);
-    if (rc == 0)
+    if (rc == 0) {
         memcpy(out, buf + off % BS, sizeof(*out));
+        INODE_TO_HOST(out);
+    }
     kfree(buf);
     return rc;
 }
@@ -169,7 +185,9 @@ static int inode_write(struct zaefs *fs, uint32_t ino, const struct zaefs_inode 
     uint64_t off = (uint64_t)ino * ZAEFS_INODE_SIZE;
     int rc = read_block(fs, fs->sb.itable_start + off / BS, buf);
     if (rc == 0) {
-        memcpy(buf + off % BS, in, sizeof(*in));
+        struct zaefs_inode *disk = (void *)(buf + off % BS);
+        memcpy(disk, in, sizeof(*in));
+        INODE_TO_HOST(disk);            /* host -> disk */
         rc = write_block(fs, fs->sb.itable_start + off / BS, buf);
     }
     kfree(buf);
@@ -239,29 +257,29 @@ static int64_t bmap_indirect(struct zaefs *fs, struct zinode *zi, uint64_t lblk,
         }
         if (read_block(fs, zi->di.dindirect, ptrs) != 0) return -1;
         uint64_t i1 = lblk / ZAEFS_PTRS_PER_BLOCK;
-        if (!ptrs[i1]) {
+        if (!le32toh(ptrs[i1])) {
             if (!alloc) return -1;
             int64_t b = alloc_block(fs);
             if (b < 0) return -1;
-            ptrs[i1] = (uint32_t)b;
+            ptrs[i1] = htole32((uint32_t)b);
             zi->di.nblocks++;
             zi->dirty = 1;
             if (write_block(fs, zi->di.dindirect, ptrs) != 0) return -1;
         }
-        idx_block = ptrs[i1];
+        idx_block = le32toh(ptrs[i1]);
         if (read_block(fs, idx_block, ptrs) != 0) return -1;
         slot = &ptrs[lblk % ZAEFS_PTRS_PER_BLOCK];
     }
-    if (!*slot) {
+    if (!le32toh(*slot)) {
         if (!alloc) return -1;
         int64_t b = alloc_block(fs);
         if (b < 0) return -1;
-        *slot = (uint32_t)b;
+        *slot = htole32((uint32_t)b);
         zi->di.nblocks++;
         zi->dirty = 1;
         if (write_block(fs, idx_block, ptrs) != 0) return -1;
     }
-    return *slot;
+    return le32toh(*slot);
 }
 
 /* Free every block of an inode (data and index). */
@@ -272,16 +290,16 @@ static void free_all_blocks(struct zaefs *fs, struct zinode *zi)
         if (zi->di.direct[i]) free_block(fs, zi->di.direct[i]);
     if (zi->di.indirect && read_block(fs, zi->di.indirect, ptrs) == 0) {
         for (int i = 0; i < ZAEFS_PTRS_PER_BLOCK; i++)
-            if (ptrs[i]) free_block(fs, ptrs[i]);
+            if (ptrs[i]) free_block(fs, le32toh(ptrs[i]));
         free_block(fs, zi->di.indirect);
     }
     if (zi->di.dindirect && read_block(fs, zi->di.dindirect, ptrs) == 0) {
         for (int i = 0; i < ZAEFS_PTRS_PER_BLOCK; i++) {
             if (!ptrs[i]) continue;
-            if (read_block(fs, ptrs[i], ptrs2) == 0)
+            if (read_block(fs, le32toh(ptrs[i]), ptrs2) == 0)
                 for (int j = 0; j < ZAEFS_PTRS_PER_BLOCK; j++)
-                    if (ptrs2[j]) free_block(fs, ptrs2[j]);
-            free_block(fs, ptrs[i]);
+                    if (ptrs2[j]) free_block(fs, le32toh(ptrs2[j]));
+            free_block(fs, le32toh(ptrs[i]));
         }
         free_block(fs, zi->di.dindirect);
     }
@@ -388,10 +406,10 @@ static struct vnode *zaefs_lookup(struct vnode *dir, const char *name, size_t le
         if (pb < 0 || read_block(fs, (uint64_t)pb, blk) != 0) continue;
         for (uint32_t off = 0; off + 8 <= BS;) {
             struct zaefs_dirent *e = (void *)(blk + off);
-            if (e->rec_len < 8) break;
-            if (e->ino && e->name_len == len && memcmp(e->name, name, len) == 0)
-                return make_vnode(dir, name, len, e->ino);
-            off += e->rec_len;
+            if (le16toh(e->rec_len) < 8) break;
+            if (le32toh(e->ino) && e->name_len == len && memcmp(e->name, name, len) == 0)
+                return make_vnode(dir, name, len, le32toh(e->ino));
+            off += le16toh(e->rec_len);
         }
     }
     return NULL;
@@ -409,22 +427,22 @@ static int dir_add(struct vnode *dir, const char *name, size_t len, uint32_t ino
         if (pb < 0 || read_block(fs, (uint64_t)pb, blk) != 0) continue;
         for (uint32_t off = 0; off + 8 <= BS;) {
             struct zaefs_dirent *e = (void *)(blk + off);
-            if (e->rec_len < 8) break;
-            uint32_t used = e->ino ? ZAEFS_DIRENT_SIZE(e->name_len) : 0;
-            if (e->rec_len - used >= need) {
+            if (le16toh(e->rec_len) < 8) break;
+            uint32_t used = le32toh(e->ino) ? ZAEFS_DIRENT_SIZE(e->name_len) : 0;
+            if (le16toh(e->rec_len) - used >= need) {
                 struct zaefs_dirent *ne = (void *)(blk + off + used);
-                uint16_t total = e->rec_len;
+                uint16_t total = le16toh(e->rec_len);
                 if (used) {
-                    e->rec_len = (uint16_t)used;
-                    ne->rec_len = (uint16_t)(total - used);
+                    e->rec_len = htole16((uint16_t)used);
+                    ne->rec_len = htole16((uint16_t)(total - used));
                 }
-                ne->ino = ino;
+                ne->ino = htole32(ino);
                 ne->name_len = (uint8_t)len;
                 ne->type = type;
                 memcpy(ne->name, name, len);
                 return write_block(fs, (uint64_t)pb, blk);
             }
-            off += e->rec_len;
+            off += le16toh(e->rec_len);
         }
     }
     /* No room: append a block holding just this record. */
@@ -433,8 +451,8 @@ static int dir_add(struct vnode *dir, const char *name, size_t len, uint32_t ino
     if (pb < 0) return -1;
     memset(blk, 0, BS);
     struct zaefs_dirent *ne = (void *)blk;
-    ne->ino = ino;
-    ne->rec_len = BS;
+    ne->ino = htole32(ino);
+    ne->rec_len = htole16(BS);
     ne->name_len = (uint8_t)len;
     ne->type = type;
     memcpy(ne->name, name, len);
@@ -455,12 +473,12 @@ static int dir_remove(struct vnode *dir, uint32_t ino)
         if (pb < 0 || read_block(fs, (uint64_t)pb, blk) != 0) continue;
         for (uint32_t off = 0; off + 8 <= BS;) {
             struct zaefs_dirent *e = (void *)(blk + off);
-            if (e->rec_len < 8) break;
-            if (e->ino == ino) {
+            if (le16toh(e->rec_len) < 8) break;
+            if (le32toh(e->ino) == ino) {
                 e->ino = 0;
                 return write_block(fs, (uint64_t)pb, blk);
             }
-            off += e->rec_len;
+            off += le16toh(e->rec_len);
         }
     }
     return -1;
@@ -476,9 +494,9 @@ static int dir_is_empty(struct vnode *dir)
         if (pb < 0 || read_block(fs, (uint64_t)pb, blk) != 0) continue;
         for (uint32_t off = 0; off + 8 <= BS;) {
             struct zaefs_dirent *e = (void *)(blk + off);
-            if (e->rec_len < 8) break;
-            if (e->ino) return 0;
-            off += e->rec_len;
+            if (le16toh(e->rec_len) < 8) break;
+            if (le32toh(e->ino)) return 0;
+            off += le16toh(e->rec_len);
         }
     }
     return 1;
@@ -528,21 +546,21 @@ static int zaefs_readdir(struct vnode *dir, size_t index, struct dirent *out)
         if (pb < 0 || read_block(fs, (uint64_t)pb, blk) != 0) continue;
         for (uint32_t off = 0; off + 8 <= BS;) {
             struct zaefs_dirent *e = (void *)(blk + off);
-            if (e->rec_len < 8) break;
-            if (e->ino) {
+            if (le16toh(e->rec_len) < 8) break;
+            if (le32toh(e->ino)) {
                 if (index == 0) {
                     size_t l = e->name_len < VFS_NAME_MAX - 1 ? e->name_len : VFS_NAME_MAX - 1;
                     memset(out->name, 0, VFS_NAME_MAX);
                     memcpy(out->name, e->name, l);
                     out->type = e->type == ZAEFS_TYPE_DIR ? VNODE_DIR : VNODE_FILE;
-                    out->ino = e->ino;
+                    out->ino = le32toh(e->ino);
                     struct zaefs_inode di;
-                    out->size = inode_read(fs, e->ino, &di) == 0 ? di.size : 0;
+                    out->size = inode_read(fs, le32toh(e->ino), &di) == 0 ? di.size : 0;
                     return 1;
                 }
                 index--;
             }
-            off += e->rec_len;
+            off += le16toh(e->rec_len);
         }
     }
     return 0;
@@ -576,7 +594,9 @@ static struct vnode *zaefs_mount(struct vfs_mount *mnt, struct vnode *devnode, c
     fs->dev = dev;
     fs->sectors_per_block = BS / dev->sector_size;
 
-    if (read_block(fs, 0, &fs->sb) != 0 || fs->sb.magic != ZAEFS_MAGIC ||
+    if (read_block(fs, 0, &fs->sb) != 0) { kfree(fs->cache); kfree(fs); return NULL; }
+    SB_TO_HOST(&fs->sb);
+    if (fs->sb.magic != ZAEFS_MAGIC ||
         fs->sb.version != ZAEFS_VERSION || fs->sb.block_size != BS ||
         fs->sb.total_blocks * fs->sectors_per_block > dev->sectors) {
         kprintf("zaefs: %s: no valid zaefs superblock\n", dev->name);
@@ -599,7 +619,7 @@ static struct vnode *zaefs_mount(struct vfs_mount *mnt, struct vnode *devnode, c
     root->size = zi->di.size;
     root->priv = zi;
 
-    kprintf("zaefs: mounted %s \"%s\": %lu blocks (%lu free), %lu inodes (%lu free)\n",
+    kprintf("zaefs: mounted %s \"%s\": %llu blocks (%llu free), %llu inodes (%llu free)\n",
             dev->name, fs->sb.label, fs->sb.total_blocks, fs->sb.free_blocks,
             fs->sb.inode_count, fs->sb.free_inodes);
     return root;

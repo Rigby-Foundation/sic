@@ -6,6 +6,7 @@
 #include "printf.h"
 #include "mm/vmm.h"
 #include "spinlock.h"
+#include "asm/arch.h"
 
 static spinlock_t pmm_lock = SPINLOCK_INIT;
 
@@ -25,8 +26,8 @@ static struct { uint64_t base, len; } keep[8];
 static size_t keep_count;
 
 static inline int  test_bit(uint64_t i) { return (bitmap[i / 64] >> (i % 64)) & 1; }
-static inline void set_bit(uint64_t i)  { bitmap[i / 64] |=  (1UL << (i % 64)); }
-static inline void clr_bit(uint64_t i)  { bitmap[i / 64] &= ~(1UL << (i % 64)); }
+static inline void set_bit(uint64_t i)  { bitmap[i / 64] |=  (1ULL << (i % 64)); }
+static inline void clr_bit(uint64_t i)  { bitmap[i / 64] &= ~(1ULL << (i % 64)); }
 
 static void mark_range(uint64_t base, uint64_t len, int used)
 {
@@ -49,6 +50,9 @@ static void mark_range(uint64_t base, uint64_t len, int used)
     }
 }
 
+static uint64_t bitmap_phys_addr;
+static int bitmap_is_early;
+
 void pmm_init(const struct zaeboot_info *info)
 {
     const struct zaeboot_mmap_entry *mm = (const void *)info->mmap;
@@ -66,8 +70,8 @@ void pmm_init(const struct zaeboot_info *info)
 
     /* Place the bitmap in the first usable region (above 1 MiB, outside the
      * kernel image) that can hold it. */
-    uint64_t kstart = PAGE_ALIGN_DOWN((uint64_t)_kernel_start);
-    uint64_t kend   = PAGE_ALIGN_UP((uint64_t)_kernel_end);
+    uint64_t kstart = PAGE_ALIGN_DOWN(KERNEL_SYM_PHYS(_kernel_start));
+    uint64_t kend   = PAGE_ALIGN_UP(KERNEL_SYM_PHYS(_kernel_end));
     uint64_t bitmap_phys = 0;
     for (size_t i = 0; i < region_count && !bitmap_phys; i++) {
         if (regions[i].type != ZAEBOOT_MEM_USABLE)
@@ -83,10 +87,12 @@ void pmm_init(const struct zaeboot_info *info)
     }
     if (!bitmap_phys) {
         kprintf("pmm: no room for frame bitmap\n");
-        for (;;) __asm__ volatile("cli; hlt");
+        arch_halt_forever();
     }
+    bitmap_phys_addr = bitmap_phys;
 
-    bitmap = (uint64_t *)bitmap_phys;      /* identity mapped at this point */
+    bitmap = EARLY_P2V(bitmap_phys);        /* the direct map comes later on x86 */
+    bitmap_is_early = 1;
     memset(bitmap, 0xFF, bitmap_bytes);
     total_pages = bitmap_pages;
     used_pages  = bitmap_pages;
@@ -112,8 +118,8 @@ void pmm_keep(uint64_t base, uint64_t len)
 
 void pmm_reclaim_boot_memory(void)
 {
-    uint64_t kstart = PAGE_ALIGN_DOWN((uint64_t)_kernel_start);
-    uint64_t kend   = PAGE_ALIGN_UP((uint64_t)_kernel_end);
+    uint64_t kstart = PAGE_ALIGN_DOWN(KERNEL_SYM_PHYS(_kernel_start));
+    uint64_t kend   = PAGE_ALIGN_UP(KERNEL_SYM_PHYS(_kernel_end));
     uint64_t freed_before = used_pages;
 
     for (size_t i = 0; i < region_count; i++) {
@@ -136,7 +142,7 @@ void pmm_reclaim_boot_memory(void)
     for (size_t i = 0; i < keep_count; i++)
         mark_range(keep[i].base, keep[i].len, 1);
 
-    kprintf("pmm: reclaimed %lu KiB of boot memory\n", (freed_before - used_pages) * 4);
+    kprintf("pmm: reclaimed %llu KiB of boot memory\n", (freed_before - used_pages) * 4);
 }
 
 uint64_t pmm_alloc_pages_below(size_t count, uint64_t limit)
@@ -172,7 +178,7 @@ uint64_t pmm_alloc_pages_below(size_t count, uint64_t limit)
 
 uint64_t pmm_alloc_pages(size_t count)
 {
-    return pmm_alloc_pages_below(count, ~0UL);
+    return pmm_alloc_pages_below(count, ~0ULL);
 }
 
 uint64_t pmm_alloc_page(void)
@@ -186,7 +192,7 @@ void pmm_free_pages(uint64_t phys, size_t count)
     spin_lock(&pmm_lock);
     for (size_t k = 0; k < count; k++) {
         if (i + k >= bitmap_pages || !test_bit(i + k)) {
-            kprintf("pmm: double free of %lx\n", (i + k) << PAGE_SHIFT);
+            kprintf("pmm: double free of %llx\n", (i + k) << PAGE_SHIFT);
             continue;
         }
         clr_bit(i + k);
@@ -210,5 +216,7 @@ uint64_t pmm_highest_address(void) { return highest_addr; }
  * is accessed through it rather than the identity map. */
 void pmm_relocate_to_hhdm(void)
 {
-    bitmap = P2V((uint64_t)bitmap);
+    if (bitmap_is_early && (void *)bitmap != P2V(bitmap_phys_addr))
+        bitmap = P2V(bitmap_phys_addr);
+    bitmap_is_early = 0;
 }

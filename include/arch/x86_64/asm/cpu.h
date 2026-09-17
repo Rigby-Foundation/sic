@@ -51,6 +51,7 @@ static inline struct cpu *this_cpu(void)
     return c;
 }
 void        cpu_set_kernel_stack(uint64_t rsp0);
+void        syscall_init_cpu(void);     /* MSRs for the syscall instruction, per CPU */
 
 uint64_t rdmsr(uint32_t msr);
 void     wrmsr(uint32_t msr, uint64_t v);

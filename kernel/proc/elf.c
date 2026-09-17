@@ -12,13 +12,16 @@
 #include "fs/vfs.h"
 #include "mm/heap.h"
 #include "drivers/keyboard.h"
-#include "arch/x86_64/timer.h"
-#include "arch/x86_64/cpu.h"
+#include "asm/timer.h"
+#include "asm/cpu.h"
 #include "string.h"
 #include "printf.h"
 #include "spinlock.h"
 
-struct elf64_ehdr {
+/* The native ELF class: ELF64 on x86_64, ELF32 (big-endian) on powerpc.
+ * Fields are in the CPU's byte order, so plain struct access is right. */
+#if BITS_PER_LONG == 64
+struct elf_ehdr {
     uint8_t  ident[16];
     uint16_t type, machine;
     uint32_t version;
@@ -27,34 +30,55 @@ struct elf64_ehdr {
     uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx;
 } __attribute__((packed));
 
-struct elf64_phdr {
+struct elf_phdr {
     uint32_t type, flags;
     uint64_t offset, vaddr, paddr, filesz, memsz, align;
 } __attribute__((packed));
+#define ELFCLASS_NATIVE 2
+#else
+struct elf_ehdr {
+    uint8_t  ident[16];
+    uint16_t type, machine;
+    uint32_t version;
+    uint32_t entry, phoff, shoff;
+    uint32_t flags;
+    uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx;
+} __attribute__((packed));
+
+struct elf_phdr {
+    uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
+} __attribute__((packed));
+#define ELFCLASS_NATIVE 1
+#endif
 
 #define PT_LOAD   1
 #define PF_X      1
 #define PF_W      2
 #define ET_EXEC   2
 #define EM_X86_64 62
+#define EM_PPC    20
+#if defined(__x86_64__)
+#define EM_NATIVE EM_X86_64
+#elif defined(__powerpc__)
+#define EM_NATIVE EM_PPC
+#endif
+typedef uintptr_t elf_word_t;           /* the size of a pointer on the initial stack */
 
-#define MMAP_BASE 0x0000010000000000UL      /* 1 TiB: anonymous mappings grow up from here */
+#define MMAP_BASE USER_MMAP_BASE
 
-extern void enter_usermode(uint64_t rip, uint64_t rsp, uint64_t argc, uint64_t argv) __attribute__((noreturn));
-extern void fork_return(struct syscall_frame *f);
 
 /* ---- address-space helpers ------------------------------------------------- */
 
-static int map_zeroed(uint64_t pml4, uint64_t virt, size_t pages, uint64_t flags)
+static int map_zeroed(uint64_t pgd, uint64_t virt, size_t pages, uint64_t flags)
 {
     for (size_t i = 0; i < pages; i++) {
         uint64_t phys = pmm_alloc_page();
         if (!phys) {
-            kprintf("%s: out of physical memory (%lu/%lu pages used)\n", task_current()->name, pmm_used_pages(), pmm_total_pages());
+            kprintf("%s: out of physical memory (%llu/%llu pages used)\n", task_current()->name, pmm_used_pages(), pmm_total_pages());
             return -1;
         }
         memset(P2V(phys), 0, PAGE_SIZE);
-        int rc = vmm_map_user_page(pml4, virt + i * PAGE_SIZE, phys, flags);
+        int rc = vmm_map_user_page(pgd, virt + i * PAGE_SIZE, phys, flags);
         if (rc == -2)                       /* already mapped: keep the existing page */
             pmm_free_page(phys);
         else if (rc != 0) {
@@ -72,13 +96,13 @@ static uint64_t prot_to_pte(int prot)
 
 int process_map_anon(struct task *t, uint64_t virt, size_t pages, int prot)
 {
-    return map_zeroed(t->mm->pml4, virt, pages, prot_to_pte(prot));
+    return map_zeroed(t->mm->pgd, virt, pages, prot_to_pte(prot));
 }
 
 int process_protect(struct task *t, uint64_t virt, size_t pages, int prot)
 {
     for (size_t i = 0; i < pages; i++)
-        if (vmm_protect_user_page(t->mm->pml4, virt + i * PAGE_SIZE, prot_to_pte(prot)) != 0)
+        if (vmm_protect_user_page(t->mm->pgd, virt + i * PAGE_SIZE, prot_to_pte(prot)) != 0)
             return -1;
     return 0;
 }
@@ -86,18 +110,18 @@ int process_protect(struct task *t, uint64_t virt, size_t pages, int prot)
 void process_unmap(struct task *t, uint64_t virt, size_t pages)
 {
     for (size_t i = 0; i < pages; i++) {
-        uint64_t phys = vmm_unmap_user_page(t->mm->pml4, virt + i * PAGE_SIZE);
+        uint64_t phys = vmm_unmap_user_page(t->mm->pgd, virt + i * PAGE_SIZE);
         if (phys)
             pmm_free_page(phys);
     }
 }
 
 /* Copy into a (not necessarily current) user address space through the HHDM. */
-static int copy_to_space(uint64_t pml4, uint64_t virt, const void *src, size_t len)
+static int copy_to_space(uint64_t pgd, uint64_t virt, const void *src, size_t len)
 {
     const uint8_t *s = src;
     while (len) {
-        uint64_t phys = vmm_translate_in(pml4, virt);
+        uint64_t phys = vmm_translate_in(pgd, virt);
         if (!phys)
             return -1;
         size_t chunk = PAGE_SIZE - (virt & 0xFFF);
@@ -112,25 +136,25 @@ static int copy_to_space(uint64_t pml4, uint64_t virt, const void *src, size_t l
 }
 
 struct image {
-    uint64_t pml4, entry, brk;
+    uint64_t pgd, entry, brk;
     uint64_t phdr_addr, phnum, phent;     /* for auxv */
 };
 
 static int elf_load(struct image *im, const void *data, size_t size)
 {
-    const struct elf64_ehdr *eh = data;
-    if (size < sizeof(*eh) || memcmp(eh->ident, "\x7f" "ELF", 4) != 0 || eh->ident[4] != 2)
+    const struct elf_ehdr *eh = data;
+    if (size < sizeof(*eh) || memcmp(eh->ident, "\x7f" "ELF", 4) != 0 || eh->ident[4] != ELFCLASS_NATIVE)
         return -ENOEXEC;
-    if (eh->machine != EM_X86_64 || eh->type != ET_EXEC)
+    if (eh->machine != EM_NATIVE || eh->type != ET_EXEC)
         return -ENOEXEC;
     if (eh->ident[EI_OSABI] != ELFOSABI_SIC || eh->ident[EI_ABIVERSION] != 0) {
         kprintf("exec: not a sic executable (OS/ABI %u)\n", eh->ident[EI_OSABI]);
         return -ENOEXEC;
     }
-    if (eh->phoff + (uint64_t)eh->phnum * sizeof(struct elf64_phdr) > size)
+    if (eh->phoff + (uint64_t)eh->phnum * sizeof(struct elf_phdr) > size)
         return -ENOEXEC;
 
-    const struct elf64_phdr *ph = (const void *)((const uint8_t *)data + eh->phoff);
+    const struct elf_phdr *ph = (const void *)((const uint8_t *)data + eh->phoff);
     uint64_t top = 0;
     for (uint16_t i = 0; i < eh->phnum; i++) {
         if (ph[i].type != PT_LOAD || ph[i].memsz == 0)
@@ -146,9 +170,9 @@ static int elf_load(struct image *im, const void *data, size_t size)
         if (ph[i].flags & PF_W)   flags |= PTE_WRITE;
         if (!(ph[i].flags & PF_X)) flags |= PTE_NX;
 
-        if (map_zeroed(im->pml4, start, (end - start) / PAGE_SIZE, flags) != 0)
+        if (map_zeroed(im->pgd, start, (end - start) / PAGE_SIZE, flags) != 0)
             return -ENOMEM;
-        if (copy_to_space(im->pml4, ph[i].vaddr, (const uint8_t *)data + ph[i].offset, ph[i].filesz) != 0)
+        if (copy_to_space(im->pgd, ph[i].vaddr, (const uint8_t *)data + ph[i].offset, ph[i].filesz) != 0)
             return -ENOMEM;
         if (end > top)
             top = end;
@@ -157,7 +181,7 @@ static int elf_load(struct image *im, const void *data, size_t size)
     /* AT_PHDR must be where the program headers really are in memory: the
      * libc derives the load base from it (AT_PHDR - PT_PHDR.p_vaddr) and
      * finds PT_TLS through it. Normally the first PT_LOAD covers them. */
-    size_t phbytes = (size_t)eh->phnum * sizeof(struct elf64_phdr);
+    size_t phbytes = (size_t)eh->phnum * sizeof(struct elf_phdr);
     uint64_t phdr_addr = 0;
     for (uint16_t i = 0; i < eh->phnum; i++)
         if (ph[i].type == PT_LOAD && ph[i].offset <= eh->phoff &&
@@ -166,8 +190,8 @@ static int elf_load(struct image *im, const void *data, size_t size)
     if (!phdr_addr) {
         /* Not loaded: give the libc a private copy after the image. */
         phdr_addr = top + PAGE_SIZE;
-        if (map_zeroed(im->pml4, phdr_addr, PAGE_ALIGN_UP(phbytes) / PAGE_SIZE, PTE_NX) != 0 ||
-            copy_to_space(im->pml4, phdr_addr, ph, phbytes) != 0)
+        if (map_zeroed(im->pgd, phdr_addr, PAGE_ALIGN_UP(phbytes) / PAGE_SIZE, PTE_NX) != 0 ||
+            copy_to_space(im->pgd, phdr_addr, ph, phbytes) != 0)
             return -ENOMEM;
         top = phdr_addr + PAGE_ALIGN_UP(phbytes);
     }
@@ -175,7 +199,7 @@ static int elf_load(struct image *im, const void *data, size_t size)
     im->entry = eh->entry;
     im->phdr_addr = phdr_addr;
     im->phnum = eh->phnum;
-    im->phent = sizeof(struct elf64_phdr);
+    im->phent = sizeof(struct elf_phdr);
     im->brk = top + PAGE_SIZE;                              /* guard page, then the heap */
     return 0;
 }
@@ -220,30 +244,30 @@ static uint32_t rng(void)
 /* Build the initial stack; returns the user rsp (pointing at argc). */
 static int build_stack(const struct image *im, const struct argpack *ap, uint64_t *rsp_out)
 {
-    if (map_zeroed(im->pml4, USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE / PAGE_SIZE,
+    if (map_zeroed(im->pgd, USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE / PAGE_SIZE,
                    PTE_WRITE | PTE_NX) != 0)
         return -ENOMEM;
 
     uint64_t sp = USER_STACK_TOP;
-    uint64_t argv_ptrs[ARG_MAX + 1], envp_ptrs[ARG_MAX + 1];
+    elf_word_t argv_ptrs[ARG_MAX + 1], envp_ptrs[ARG_MAX + 1];
 
-#define PUSH_BYTES(src, len) do { sp -= (len); if (copy_to_space(im->pml4, sp, (src), (len)) != 0) return -ENOMEM; } while (0)
-    for (int i = 0; i < ap->envc; i++) { PUSH_BYTES(ap->envp[i], strlen(ap->envp[i]) + 1); envp_ptrs[i] = sp; }
-    for (int i = 0; i < ap->argc; i++) { PUSH_BYTES(ap->argv[i], strlen(ap->argv[i]) + 1); argv_ptrs[i] = sp; }
+#define PUSH_BYTES(src, len) do { sp -= (len); if (copy_to_space(im->pgd, sp, (src), (len)) != 0) return -ENOMEM; } while (0)
+    for (int i = 0; i < ap->envc; i++) { PUSH_BYTES(ap->envp[i], strlen(ap->envp[i]) + 1); envp_ptrs[i] = (elf_word_t)sp; }
+    for (int i = 0; i < ap->argc; i++) { PUSH_BYTES(ap->argv[i], strlen(ap->argv[i]) + 1); argv_ptrs[i] = (elf_word_t)sp; }
     argv_ptrs[ap->argc] = 0;
     envp_ptrs[ap->envc] = 0;
 
     uint32_t rnd[4] = { rng(), rng(), rng(), rng() };
-    sp &= ~15UL;
+    sp &= ~15ULL;
     PUSH_BYTES(rnd, 16);
-    uint64_t random_addr = sp;
+    elf_word_t random_addr = (elf_word_t)sp;
 
-    uint64_t auxv[] = {
-        AT_PHDR,   im->phdr_addr,
-        AT_PHENT,  im->phent,
-        AT_PHNUM,  im->phnum,
+    elf_word_t auxv[] = {
+        AT_PHDR,   (elf_word_t)im->phdr_addr,
+        AT_PHENT,  (elf_word_t)im->phent,
+        AT_PHNUM,  (elf_word_t)im->phnum,
         AT_PAGESZ, PAGE_SIZE,
-        AT_ENTRY,  im->entry,
+        AT_ENTRY,  (elf_word_t)im->entry,
         AT_UID, 0, AT_EUID, 0, AT_GID, 0, AT_EGID, 0,
         AT_SECURE, 0,
         AT_HWCAP,  0,
@@ -252,18 +276,19 @@ static int build_stack(const struct image *im, const struct argpack *ap, uint64_
         AT_NULL,   0,
     };
 
-    /* Vector area: argc, argv[], NULL, envp[], NULL, auxv. Keep rsp 16-aligned. */
-    size_t vec_bytes = 8 + (ap->argc + 1) * 8 + (ap->envc + 1) * 8 + sizeof(auxv);
-    sp = (sp - vec_bytes) & ~15UL;
+    /* Vector area: argc, argv[], NULL, envp[], NULL, auxv. Keep the stack 16-aligned. */
+    const size_t W = sizeof(elf_word_t);
+    size_t vec_bytes = W + (ap->argc + 1) * W + (ap->envc + 1) * W + sizeof(auxv);
+    sp = (sp - vec_bytes) & ~15ULL;
     uint64_t p = sp;
-    uint64_t argc64 = (uint64_t)ap->argc;
-    if (copy_to_space(im->pml4, p, &argc64, 8) != 0) return -ENOMEM;
-    p += 8;
-    if (copy_to_space(im->pml4, p, argv_ptrs, (ap->argc + 1) * 8) != 0) return -ENOMEM;
-    p += (ap->argc + 1) * 8;
-    if (copy_to_space(im->pml4, p, envp_ptrs, (ap->envc + 1) * 8) != 0) return -ENOMEM;
-    p += (ap->envc + 1) * 8;
-    if (copy_to_space(im->pml4, p, auxv, sizeof(auxv)) != 0) return -ENOMEM;
+    elf_word_t argc_w = (elf_word_t)ap->argc;
+    if (copy_to_space(im->pgd, p, &argc_w, W) != 0) return -ENOMEM;
+    p += W;
+    if (copy_to_space(im->pgd, p, argv_ptrs, (ap->argc + 1) * W) != 0) return -ENOMEM;
+    p += (ap->argc + 1) * W;
+    if (copy_to_space(im->pgd, p, envp_ptrs, (ap->envc + 1) * W) != 0) return -ENOMEM;
+    p += (ap->envc + 1) * W;
+    if (copy_to_space(im->pgd, p, auxv, sizeof(auxv)) != 0) return -ENOMEM;
 #undef PUSH_BYTES
 
     *rsp_out = sp;
@@ -284,13 +309,13 @@ static int build_image(const char *path, const struct argpack *ap, struct image 
         return -ENOMEM;
 
     memset(im, 0, sizeof(*im));
-    im->pml4 = vmm_create_address_space();
+    im->pgd = vmm_create_address_space();
     int rc = elf_load(im, data, size);
     kfree(data);
     if (rc == 0)
         rc = build_stack(im, ap, rsp);
     if (rc != 0) {
-        vmm_destroy_address_space(im->pml4);
+        vmm_destroy_address_space(im->pgd);
         return rc;
     }
     return 0;
@@ -312,17 +337,16 @@ static void set_name(struct task *t, const char *path)
 /* Give `t` a fresh mm for `im`; returns the old mm (to be put) or NULL. */
 static struct mm *apply_image(struct task *t, const struct image *im)
 {
-    struct mm *mm = mm_create(im->pml4);
+    struct mm *mm = mm_create(im->pgd);
     if (!mm)
         return NULL;
     mm->brk_start = mm->brk_end = im->brk;
     mm->mmap_next = MMAP_BASE;
     struct mm *old = t->mm;
     t->mm = mm;
-    t->pml4 = mm->pml4;
-    t->fs_base = 0;
+    t->pgd = mm->pgd;
+    arch_task_init_user(t);
     t->clear_child_tid = 0;
-    memcpy(t->fpu, fpu_initial_state, sizeof(t->fpu));
     return old;
 }
 
@@ -334,7 +358,7 @@ static void spawn_thunk(void *arg)
 {
     struct spawn_args a = *(struct spawn_args *)arg;
     kfree(arg);
-    enter_usermode(a.entry, a.rsp, 0, 0);
+    arch_exec_enter(task_current(), a.entry, a.rsp);
 }
 
 struct task *process_spawn(const char *path, const char *const argv[], const char *const envp[])
@@ -363,7 +387,7 @@ struct task *process_spawn(const char *path, const char *const argv[], const cha
 
     struct task *t = task_alloc(path, spawn_thunk, sa);
     if (!t) {
-        vmm_destroy_address_space(im.pml4);
+        vmm_destroy_address_space(im.pgd);
         kfree(sa);
         return NULL;
     }
@@ -371,10 +395,10 @@ struct task *process_spawn(const char *path, const char *const argv[], const cha
     t->fdt = fdt_create();
     apply_image(t, &im);                /* a fresh task has no old mm to return */
     if (!t->fdt || !t->mm) {
-        if (!t->mm) vmm_destroy_address_space(im.pml4); else mm_put(t->mm);
+        if (!t->mm) vmm_destroy_address_space(im.pgd); else mm_put(t->mm);
         fdt_put(t->fdt);
         signal_release(t);
-        heap_free_pages(t->stack, t->stack_pages);
+        kstack_free(t->stack, t->stack_pages);
         kfree(t);
         kfree(sa);
         return NULL;
@@ -414,8 +438,8 @@ long process_exec(const char *path, const char *const argv[], const char *const 
      * Other threads of the process, if any, are told to exit. */
     set_name(t, path);
     struct mm *old = apply_image(t, &im);
-    if (!t->mm || t->mm->pml4 != im.pml4) {
-        vmm_destroy_address_space(im.pml4);
+    if (!t->mm || t->mm->pgd != im.pgd) {
+        vmm_destroy_address_space(im.pgd);
         return -ENOMEM;
     }
     task_kill_other_threads();
@@ -424,34 +448,27 @@ long process_exec(const char *path, const char *const argv[], const char *const 
         t->tgid = t->id;
     }
     signal_exec(t);
-    write_cr3(im.pml4);
-    wrmsr(MSR_FS_BASE, 0);
+    arch_task_init_user(t);
     mm_put(old);
-    enter_usermode(im.entry, rsp, 0, 0);
+    arch_exec_enter(t, im.entry, rsp);
 }
 
 /* ---- fork --------------------------------------------------------------------------- */
-
-static void fork_thunk(void *arg)
-{
-    (void)arg;
-    fork_return((struct syscall_frame *)(task_current()->kstack_top - sizeof(struct syscall_frame)));
-}
 
 long process_fork(struct syscall_frame *f)
 {
     struct task *parent = task_current();
 
-    uint64_t pml4 = vmm_clone_address_space(parent->mm->pml4);
-    if (!pml4)
+    uint64_t pgd = vmm_clone_address_space(parent->mm->pgd);
+    if (!pgd)
         return -ENOMEM;
-    struct mm *mm = mm_create(pml4);
-    struct task *child = mm ? task_alloc_reserve(parent->name, fork_thunk, NULL, sizeof(struct syscall_frame)) : NULL;
+    struct mm *mm = mm_create(pgd);
+    struct task *child = mm ? task_alloc(parent->name, NULL, NULL) : NULL;
     struct fdtable *fdt = child ? fdt_clone(parent->fdt) : NULL;
     if (!mm || !child || !fdt || signal_fork(child, parent) != 0) {
         if (fdt) fdt_put(fdt);
-        if (child) { signal_release(child); heap_free_pages(child->stack, child->stack_pages); kfree(child); }
-        if (mm) mm_put(mm); else vmm_destroy_address_space(pml4);
+        if (child) { signal_release(child); kstack_free(child->stack, child->stack_pages); kfree(child); }
+        if (mm) mm_put(mm); else vmm_destroy_address_space(pgd);
         return -ENOMEM;
     }
     spin_lock(&parent->mm->lock);
@@ -460,21 +477,14 @@ long process_fork(struct syscall_frame *f)
     mm->mmap_next = parent->mm->mmap_next;
     spin_unlock(&parent->mm->lock);
 
-    /* The child resumes right after the syscall instruction with rax = 0. */
-    struct syscall_frame *cf = (struct syscall_frame *)(child->kstack_top - sizeof(*cf));
-    *cf = *f;
-    cf->rax = 0;
-
+    arch_task_fork(child, parent, f, 0, 0);
     child->mm = mm;
-    child->pml4 = pml4;
+    child->pgd = pgd;
     child->fdt = fdt;
     child->is_user = 1;
     child->parent_id = parent->tgid;
     child->cwd = parent->cwd;
-    child->fs_base = parent->fs_base;
     child->clear_child_tid = 0;
-    fpu_save(parent->fpu);                  /* the parent's live state is in the registers */
-    memcpy(child->fpu, parent->fpu, sizeof(child->fpu));
 
     task_start(child);
     return child->id;
@@ -500,23 +510,19 @@ long process_clone(struct syscall_frame *f, uint64_t flags, uint64_t stack, uint
     if (!(flags & CLONE_THREAD) || !stack)
         return -EINVAL;                 /* shared-VM non-thread clones: not supported */
 
-    struct task *t = task_alloc_reserve(parent->name, fork_thunk, NULL, sizeof(struct syscall_frame));
+    struct task *t = task_alloc(parent->name, NULL, NULL);
     if (!t)
         return -ENOMEM;
     signal_release(t);                  /* task_alloc gave it a private sighand */
-
-    struct syscall_frame *cf = (struct syscall_frame *)(t->kstack_top - sizeof(*cf));
-    *cf = *f;
-    cf->rax = 0;
-    cf->rsp = stack;
+    arch_task_fork(t, parent, f, stack, (flags & CLONE_SETTLS) ? tls : 0);
 
     t->mm = mm_get(parent->mm);
-    t->pml4 = t->mm->pml4;
+    t->pgd = t->mm->pgd;
     t->fdt = (flags & CLONE_FILES) ? fdt_get(parent->fdt) : fdt_clone(parent->fdt);
     if (flags & CLONE_SIGHAND)
         signal_clone(t, parent);
     else if (signal_fork(t, parent) != 0) {
-        mm_put(t->mm); fdt_put(t->fdt); heap_free_pages(t->stack, t->stack_pages); kfree(t);
+        mm_put(t->mm); fdt_put(t->fdt); kstack_free(t->stack, t->stack_pages); kfree(t);
         return -ENOMEM;
     }
     t->is_user = 1;
@@ -524,17 +530,14 @@ long process_clone(struct syscall_frame *f, uint64_t flags, uint64_t stack, uint
     t->tgid = parent->tgid;
     t->parent_id = parent->parent_id;
     t->cwd = parent->cwd;
-    t->fs_base = (flags & CLONE_SETTLS) ? tls : parent->fs_base;
     t->clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? ctid : 0;
-    fpu_save(parent->fpu);
-    memcpy(t->fpu, parent->fpu, sizeof(t->fpu));
 
     task_start(t);                      /* assigns the tid */
     if ((flags & CLONE_PARENT_SETTID) && ptid >= USER_BASE && ptid + 4 <= USER_END &&
-        vmm_translate_in(parent->mm->pml4, ptid))
+        vmm_translate_in(parent->mm->pgd, ptid))
         *(volatile uint32_t *)ptid = t->id;
     if ((flags & CLONE_CHILD_SETTID) && ctid >= USER_BASE && ctid + 4 <= USER_END &&
-        vmm_translate_in(parent->mm->pml4, ctid))
+        vmm_translate_in(parent->mm->pgd, ctid))
         *(volatile uint32_t *)ctid = t->id;
     return t->id;
 }

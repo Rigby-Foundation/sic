@@ -4,6 +4,7 @@
  * created; VFAT long names are read (so files written elsewhere show their
  * real names) but never written. */
 #include "fs/vfs.h"
+#include "endian.h"
 #include "fs/blkdev.h"
 #include "mm/heap.h"
 #include "string.h"
@@ -153,7 +154,7 @@ static uint32_t fat_get(struct fat *fs, uint32_t cluster)
         v = fs->fat_cache[in] | (fs->fat_cache[in + 1] << 8);
         if (v >= 0xFFF8) v = 0x0FFFFFFF;
     } else {
-        memcpy(&v, fs->fat_cache + in, 4);
+        v = get_le32(fs->fat_cache + in);
         v &= 0x0FFFFFFF;
         if (v >= 0x0FFFFFF8) v = 0x0FFFFFFF;
     }
@@ -178,10 +179,8 @@ static int fat_set(struct fat *fs, uint32_t cluster, uint32_t value)
         fs->fat_cache[in] = (uint8_t)value;
         fs->fat_cache[in + 1] = (uint8_t)(value >> 8);
     } else {
-        uint32_t old;
-        memcpy(&old, fs->fat_cache + in, 4);
-        value = (old & 0xF0000000) | (value & 0x0FFFFFFF);
-        memcpy(fs->fat_cache + in, &value, 4);
+        uint32_t old = get_le32(fs->fat_cache + in);
+        put_le32(fs->fat_cache + in, (old & 0xF0000000) | (value & 0x0FFFFFFF));
     }
     return fat_sector_store(fs);
 }
@@ -326,7 +325,7 @@ static int dir_walk(struct fat *fs, struct fnode *d, dir_cb cb, void *arg)
                 memcpy(part, l->name1, 10); memcpy(part + 5, l->name2, 12); memcpy(part + 11, l->name3, 4);
                 int base = (seq - 1) * 13;
                 for (int k = 0; k < 13; k++) {
-                    uint16_t ch = part[k];
+                    uint16_t ch = le16toh(part[k]);
                     if (ch == 0 || ch == 0xFFFF) { if (base + k > lfn_len) lfn_len = base + k; break; }
                     lfn[base + k] = ch < 128 ? (char)ch : '?';
                     if (base + k + 1 > lfn_len) lfn_len = base + k + 1;
@@ -385,13 +384,13 @@ static struct vnode *make_vnode(struct vnode *dir, const char *name, size_t len,
 {
     struct fnode *fn = kzalloc(sizeof(*fn));
     if (!fn) return NULL;
-    fn->cluster = ((uint32_t)e->cluster_hi << 16) | e->cluster_lo;
+    fn->cluster = ((uint32_t)le16toh(e->cluster_hi) << 16) | le16toh(e->cluster_lo);
     fn->dirent_sector = pos->sector;
     fn->dirent_off = pos->off;
     struct vnode *n = vnode_alloc(name, len, (e->attr & ATTR_DIR) ? VNODE_DIR : VNODE_FILE, dir);
     if (!n) { kfree(fn); return NULL; }
     n->priv = fn;
-    n->size = (e->attr & ATTR_DIR) ? 0 : e->size;
+    n->size = (e->attr & ATTR_DIR) ? 0 : le32toh(e->size);
     n->ino = fn->cluster ? fn->cluster : (pos->sector << 4 | pos->off / 32);
     return n;
 }
@@ -414,9 +413,9 @@ static int write_dirent(struct vnode *n)
     if (!fn->dirent_sector) return 0;           /* the root */
     if (read_sector(fs, fn->dirent_sector, fs->sec) != 0) return -1;
     struct fat_dirent *e = (void *)(fs->sec + fn->dirent_off);
-    e->size = n->type == VNODE_DIR ? 0 : (uint32_t)n->size;
-    e->cluster_hi = (uint16_t)(fn->cluster >> 16);
-    e->cluster_lo = (uint16_t)fn->cluster;
+    e->size = htole32(n->type == VNODE_DIR ? 0 : (uint32_t)n->size);
+    e->cluster_hi = htole16((uint16_t)(fn->cluster >> 16));
+    e->cluster_lo = htole16((uint16_t)fn->cluster);
     return write_sector(fs, fn->dirent_sector, fs->sec);
 }
 
@@ -452,12 +451,12 @@ static struct vnode *fat_create(struct vnode *dir, const char *name, size_t len,
     memset(&e, 0, sizeof(e));
     memcpy(e.name, raw, 11);
     e.attr = type == VNODE_DIR ? ATTR_DIR : 0;
-    e.mdate = e.cdate = (uint16_t)(((2026 - 1980) << 9) | (1 << 5) | 1);
+    e.mdate = e.cdate = htole16((uint16_t)(((2026 - 1980) << 9) | (1 << 5) | 1));
     if (type == VNODE_DIR) {
         uint32_t c = alloc_cluster(fs);
         if (!c) return NULL;
-        e.cluster_hi = (uint16_t)(c >> 16);
-        e.cluster_lo = (uint16_t)c;
+        e.cluster_hi = htole16((uint16_t)(c >> 16));
+        e.cluster_lo = htole16((uint16_t)c);
         /* "." and ".." */
         uint8_t *sec = fs->sec;
         memset(sec, 0, fs->sector_size);
@@ -467,7 +466,7 @@ static struct vnode *fat_create(struct vnode *dir, const char *name, size_t len,
         memset(dotdot->name, ' ', 11); dotdot->name[0] = dotdot->name[1] = '.'; dotdot->attr = ATTR_DIR;
         uint32_t pc = fn_of(dir)->fixed_root ? 0 : fn_of(dir)->cluster;
         if (fs->type == 32 && pc == fs->root_cluster) pc = 0;
-        dotdot->cluster_hi = (uint16_t)(pc >> 16); dotdot->cluster_lo = (uint16_t)pc;
+        dotdot->cluster_hi = htole16((uint16_t)(pc >> 16)); dotdot->cluster_lo = htole16((uint16_t)pc);
         if (write_sector(fs, cluster_sector(fs, c), sec) != 0) return NULL;
     }
     if (read_sector(fs, pos.sector, fs->sec) != 0) return NULL;
@@ -578,8 +577,9 @@ static int readdir_cb(struct fat *fs, const struct fat_dirent *e, const char *na
     memset(ra->out->name, 0, VFS_NAME_MAX);
     memcpy(ra->out->name, name, l);
     ra->out->type = (e->attr & ATTR_DIR) ? VNODE_DIR : VNODE_FILE;
-    ra->out->size = (e->attr & ATTR_DIR) ? 0 : e->size;
-    ra->out->ino = ((uint32_t)e->cluster_hi << 16 | e->cluster_lo) ? ((uint32_t)e->cluster_hi << 16 | e->cluster_lo) : (pos->sector << 4 | pos->off / 32);
+    ra->out->size = (e->attr & ATTR_DIR) ? 0 : le32toh(e->size);
+    uint32_t cl = (uint32_t)le16toh(e->cluster_hi) << 16 | le16toh(e->cluster_lo);
+    ra->out->ino = cl ? cl : (pos->sector << 4 | pos->off / 32);
     return 1;
 }
 
@@ -619,7 +619,7 @@ static struct vnode *fat_mount(struct vfs_mount *mnt, struct vnode *devnode, con
         goto bad;
 
     struct bpb *b = (void *)fs->sec;
-    if (b->bytes_per_sector != fs->sector_size || b->sectors_per_cluster == 0 || b->fats == 0 ||
+    if (le16toh(b->bytes_per_sector) != fs->sector_size || b->sectors_per_cluster == 0 || b->fats == 0 ||
         (fs->sec[510] != 0x55 || fs->sec[511] != 0xAA)) {
         kprintf("fat: %s: no FAT boot sector\n", dev->name);
         goto bad;
@@ -627,16 +627,16 @@ static struct vnode *fat_mount(struct vfs_mount *mnt, struct vnode *devnode, con
     fs->sectors_per_cluster = b->sectors_per_cluster;
     fs->cluster_size = fs->sectors_per_cluster * fs->sector_size;
     fs->fats = b->fats;
-    fs->fat_start = b->reserved_sectors;
-    fs->fat_sectors = b->fat_size16 ? b->fat_size16 : b->fat_size32;
-    uint32_t total = b->total_sectors16 ? b->total_sectors16 : b->total_sectors32;
-    fs->root_sectors = (b->root_entries * 32 + fs->sector_size - 1) / fs->sector_size;
+    fs->fat_start = le16toh(b->reserved_sectors);
+    fs->fat_sectors = b->fat_size16 ? le16toh(b->fat_size16) : le32toh(b->fat_size32);
+    uint32_t total = b->total_sectors16 ? le16toh(b->total_sectors16) : le32toh(b->total_sectors32);
+    fs->root_sectors = (le16toh(b->root_entries) * 32 + fs->sector_size - 1) / fs->sector_size;
     fs->root_start = fs->fat_start + fs->fats * fs->fat_sectors;
     fs->data_start = fs->root_start + fs->root_sectors;
     fs->clusters = (total - fs->data_start) / fs->sectors_per_cluster;
     fs->type = fs->clusters < 4085 ? 12 : fs->clusters < 65525 ? 16 : 32;
     fs->eoc = fs->type == 12 ? 0xFFF : fs->type == 16 ? 0xFFFF : 0x0FFFFFFF;
-    fs->root_cluster = fs->type == 32 ? b->root_cluster : 0;
+    fs->root_cluster = fs->type == 32 ? le32toh(b->root_cluster) : 0;
     fs->next_free = 2;
     char label[12] = "";
     memcpy(label, fs->type == 32 ? b->label : (const char *)(fs->sec + 43), 11);

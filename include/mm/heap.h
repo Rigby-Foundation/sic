@@ -14,6 +14,11 @@ void  kfree(void *ptr);
 void *heap_alloc_pages(size_t count);
 void  heap_free_pages(void *virt, size_t count);
 
+/* Kernel stacks: physically contiguous pages in the direct map, so that
+ * exception entry can find them before address translation is on (powerpc). */
+void *kstack_alloc(size_t pages);
+void  kstack_free(void *virt, size_t pages);
+
 struct heap_stats {
     uint64_t pages_mapped;      /* backing pages currently mapped */
     uint64_t slabs;             /* live slabs */

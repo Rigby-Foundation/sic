@@ -6,9 +6,9 @@
 #include "string.h"
 #include "printf.h"
 #include "spinlock.h"
-#include "arch/x86_64/apic.h"
-#include "arch/x86_64/smp.h"
-#include "arch/x86_64/cpu.h"
+#include "asm/apic.h"
+#include "asm/smp.h"
+#include "asm/cpu.h"
 
 #define ENTRIES 512
 #define IDX(virt, level) (((virt) >> (12 + 9 * (level))) & 0x1FF)
@@ -98,7 +98,7 @@ void vmm_init(void)
     active = 1;
     pmm_relocate_to_hhdm();
 
-    kprintf("vmm: %lu MiB identity + HHDM mapped, pml4 at %lx\n", span >> 20, kernel_pml4);
+    kprintf("vmm: %llu MiB identity + HHDM mapped, pml4 at %llx\n", span >> 20, kernel_pml4);
 }
 
 static int map_in(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t flags, uint64_t tflags)
@@ -191,7 +191,7 @@ static uint64_t translate_in(uint64_t pml4, uint64_t virt)
 
 uint64_t vmm_translate(uint64_t virt)                 { return translate_in(kernel_pml4, virt); }
 uint64_t vmm_translate_in(uint64_t pml4, uint64_t virt) { return translate_in(pml4, virt); }
-uint64_t vmm_kernel_pml4(void)                        { return kernel_pml4; }
+uint64_t vmm_kernel_pgd(void)                        { return kernel_pml4; }
 
 static uint64_t mmio_next = MMIO_BASE;
 
@@ -242,7 +242,7 @@ void vmm_flush_range(uint64_t virt, size_t pages)
     lapic_broadcast_ipi(IPI_TLB_SHOOTDOWN);
     if (can_wait)
         while (shootdown_acks < smp_cpu_count() - 1)
-            __asm__ volatile("pause");
+            cpu_relax();
     spin_unlock(&shootdown_lock);
 }
 

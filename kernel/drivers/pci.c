@@ -1,31 +1,28 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
-/* PCI: configuration space via the legacy 0xCF8/0xCFC ports. */
+/* PCI enumeration. The configuration-space mechanism itself is the
+ * architecture's (asm/pci.h): 0xCF8/0xCFC ports on x86, the host bridge's
+ * registers on a PowerMac. */
 #include "drivers/pci.h"
-#include "arch/x86_64/io.h"
+#include "asm/pci.h"
 #include "printf.h"
 
 static struct pci_dev devs[PCI_MAX_DEVS];
 static size_t ndevs;
 
-static inline uint32_t addr(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off)
-{
-    return 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)slot << 11) | ((uint32_t)func << 8) | (off & 0xFC);
-}
-
-static inline void outl(uint16_t port, uint32_t v) { __asm__ volatile("outl %0, %1" : : "a"(v), "Nd"(port)); }
-static inline uint32_t inl(uint16_t port) { uint32_t v; __asm__ volatile("inl %1, %0" : "=a"(v) : "Nd"(port)); return v; }
-
 uint32_t pci_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off)
 {
-    outl(0xCF8, addr(bus, slot, func, off));
-    return inl(0xCFC);
+    return arch_pci_read32(bus, slot, func, off);
+}
+
+int pci_irq(const struct pci_dev *d)
+{
+    return arch_pci_irq(d->bus, d->slot, d->func);
 }
 
 void pci_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint32_t v)
 {
-    outl(0xCF8, addr(bus, slot, func, off));
-    outl(0xCFC, v);
+    arch_pci_write32(bus, slot, func, off, v);
 }
 
 static void probe(uint8_t bus, uint8_t slot, uint8_t func)
@@ -61,6 +58,7 @@ static void probe(uint8_t bus, uint8_t slot, uint8_t func)
 
 void pci_init(void)
 {
+    arch_pci_init();
     for (int bus = 0; bus < 256; bus++)
         for (int slot = 0; slot < 32; slot++) {
             uint32_t id = pci_read32(bus, slot, 0, 0);
@@ -72,7 +70,7 @@ void pci_init(void)
         }
     kprintf("pci: %lu device(s)\n", ndevs);
     for (size_t i = 0; i < ndevs; i++)
-        kprintf("  %02x:%02x.%u %04x:%04x class %02x.%02x.%02x bar0 %lx\n",
+        kprintf("  %02x:%02x.%u %04x:%04x class %02x.%02x.%02x bar0 %llx\n",
                 devs[i].bus, devs[i].slot, devs[i].func, devs[i].vendor, devs[i].device,
                 devs[i].class, devs[i].subclass, devs[i].prog_if, devs[i].bar[0]);
 }

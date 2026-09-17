@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
 #include "fs/blkdev.h"
+#include "endian.h"
 #include "fs/vfs.h"
 #include "mm/heap.h"
 #include "string.h"
@@ -169,25 +170,25 @@ static void scan_partitions(struct blkdev *disk)
         struct gpt_header h;
         if (disk->read(disk, 1, 1, sec) != 0) goto out;
         memcpy(&h, sec, sizeof(h));
-        if (memcmp(h.sig, "EFI PART", 8) != 0 || h.entry_size < sizeof(struct gpt_entry)) goto out;
-        uint32_t per_sector = 512 / h.entry_size;
+        uint32_t entry_size = le32toh(h.entry_size), entry_count = le32toh(h.entry_count);
+        uint64_t entries_lba = le64toh(h.entries_lba);
+        if (memcmp(h.sig, "EFI PART", 8) != 0 || entry_size < sizeof(struct gpt_entry)) goto out;
+        uint32_t per_sector = 512 / entry_size;
         int index = 1;
-        for (uint32_t i = 0; i < h.entry_count && i < 128; i++) {
-            if (i % per_sector == 0 && disk->read(disk, h.entries_lba + i / per_sector, 1, sec) != 0) break;
-            struct gpt_entry *e = (void *)(sec + (i % per_sector) * h.entry_size);
+        for (uint32_t i = 0; i < entry_count && i < 128; i++) {
+            if (i % per_sector == 0 && disk->read(disk, entries_lba + i / per_sector, 1, sec) != 0) break;
+            struct gpt_entry *e = (void *)(sec + (i % per_sector) * entry_size);
             int empty = 1;
             for (int k = 0; k < 16; k++) if (e->type[k]) empty = 0;
             if (empty) { index++; continue; }
-            add_partition(disk, index++, e->first, e->last - e->first + 1);
+            add_partition(disk, index++, le64toh(e->first), le64toh(e->last) - le64toh(e->first) + 1);
         }
         goto out;
     }
     /* MBR: primary partitions only. */
     for (int i = 0; i < 4; i++) {
         uint8_t *e = sec + 446 + i * 16;
-        uint32_t start, count;
-        memcpy(&start, e + 8, 4);
-        memcpy(&count, e + 12, 4);
+        uint32_t start = get_le32(e + 8), count = get_le32(e + 12);
         if (e[4] && count)
             add_partition(disk, i + 1, start, count);
     }
@@ -214,9 +215,9 @@ void blkdev_register(struct blkdev *d)
         n->is_block = 1;
     }
     if (d->parent)
-        kprintf("blk:   %s: %lu MiB at sector %lu\n", d->name, d->sectors * d->sector_size >> 20, d->start);
+        kprintf("blk:   %s: %llu MiB at sector %llu\n", d->name, d->sectors * d->sector_size >> 20, d->start);
     else
-        kprintf("blk: %s: %lu MiB (%lu x %u)\n", d->name,
+        kprintf("blk: %s: %llu MiB (%llu x %u)\n", d->name,
                 d->sectors * d->sector_size >> 20, d->sectors, d->sector_size);
     if (!d->parent)
         scan_partitions(d);

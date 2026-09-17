@@ -1,17 +1,17 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
 /* Symmetric multiprocessing: bring up application processors. */
-#include "arch/x86_64/smp.h"
-#include "arch/x86_64/cpu.h"
-#include "arch/x86_64/acpi.h"
-#include "arch/x86_64/apic.h"
+#include "asm/smp.h"
+#include "asm/cpu.h"
+#include "asm/acpi.h"
+#include "asm/apic.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
-#include "arch/x86_64/pit.h"
+#include "asm/pit.h"
 #include "proc/sched.h"
 #include "string.h"
 #include "printf.h"
-#include "arch/x86_64/idt.h"
+#include "asm/idt.h"
 #include "proc/syscall.h"
 
 #define TRAMPOLINE_PHYS 0x8000
@@ -50,7 +50,7 @@ static int start_ap(struct cpu *c)
     if (!stack)
         return -1;
 
-    *(uint64_t *)tramp(&ap_param_cr3)   = vmm_kernel_pml4();
+    *(uint64_t *)tramp(&ap_param_cr3)   = vmm_kernel_pgd();
     *(uint64_t *)tramp(&ap_param_stack) = (uint64_t)stack + AP_STACK_PAGES * 4096;
     *(uint64_t *)tramp(&ap_param_entry) = (uint64_t)ap_main;
     *(uint64_t *)tramp(&ap_param_cpu)   = (uint64_t)c;

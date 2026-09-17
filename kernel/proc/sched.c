@@ -3,20 +3,19 @@
 /* Preemptive round-robin scheduler for kernel and user tasks, SMP-safe with
  * one global run queue protected by sched_lock. */
 #include "proc/sched.h"
-#include "arch/x86_64/cpu.h"
+#include "asm/cpu.h"
 #include "mm/heap.h"
-#include "arch/x86_64/timer.h"
+#include "asm/timer.h"
 #include "mm/vmm.h"
 #include "string.h"
 #include "printf.h"
 #include "spinlock.h"
 #include "proc/futex.h"
+#include "asm/arch.h"
 
 #define STACK_PAGES 16      /* 64 KiB: filesystem code keeps 4 KiB blocks on the stack */
 #define TIME_SLICE  (TIMER_HZ / 100)     /* 10 ms */
 
-extern void switch_context(uint64_t *old_rsp, uint64_t new_rsp);
-extern void task_trampoline(void);
 extern char stack_top[];                 /* boot stack, entry.S */
 
 static struct task boot_task = { .id = 0, .tgid = 0, .name = "main", .state = TASK_RUNNING };
@@ -98,7 +97,7 @@ static void reap_zombies(void)
         signal_release(t);
         mm_put(t->mm);
         if (t->stack)
-            heap_free_pages(t->stack, t->stack_pages);
+            kstack_free(t->stack, t->stack_pages);
         kfree(t);
     }
 }
@@ -111,7 +110,7 @@ static void wake_sleepers(uint64_t now)
 #ifdef CONFIG_SIGNALS
         if (t->alarm_at && t->alarm_at <= now && t->state != TASK_ZOMBIE) {
             t->alarm_at = t->alarm_interval ? now + t->alarm_interval : 0;
-            __atomic_fetch_or(&t->sig_pending, 1UL << (SIGALRM - 1), __ATOMIC_SEQ_CST);
+            __atomic_fetch_or(&t->sig_pending, 1ULL << (SIGALRM - 1), __ATOMIC_SEQ_CST);
             if (t->state == TASK_SLEEPING || t->state == TASK_BLOCKED)
                 rq_push(t);
             else
@@ -148,16 +147,7 @@ static void schedule(void)
         return;
 
     cpu->current = next;
-    cpu_set_kernel_stack(next->kstack_top);
-    if (prev->is_user)
-        fpu_save(prev->fpu);
-    if (next->is_user) {
-        fpu_restore(next->fpu);
-        wrmsr(MSR_FS_BASE, next->fs_base);
-    }
-    if (next->pml4 != read_cr3())
-        write_cr3(next->pml4);
-    switch_context(&prev->rsp, next->rsp);
+    arch_switch(prev, next);
     /* Back on `prev`'s stack, some time later — possibly on another CPU. */
 }
 
@@ -173,7 +163,7 @@ static void idle_main(void *arg)
     (void)arg;
     for (;;) {
         reap_zombies();
-        __asm__ volatile("sti; hlt");
+        arch_idle();
     }
 }
 
@@ -188,16 +178,15 @@ struct task *task_alloc_reserve(const char *name, task_entry_t entry, void *arg,
     if (!t)
         return NULL;
     t->stack_pages = STACK_PAGES;
-    t->stack = heap_alloc_pages(STACK_PAGES);
+    t->stack = kstack_alloc(STACK_PAGES);
     if (!t->stack) {
         kfree(t);
         return NULL;
     }
-    t->kstack_top = (uint64_t)t->stack + STACK_PAGES * 4096;
-    t->pml4 = vmm_kernel_pml4();
-    memcpy(t->fpu, fpu_initial_state, sizeof(t->fpu));
+    t->kstack_top = (uint64_t)(uintptr_t)t->stack + STACK_PAGES * 4096;
+    t->pgd = vmm_kernel_pgd();
     if (signal_init_task(t) != 0) {
-        heap_free_pages(t->stack, STACK_PAGES);
+        kstack_free(t->stack, STACK_PAGES);
         kfree(t);
         return NULL;
     }
@@ -207,17 +196,7 @@ struct task *task_alloc_reserve(const char *name, task_entry_t entry, void *arg,
         n = sizeof(t->name) - 1;
     memcpy(t->name, name, n);
 
-    /* Initial frame, as switch_context expects to pop it:
-     * r15 r14 r13(entry) r12(arg) rbx rbp | return -> task_trampoline. */
-    uint64_t *sp = (uint64_t *)(t->kstack_top - ((reserve + 15) & ~15UL));
-    *--sp = (uint64_t)task_trampoline;
-    *--sp = 0;                      /* rbp */
-    *--sp = 0;                      /* rbx */
-    *--sp = (uint64_t)arg;          /* r12 */
-    *--sp = (uint64_t)entry;        /* r13 */
-    *--sp = 0;                      /* r14 */
-    *--sp = 0;                      /* r15 */
-    t->rsp = (uint64_t)sp;
+    arch_task_setup(t, entry, arg, reserve);
     t->state = TASK_READY;
     return t;
 }
@@ -259,8 +238,8 @@ void sched_init(void)
 {
     struct cpu *c = this_cpu();
     boot_task.slice_left = TIME_SLICE;
-    boot_task.kstack_top = (uint64_t)stack_top;
-    boot_task.pml4 = vmm_kernel_pml4();
+    boot_task.kstack_top = (uint64_t)(uintptr_t)stack_top;
+    boot_task.pgd = vmm_kernel_pgd();
     c->current = &boot_task;
     c->idle = make_idle(c);
     started = 1;
@@ -279,10 +258,8 @@ void sched_init_ap(struct cpu *c)
 void sched_enter_idle(void)
 {
     struct cpu *c = this_cpu();
-    uint64_t scratch;
     spin_lock_irqsave(&sched_lock);
-    switch_context(&scratch, c->idle->rsp);
-    __builtin_unreachable();
+    arch_switch_first(c->idle);
 }
 
 struct task *task_current(void) { return CUR; }
@@ -330,12 +307,17 @@ void task_wake(struct task *t)
     spin_unlock_irqrestore(&sched_lock, f);
 }
 
+/* The list walk must be locked: the reaper on another CPU unlinks zombies
+ * and reuses their `next` for its own list, which a bare walk would follow
+ * off the end (seen as a spurious ESRCH from tkill). */
 struct task *task_find(uint32_t id)
 {
+    struct task *found = NULL;
+    uint64_t f = spin_lock_irqsave(&sched_lock);
     for (struct task *t = all_tasks; t; t = t->next)
-        if (t->id == id)
-            return t;
-    return NULL;
+        if (t->id == id) { found = t; break; }
+    spin_unlock_irqrestore(&sched_lock, f);
+    return found;
 }
 
 void task_foreach(void (*fn)(struct task *t, void *arg), void *arg)
@@ -372,7 +354,7 @@ static void clear_child_tid(struct task *t)
 {
     if (!t->clear_child_tid || !t->mm)
         return;
-    uint64_t phys = vmm_translate_in(t->mm->pml4, t->clear_child_tid);
+    uint64_t phys = vmm_translate_in(t->mm->pgd, t->clear_child_tid);
     if (phys) {
         *(volatile uint32_t *)P2V(phys) = 0;
         futex_wake_phys(phys, 1);
@@ -390,7 +372,7 @@ void task_exit_code(int code)
     CUR->state = TASK_ZOMBIE;
     schedule();
     kprintf("sched: zombie %s resumed?!\n", CUR->name);
-    for (;;) __asm__ volatile("cli; hlt");
+    arch_halt_forever();
 }
 
 void task_exit(void) { task_exit_code(0); }
@@ -435,7 +417,7 @@ void task_exit_group(int code)
     self->state = TASK_ZOMBIE;
     schedule();
     kprintf("sched: zombie %s resumed?!\n", CUR->name);
-    for (;;) __asm__ volatile("cli; hlt");
+    arch_halt_forever();
 }
 
 int task_alive(uint32_t id)
@@ -491,7 +473,7 @@ void sched_dump(void)
     uint64_t f = spin_lock_irqsave(&sched_lock);
     kprintf("tasks:\n");
     for (struct task *t = all_tasks; t; t = t->next)
-        kprintf("  %2u %-12s %-8s cpu %u  runtime %lu ms%s\n",
+        kprintf("  %2u %-12s %-8s cpu %u  runtime %llu ms%s\n",
                 t->id, t->name, names[t->state], t->last_cpu,
                 t->runtime * 1000 / TIMER_HZ, t->is_user ? "  [user]" : "");
     spin_unlock_irqrestore(&sched_lock, f);

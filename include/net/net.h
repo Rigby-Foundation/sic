@@ -16,13 +16,14 @@
 #include "spinlock.h"
 #include "proc/wait.h"
 #include "abi/abi.h"
+#include "endian.h"
 
 extern spinlock_t net_lock;
 
-static inline uint16_t htons(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
-static inline uint16_t ntohs(uint16_t v) { return htons(v); }
-static inline uint32_t htonl(uint32_t v) { return __builtin_bswap32(v); }
-static inline uint32_t ntohl(uint32_t v) { return __builtin_bswap32(v); }
+static inline uint16_t htons(uint16_t v) { return htobe16(v); }
+static inline uint16_t ntohs(uint16_t v) { return be16toh(v); }
+static inline uint32_t htonl(uint32_t v) { return htobe32(v); }
+static inline uint32_t ntohl(uint32_t v) { return be32toh(v); }
 #define IP4(a, b, c, d) htonl(((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
 
 /* ---- packets ------------------------------------------------------------------ */

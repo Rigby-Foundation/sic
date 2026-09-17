@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
-#include "arch/x86_64/apic.h"
-#include "arch/x86_64/acpi.h"
+#include "asm/apic.h"
+#include "asm/irqflags.h"
+#include "asm/acpi.h"
 #include "mm/vmm.h"
-#include "arch/x86_64/pit.h"
+#include "asm/pit.h"
 #include "printf.h"
-#include "arch/x86_64/cpu.h"
+#include "asm/cpu.h"
 
 /* ---- local APIC ------------------------------------------------------------- */
 
@@ -66,7 +67,7 @@ void lapic_init_ap(void)
 static void ipi_wait(void)
 {
     while (lapic_read(LAPIC_ICR_LO) & ICR_PENDING)
-        __asm__ volatile("pause");
+        cpu_relax();
 }
 
 static void ipi_send(uint32_t apic_id, uint32_t lo)

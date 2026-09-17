@@ -4,13 +4,14 @@
  * real PCI/PCIe parts. Legacy descriptors, one receive and one transmit
  * ring, interrupts on the PCI INTx line from config space. */
 #include "drivers/e1000.h"
+#include "endian.h"
 #include "drivers/pci.h"
 #include "net/net.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "mm/heap.h"
-#include "arch/x86_64/idt.h"
-#include "arch/x86_64/timer.h"
+#include "asm/irq.h"
+#include "asm/timer.h"
 #include "string.h"
 #include "printf.h"
 
@@ -98,8 +99,8 @@ struct e1000 {
 static struct e1000 *nics[4];
 static int nic_count;
 
-static inline uint32_t rd(struct e1000 *n, uint32_t reg) { return n->regs[reg / 4]; }
-static inline void wr(struct e1000 *n, uint32_t reg, uint32_t v) { n->regs[reg / 4] = v; }
+static inline uint32_t rd(struct e1000 *n, uint32_t reg) { return mmio_read32((const volatile uint8_t *)n->regs + reg); }
+static inline void wr(struct e1000 *n, uint32_t reg, uint32_t v) { mmio_write32((volatile uint8_t *)n->regs + reg, v); }
 
 static int eeprom_read(struct e1000 *n, uint8_t addr, uint16_t *out)
 {
@@ -152,10 +153,11 @@ static int e1000_xmit(struct netdev *d, struct pkt *p)
         return -ENOBUFS;
     }
     memcpy(n->tx_buf[i], pkt_data(p), p->len);
-    td->length = (uint16_t)p->len;
+    td->length = htole16((uint16_t)p->len);
     td->cmd = TXD_EOP | TXD_IFCS | TXD_RS;
     td->status = 0;
     n->tx_next = (i + 1) % TX_DESCS;
+    dma_wmb();                      /* descriptor and buffer before the doorbell */
     wr(n, REG_TDT, n->tx_next);
     spin_unlock_irqrestore(&n->tx_lock, f);
     pkt_free(p);
@@ -171,11 +173,13 @@ static void e1000_poll(struct netdev *d)
         struct rx_desc *rd_ = &n->rx[i];
         if (!(rd_->status & RXD_DD))
             break;
-        if ((rd_->status & RXD_EOP) && !rd_->errors && rd_->length >= 14 && rd_->length <= PKT_DATA_MAX + PKT_HEADROOM) {
+        dma_rmb();                  /* status first, then length and data */
+        uint16_t len = le16toh(rd_->length);
+        if ((rd_->status & RXD_EOP) && !rd_->errors && len >= 14 && len <= PKT_DATA_MAX + PKT_HEADROOM) {
             struct pkt *p = pkt_alloc();
             if (p) {
-                memcpy(pkt_data(p), n->rx_buf[i], rd_->length);
-                p->len = rd_->length;
+                memcpy(pkt_data(p), n->rx_buf[i], len);
+                p->len = len;
                 net_rx(d, p);
             } else {
                 d->rx_dropped++;
@@ -185,6 +189,7 @@ static void e1000_poll(struct netdev *d)
         }
         rd_->status = 0;
         n->rx_next = (i + 1) % RX_DESCS;
+        dma_wmb();
         wr(n, REG_RDT, i);          /* give this slot back */
     }
     uint32_t st = rd(n, REG_STATUS);
@@ -204,12 +209,17 @@ static void e1000_irq(struct interrupt_frame *f)
 
 static int e1000_setup(const struct pci_dev *pd)
 {
+    int irq = pci_irq(pd);
+    if (irq < 0) {
+        kprintf("e1000: no interrupt line for %02x:%02x.%u\n", pd->bus, pd->slot, pd->func);
+        return -1;
+    }
     struct e1000 *n = kzalloc(sizeof(*n));
     if (!n)
         return -1;
     pci_enable_busmaster(pd);
     n->regs = vmm_map_mmio(pd->bar[0], 0x20000);
-    n->irq = (uint8_t)(pci_read32(pd->bus, pd->slot, pd->func, 0x3C) & 0xFF);
+    n->irq = (uint8_t)irq;
 
     wr(n, REG_IMC, 0xFFFFFFFF);
     wr(n, REG_CTRL, rd(n, REG_CTRL) | CTRL_RST);
@@ -235,17 +245,18 @@ static int e1000_setup(const struct pci_dev *pd)
         uint64_t ph = pmm_alloc_page();
         n->rx_buf[i] = P2V(ph);
         n->rx_buf[i + 1] = P2V(ph + BUF_SIZE);
-        n->rx[i].addr = ph;
-        n->rx[i + 1].addr = ph + BUF_SIZE;
+        n->rx[i].addr = htole64(ph);
+        n->rx[i + 1].addr = htole64(ph + BUF_SIZE);
     }
     for (int i = 0; i < TX_DESCS; i += 2) {
         uint64_t ph = pmm_alloc_page();
         n->tx_buf[i] = P2V(ph);
         n->tx_buf[i + 1] = P2V(ph + BUF_SIZE);
-        n->tx[i].addr = ph;
-        n->tx[i + 1].addr = ph + BUF_SIZE;
+        n->tx[i].addr = htole64(ph);
+        n->tx[i + 1].addr = htole64(ph + BUF_SIZE);
         n->tx[i].status = n->tx[i + 1].status = TXD_DD;
     }
+    dma_wmb();
     wr(n, REG_RDBAL, (uint32_t)n->rx_phys);
     wr(n, REG_RDBAH, (uint32_t)(n->rx_phys >> 32));
     wr(n, REG_RDLEN, RX_DESCS * sizeof(struct rx_desc));

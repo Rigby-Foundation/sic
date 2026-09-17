@@ -3,9 +3,9 @@
 /* System call layer: the sic ABI (abi/syscall.tbl) with POSIX semantics as
  * musl expects them. Handlers return a value or -errno. */
 #include "proc/syscall.h"
-#include "arch/x86_64/cpu.h"
+#include "asm/cpu.h"
 #include "proc/sched.h"
-#include "arch/x86_64/timer.h"
+#include "asm/timer.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "fs/vfs.h"
@@ -17,33 +17,17 @@
 #include "proc/signal.h"
 #include "proc/futex.h"
 #include "proc/wait.h"
+#include "asm/arch.h"
 #ifdef CONFIG_NET
 #include "net/net.h"
 #include "net/socket.h"
 #endif
-#include "arch/x86_64/smp.h"
+#include "asm/smp.h"
 #ifdef CONFIG_KEYBOARD
 #include "drivers/keyboard.h"
 #endif
 #include "string.h"
 #include "printf.h"
-
-#define MSR_EFER   0xC0000080
-#define MSR_STAR   0xC0000081
-#define MSR_LSTAR  0xC0000082
-#define MSR_SFMASK 0xC0000084
-#define EFER_SCE   (1 << 0)
-
-extern void syscall_entry(void);
-
-void syscall_init_cpu(void)
-{
-    wrmsr(MSR_EFER, rdmsr(MSR_EFER) | EFER_SCE);
-    /* syscall: CS = 0x08, SS = 0x10; sysret: CS = 0x10+16 | 3, SS = 0x10+8 | 3 */
-    wrmsr(MSR_STAR, ((uint64_t)SEL_KDATA << 48) | ((uint64_t)SEL_KCODE << 32));
-    wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
-    wrmsr(MSR_SFMASK, (1 << 9) | (1 << 8) | (1 << 10) | (1 << 18));   /* IF, TF, DF, AC */
-}
 
 /* ---- user memory access ------------------------------------------------------ */
 
@@ -55,9 +39,9 @@ int user_ok(uint64_t ptr, uint64_t len)
         return ptr >= USER_BASE && ptr < USER_END;
     if (ptr < USER_BASE || len > USER_END - USER_BASE || ptr + len > USER_END)
         return 0;
-    uint64_t pml4 = task_current()->mm->pml4;
-    for (uint64_t p = ptr & ~0xFFFUL; p < ptr + len; p += 4096)
-        if (!vmm_translate_in(pml4, p))
+    uint64_t pgd = task_current()->mm->pgd;
+    for (uint64_t p = ptr & ~0xFFFULL; p < ptr + len; p += 4096)
+        if (!vmm_translate_in(pgd, p))
             return 0;
     return 1;
 }
@@ -367,10 +351,10 @@ static long sys_fcntl(long fd, long cmd, long arg)
     return -EINVAL;
 }
 
-static long sys_ioctl(long fd, long req, uint64_t arg)
+static long sys_ioctl(long fd, long ureq, uint64_t arg)
 {
     struct file *f = fd_get(fd);
-    req = (long)(uint32_t)req;              /* the libc passes an int: strip sign extension */
+    uint32_t req = (uint32_t)ureq;          /* the libc passes an int: strip sign extension */
     if (!f) return -EBADF;
     if (f->node->type != VNODE_DEV) return -ENOTTY;
     if (f->node->dev && f->node->dev->ioctl) {
@@ -430,7 +414,7 @@ static long do_poll(struct abi_pollfd *fds, int n, long timeout_ms)
 {
     struct waitqueue *wqs[POLL_MAX];
     struct wait_entry entries[POLL_MAX];
-    uint64_t deadline = timeout_ms < 0 ? ~0UL : timer_ticks() + ((uint64_t)timeout_ms * TIMER_HZ + 999) / 1000;
+    uint64_t deadline = timeout_ms < 0 ? ~0ULL : timer_ticks() + ((uint64_t)timeout_ms * TIMER_HZ + 999) / 1000;
 
     for (;;) {
         int ready = 0;
@@ -463,7 +447,7 @@ static long do_poll(struct abi_pollfd *fds, int n, long timeout_ms)
         }
         int sig = task_signal_pending(task_current());
         if (!changed && !sig) {
-            if (deadline == ~0UL)
+            if (deadline == ~0ULL)
                 task_block();
             else
                 task_sleep_ms((deadline - now) * 1000 / TIMER_HZ + 1);
@@ -654,7 +638,7 @@ static long sys_brk(uint64_t addr)
     if (addr == 0 || addr < mm->brk_start)
         goto out;
     uint64_t old = PAGE_ALIGN_UP(mm->brk_end), new = PAGE_ALIGN_UP(addr);
-    if (new >= 0x0000010000000000UL)              /* would run into the mmap area */
+    if (new >= USER_MMAP_BASE)                     /* would run into the mmap area */
         goto out;
     if (new > old) {
         if (process_map_anon(t, old, (new - old) / PAGE_SIZE, PROT_READ | PROT_WRITE) != 0) {
@@ -691,8 +675,9 @@ static long sys_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     for (int l = 0; rc == 0 && l < 2; l++) {
         int n = 0;
         for (; uv[l] && n < ARG_MAX; n++) {
-            if (!user_ok(uv[l] + n * 8, 8)) { rc = -EFAULT; break; }
-            uint64_t sp = *(const uint64_t *)(uv[l] + n * 8);
+            uint64_t slot = uv[l] + (uint64_t)n * sizeof(unsigned long);
+            if (!user_ok(slot, sizeof(unsigned long))) { rc = -EFAULT; break; }
+            uint64_t sp = *(const unsigned long *)(uintptr_t)slot;
             if (!sp) break;
             rc = user_str(sp, data + used, cap - used);
             if (rc == -ENAMETOOLONG) rc = -E2BIG;
@@ -728,21 +713,23 @@ static long sys_wait4(long pid, uint64_t ustatus, long options, uint64_t rusage)
     }
 }
 
+#ifdef __x86_64__
 static long sys_arch_prctl(long code, uint64_t addr)
 {
     struct task *t = task_current();
     switch (code) {
     case ARCH_SET_FS:
-        t->fs_base = addr;
+        t->arch.fs_base = addr;
         wrmsr(MSR_FS_BASE, addr);
         return 0;
     case ARCH_GET_FS:
         if (!user_ok(addr, 8)) return -EFAULT;
-        *(uint64_t *)addr = t->fs_base;
+        *(uint64_t *)addr = t->arch.fs_base;
         return 0;
     }
     return -EINVAL;
 }
+#endif
 
 /* ---- mounting ----------------------------------------------------------------------- */
 
@@ -857,14 +844,14 @@ static long sys_uname(uint64_t ubuf)
     memcpy(u->nodename, "sic", 4);
     memcpy(u->release, "0.1", 4);
     memcpy(u->version, "zaeboot/ZAE", 12);
-    memcpy(u->machine, "x86_64", 7);
+    memcpy(u->machine, ARCH_NAME, sizeof(ARCH_NAME));
     return 0;
 }
 
 static long sys_getrandom(uint64_t ubuf, uint64_t len)
 {
     if (!user_ok(ubuf, len)) return -EFAULT;
-    static uint64_t x = 0x2545F4914F6CDD1DUL;
+    static uint64_t x = 0x2545F4914F6CDD1DULL;
     uint8_t *b = (void *)ubuf;
     for (uint64_t i = 0; i < len; i++) {
         x ^= x << 13; x ^= x >> 7; x ^= x << 17;
@@ -877,18 +864,19 @@ static long sys_getrandom(uint64_t ubuf, uint64_t len)
 
 int syscall_dispatch(struct syscall_frame *f)
 {
-    uint64_t a1 = f->rdi, a2 = f->rsi, a3 = f->rdx, a4 = f->r10, a5 = f->r8, a6 = f->r9;
+    unsigned long a1 = SYSCALL_ARG1(f), a2 = SYSCALL_ARG2(f), a3 = SYSCALL_ARG3(f),
+                  a4 = SYSCALL_ARG4(f), a5 = SYSCALL_ARG5(f), a6 = SYSCALL_ARG6(f);
     long ret;
 
 #ifdef CONFIG_SIGNALS
-    if (f->rax == SYS_rt_sigreturn) {           /* restores the whole frame, rax included */
+    if (SYSCALL_NR(f) == SYS_rt_sigreturn) {    /* restores the whole frame, result register included */
         sys_rt_sigreturn(f);
         signal_deliver_syscall(f);
-        return 1;                               /* iretq: rcx/r11 must survive */
+        return 1;                               /* full frame restore: every register must survive */
     }
 #endif
 
-    switch (f->rax) {
+    switch (SYSCALL_NR(f)) {
     /* process */
     case SYS_exit:          task_exit_code((int)a1 & 0xFF);          /* a thread; the leader ends the process */
     case SYS_exit_group:    task_exit_group((int)a1 & 0xFF);
@@ -905,7 +893,9 @@ int syscall_dispatch(struct syscall_frame *f)
         task_current()->clear_child_tid = a1;
         ret = task_current()->id; break;
     case SYS_set_robust_list: ret = 0; break;
+#ifdef __x86_64__
     case SYS_arch_prctl:    ret = sys_arch_prctl((long)a1, a2); break;
+#endif
     case SYS_getcpu:
         if (a1 && user_ok(a1, 4)) *(uint32_t *)a1 = this_cpu()->index;
         if (a2 && user_ok(a2, 4)) *(uint32_t *)a2 = 0;
@@ -958,7 +948,7 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_fcntl:         ret = sys_fcntl((long)a1, (long)a2, (long)a3); break;
     case SYS_ioctl:         ret = sys_ioctl((long)a1, (long)a2, a3); break;
     case SYS_fsync: case SYS_fdatasync: case SYS_sync:
-        ret = fd_get((long)a1) || f->rax == SYS_sync ? 0 : -EBADF; break;
+        ret = fd_get((long)a1) || SYSCALL_NR(f) == SYS_sync ? 0 : -EBADF; break;
     case SYS_umask:         ret = 022; break;
 #ifdef CONFIG_PIPES
     case SYS_pipe:          ret = sys_pipe2(a1, 0); break;
@@ -1034,18 +1024,21 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_getpgid: case SYS_getpgrp: case SYS_getsid:
         ret = task_current()->tgid; break;
     case SYS_sched_getaffinity:
-        if (a3 && user_ok(a3, 8)) { *(uint64_t *)a3 = (1UL << smp_cpu_count()) - 1; ret = 8; } else ret = -EFAULT;
+        if (a3 && user_ok(a3, sizeof(unsigned long))) {
+            *(unsigned long *)a3 = (1UL << smp_cpu_count()) - 1;
+            ret = sizeof(unsigned long);
+        } else ret = -EFAULT;
         break;
     case SYS_membarrier:    ret = 0; break;
     case SYS_prlimit64: case SYS_getrlimit: case SYS_setrlimit:
         ret = -ENOSYS; break;
 
     default:
-        if (f->rax > SYS_sic_max)
-            kprintf("[%s: bad syscall %lu]\n", task_current()->name, f->rax);
+        if (SYSCALL_NR(f) > SYS_sic_max)
+            kprintf("[%s: bad syscall %lu]\n", task_current()->name, (unsigned long)SYSCALL_NR(f));
         ret = -ENOSYS;
     }
-    f->rax = (uint64_t)ret;
+    SYSCALL_SET_RET(f, ret);
     signal_deliver_syscall(f);              /* may redirect the return into a handler */
     return 0;
 }

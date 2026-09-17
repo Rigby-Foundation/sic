@@ -3,7 +3,7 @@
 #pragma once
 #include "types.h"
 #include "proc/syscall.h"
-#include "arch/x86_64/idt.h"
+#include "asm/irq.h"
 
 #define NSIG 64
 
@@ -44,11 +44,12 @@
 #define SIG_UNBLOCK 1
 #define SIG_SETMASK 2
 
-/* musl's struct k_sigaction for x86_64 (what rt_sigaction takes). */
+/* musl's struct k_sigaction (what rt_sigaction takes): three words and a
+ * 64-bit mask, so 32 bytes on x86_64 and 20 on powerpc. */
 struct k_sigaction {
-    uint64_t handler;
-    uint64_t flags;
-    uint64_t restorer;
+    unsigned long handler;
+    unsigned long flags;
+    unsigned long restorer;
     uint32_t mask[2];
 } __attribute__((packed));
 
@@ -61,11 +62,10 @@ struct sighand {
 };
 
 /* Register set common to the syscall and interrupt frames. */
-struct sigregs {
-    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
-    uint64_t rbp, rbx, rdi, rsi, rdx, rcx, rax;
-    uint64_t rip, rflags, rsp;
-};
+#include "asm/signal.h"
+
+/* A user range that is mapped in the current process (used by the arch code too). */
+int user_range_ok(uint64_t p, uint64_t len);
 
 #ifdef CONFIG_SIGNALS
 int  signal_init_task(struct task *t);            /* fresh sighand; 0 or -ENOMEM */

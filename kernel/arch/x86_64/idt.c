@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
-#include "arch/x86_64/idt.h"
+#include "asm/idt.h"
 #include "printf.h"
-#include "arch/x86_64/pic.h"
-#include "arch/x86_64/apic.h"
+#include "asm/pic.h"
+#include "asm/apic.h"
 #include "proc/sched.h"
-#include "arch/x86_64/cpu.h"
+#include "asm/cpu.h"
 #include "proc/signal.h"
 #include "mm/vmm.h"
 
@@ -183,8 +183,8 @@ void isr_handler(struct interrupt_frame *f)
         if (signal_fault(f, sig, cr2))
             return;                         /* handler frame set up; iretq runs it */
 #endif
-        kprintf("[%s (pid %u) killed: %s at rip=%lx, addr=%lx, err=%lx]\n"
-                "  rsp=%lx rdi=%lx rsi=%lx rdx=%lx rcx=%lx rax=%lx\n",
+        kprintf("[%s (pid %u) killed: %s at rip=%llx, addr=%llx, err=%llx]\n"
+                "  rsp=%llx rdi=%llx rsi=%llx rdx=%llx rcx=%llx rax=%llx\n",
                 task_current()->name, task_current()->id, name, f->rip, cr2, f->error_code,
                 f->rsp, f->rdi, f->rsi, f->rdx, f->rcx, f->rax);
         task_current()->killed_sig = sig;
@@ -195,24 +195,24 @@ void isr_handler(struct interrupt_frame *f)
      * the screen: stop dead instead. */
     static volatile int in_fatal;
     if (__atomic_exchange_n(&in_fatal, 1, __ATOMIC_SEQ_CST)) {
-        kprintf("\n*** nested exception %lu at %lx: halted ***\n", f->vector, f->rip);
+        kprintf("\n*** nested exception %llu at %llx: halted ***\n", f->vector, f->rip);
         for (;;)
             __asm__ volatile("cli; hlt");
     }
 
-    kprintf("\n*** EXCEPTION %lu: %s (error code %lx) ***\n", f->vector, name, f->error_code);
+    kprintf("\n*** EXCEPTION %llu: %s (error code %llx) ***\n", f->vector, name, f->error_code);
     kprintf("rip=");
     kprint_sym(f->rip);
-    kprintf(" cs=%04lx rflags=%016lx rsp=%016lx ss=%04lx\n", f->cs, f->rflags, f->rsp, f->ss);
-    kprintf("rax=%016lx rbx=%016lx rcx=%016lx rdx=%016lx\n", f->rax, f->rbx, f->rcx, f->rdx);
-    kprintf("rsi=%016lx rdi=%016lx rbp=%016lx\n", f->rsi, f->rdi, f->rbp);
-    kprintf("r8 =%016lx r9 =%016lx r10=%016lx r11=%016lx\n", f->r8, f->r9, f->r10, f->r11);
-    kprintf("r12=%016lx r13=%016lx r14=%016lx r15=%016lx\n", f->r12, f->r13, f->r14, f->r15);
+    kprintf(" cs=%04llx rflags=%016llx rsp=%016llx ss=%04llx\n", f->cs, f->rflags, f->rsp, f->ss);
+    kprintf("rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n", f->rax, f->rbx, f->rcx, f->rdx);
+    kprintf("rsi=%016llx rdi=%016llx rbp=%016llx\n", f->rsi, f->rdi, f->rbp);
+    kprintf("r8 =%016llx r9 =%016llx r10=%016llx r11=%016llx\n", f->r8, f->r9, f->r10, f->r11);
+    kprintf("r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n", f->r12, f->r13, f->r14, f->r15);
 
     if (f->vector == 14) {
         uint64_t cr2;
         __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-        kprintf("cr2=%016lx\n", cr2);
+        kprintf("cr2=%016llx\n", cr2);
     }
 
     /* Frame-pointer backtrace (the kernel is built with -fno-omit-frame-pointer). */

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
-#include "arch/x86_64/pit.h"
-#include "arch/x86_64/io.h"
+#include "asm/pit.h"
+#include "asm/io.h"
 
 #define PIT_CH0  0x40
 #define PIT_CH2  0x42

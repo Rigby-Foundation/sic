@@ -5,10 +5,9 @@
 #include "zaeboot.h"
 #include "printf.h"
 #include "string.h"
-#include "arch/x86_64/cpu.h"
-#include "arch/x86_64/smp.h"
-#include "arch/x86_64/timer.h"
-#include "arch/x86_64/apic.h"
+#include "asm/cpu.h"
+#include "asm/smp.h"
+#include "asm/timer.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
@@ -16,6 +15,7 @@
 #include "proc/elf.h"
 #include "fs/vfs.h"
 #include "core/selftest.h"
+#include "asm/arch.h"
 
 #define CHECK(cond, ...) do { if (!(cond)) { kprintf("  FAIL: " __VA_ARGS__); kprintf("\n"); fails++; } } while (0)
 
@@ -23,7 +23,7 @@ static int fails;
 
 static void test_pmm(void)
 {
-    kprintf("pmm: %lu MiB total, %lu KiB used\n",
+    kprintf("pmm: %llu MiB total, %llu KiB used\n",
             pmm_total_pages() * 4 / 1024, pmm_used_pages() * 4);
 
     uint64_t before = pmm_used_pages();
@@ -34,26 +34,28 @@ static void test_pmm(void)
     pmm_free_page(a);
     pmm_free_page(b);
     pmm_free_pages(run, 8);
-    CHECK(pmm_used_pages() == before, "pmm leaked pages (%lu -> %lu)", before, pmm_used_pages());
+    CHECK(pmm_used_pages() == before, "pmm leaked pages (%llu -> %llu)", before, pmm_used_pages());
     kprintf("pmm: alloc/free ok\n");
 }
 
 static void test_vmm(void)
 {
-    uint64_t virt = 0xFFFFD00000000000UL;
+    uint64_t virt = VMM_TEST_VIRT;              /* an unused page-mappable kernel address */
     uint64_t phys = pmm_alloc_page();
     CHECK(vmm_map_page(virt, phys, PTE_WRITE | PTE_NX) == 0, "vmm_map_page failed");
     CHECK(vmm_translate(virt) == phys, "vmm_translate mismatch");
 
-    volatile uint64_t *p = (volatile uint64_t *)virt;
-    *p = 0xDEADBEEFCAFEBABEUL;
-    CHECK(*(volatile uint64_t *)P2V(phys) == 0xDEADBEEFCAFEBABEUL, "write via new mapping not visible via HHDM");
+    volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)virt;
+    *p = 0xDEADBEEFCAFEBABEULL;
+    CHECK(*(volatile uint64_t *)P2V(phys) == 0xDEADBEEFCAFEBABEULL, "write via new mapping not visible via HHDM");
 
     CHECK(vmm_unmap_page(virt) == phys, "vmm_unmap_page returned wrong phys");
     CHECK(vmm_translate(virt) == 0, "page still mapped after unmap");
     pmm_free_page(phys);
 
+#ifdef __x86_64__
     CHECK(vmm_translate(0x100000) == 0x100000, "identity map broken");
+#endif
     CHECK(vmm_translate(HHDM_BASE + 0x100000) == 0x100000, "HHDM broken");
     kprintf("vmm: map/unmap/translate ok\n");
 }
@@ -138,10 +140,10 @@ static void test_heap(void)
     heap_get_stats(&s2);
     CHECK(s2.slab_objects == base.slab_objects && s2.large_allocs == base.large_allocs &&
           s2.bytes_requested == base.bytes_requested,
-          "heap leak: %lu objects, %lu large, %lu bytes",
+          "heap leak: %llu objects, %llu large, %llu bytes",
           s2.slab_objects - base.slab_objects, s2.large_allocs - base.large_allocs,
           s2.bytes_requested - base.bytes_requested);
-    kprintf("heap: pmm pages in use by heap after tests: %lu (spare slabs kept)\n",
+    kprintf("heap: pmm pages in use by heap after tests: %llu (spare slabs kept)\n",
             pmm_used_pages() - pmm_before);
 }
 
@@ -151,8 +153,8 @@ static void test_timer(void)
     task_sleep_ms(200);
     uint64_t dt = timer_ticks() - t0;
     CHECK(dt >= 200 * TIMER_HZ / 1000 && dt <= 220 * TIMER_HZ / 1000,
-          "timer off: %lu ticks in 200 ms", dt);
-    kprintf("timer: %lu ticks in 200 ms @ %u Hz (%s)\n", dt, TIMER_HZ, apic_enabled() ? "lapic" : "pit");
+          "timer off: %llu ticks in 200 ms", dt);
+    kprintf("timer: %llu ticks in 200 ms @ %u Hz (%s)\n", dt, TIMER_HZ, timer_source());
 }
 
 /* Workers: one spins (proves preemption), the others sleep-loop. */
@@ -261,20 +263,6 @@ static void test_vfs(void)
     kprintf("vfs: create/write/read/lookup/unlink ok\n");
 }
 
-/* "TCGTCGTCGTCG", "KVMKVMKVM\0\0\0", ... or empty on bare metal. */
-static void hypervisor_id(char out[13])
-{
-    uint32_t eax, ebx, ecx, edx;
-    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
-    memset(out, 0, 13);
-    if (!(ecx & (1u << 31)))            /* no hypervisor present bit */
-        return;
-    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0x40000000));
-    memcpy(out, &ebx, 4);
-    memcpy(out + 4, &ecx, 4);
-    memcpy(out + 8, &edx, 4);
-}
-
 static void test_user(void)
 {
     if (!vfs_lookup(vfs_root(), "/bin/test") || !vfs_lookup(vfs_root(), "/bin/crash")) {
@@ -284,7 +272,7 @@ static void test_user(void)
     /* The user-space test formats disks; it only does so when told it runs
      * in a VM, so a self-test build on real hardware never touches a drive. */
     char hv[13];
-    hypervisor_id(hv);
+    arch_hypervisor_id(hv);
     char envbuf[32] = "SIC_VM=";
     memcpy(envbuf + 7, hv, 13);
     const char *const envp[] = { "PATH=/bin", hv[0] ? envbuf : "SIC_VM=", NULL };

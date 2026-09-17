@@ -65,3 +65,12 @@ char *strcpy(char *dst, const char *src)
         ;
     return r;
 }
+
+char *strstr(const char *h, const char *n)
+{
+    size_t nl = strlen(n);
+    if (!nl) return (char *)h;
+    for (; *h; h++)
+        if (memcmp(h, n, nl) == 0) return (char *)h;
+    return NULL;
+}

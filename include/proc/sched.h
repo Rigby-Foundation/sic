@@ -6,15 +6,17 @@
 #include "proc/signal.h"
 #include "proc/mm.h"
 #include "fs/fdtable.h"
+#include "mm/vmm.h"
+#include "asm/task.h"
 
 enum task_state { TASK_READY, TASK_RUNNING, TASK_SLEEPING, TASK_BLOCKED, TASK_ZOMBIE };
 
 struct cpu;
 
 struct task {
-    uint64_t rsp;               /* saved stack pointer while not running (must be first) */
+    struct arch_task arch;      /* register/stack state; must be first (see asm/task.h) */
     uint64_t kstack_top;        /* top of the kernel stack (TSS.rsp0 / syscall entry) */
-    uint64_t pml4;              /* CR3 to run with: mm->pml4, or the kernel PML4 */
+    pgd_t    pgd;               /* address space to run with: mm->pgd, or the kernel's */
     struct mm *mm;              /* user address space (NULL for kernel tasks) */
     uint32_t id;
     enum task_state state;
@@ -33,14 +35,12 @@ struct task {
     uint64_t clear_child_tid;   /* CLONE_CHILD_CLEARTID / set_tid_address */
     volatile int group_exit;    /* the process is exiting: die at the next delivery point */
     int      killed_sig;        /* nonzero if terminated by a fault */
-    uint64_t fs_base;           /* user TLS pointer (arch_prctl) */
     uint64_t sig_pending, sig_blocked;
     uint64_t sig_saved_mask;    /* mask to restore after a sigsuspend handler */
     int      sig_saved_mask_valid;
     struct sighand *sighand;
     uint64_t alarm_at;          /* tick for SIGALRM, 0 = none */
     uint64_t alarm_interval;    /* ticks; re-arm after firing (setitimer) */
-    uint8_t  fpu[512] __attribute__((aligned(16)));
     int      wake_pending;      /* task_wake() raced ahead of task_block() */
     int      reaped;            /* zombie collected by waitpid; idle may free it */
     struct fdtable *fdt;
@@ -50,7 +50,6 @@ struct task {
     struct task *rq_next;       /* run queue */
 };
 
-typedef void (*task_entry_t)(void *arg);
 
 void         sched_init(void);          /* turn the boot context into task 0 + create idle */
 void         sched_init_ap(struct cpu *c);

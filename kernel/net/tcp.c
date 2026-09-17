@@ -8,7 +8,7 @@
  * window scaling, no Nagle. */
 #include "net/net.h"
 #include "mm/heap.h"
-#include "arch/x86_64/timer.h"
+#include "asm/timer.h"
 #include "string.h"
 #include "printf.h"
 

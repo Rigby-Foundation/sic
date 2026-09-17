@@ -446,10 +446,22 @@ void heap_dump(void)
 {
     struct heap_stats st;
     heap_get_stats(&st);
-    kprintf("heap: %lu pages mapped, %lu slabs / %lu objects, %lu large, %lu bytes live\n",
+    kprintf("heap: %llu pages mapped, %llu slabs / %llu objects, %llu large, %llu bytes live\n",
             st.pages_mapped, st.slabs, st.slab_objects, st.large_allocs, st.bytes_requested);
     for (size_t i = 0; i < NUM_CLASSES; i++)
         if (caches[i].nslabs)
-            kprintf("  class %4u: %lu slabs, %lu live\n",
+            kprintf("  class %4u: %llu slabs, %llu live\n",
                     caches[i].obj_size, caches[i].nslabs, caches[i].live_objects);
+}
+
+void *kstack_alloc(size_t pages)
+{
+    uint64_t phys = pmm_alloc_pages(pages);
+    return phys ? P2V(phys) : NULL;
+}
+
+void kstack_free(void *virt, size_t pages)
+{
+    if (virt)
+        pmm_free_pages(V2P(virt), pages);
 }

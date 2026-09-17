@@ -1,7 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
-/* Loadable kernel modules: an ELF64 relocatable-object linker. */
+/* Loadable kernel modules: a relocatable-object (ET_REL) linker for the
+ * native ELF class; the relocation types and the memory come from the
+ * architecture (module_arch.h). */
 #include "module.h"
+#include "module_arch.h"
 #include "mm/pmm.h"
 #include "mm/heap.h"
 #include "string.h"
@@ -11,10 +14,7 @@
 
 extern const struct ksym __ksymtab_start[], __ksymtab_end[];
 
-/* Modules must sit within ±2 GiB of the kernel (linked at 1 MiB) for the
- * small code model's 32-bit relocations; the low identity map is RWX. */
-#define MODULE_ADDR_LIMIT 0x7FFF0000UL
-
+#if BITS_PER_LONG == 64
 struct elf_ehdr {
     uint8_t  ident[16];
     uint16_t type, machine;
@@ -43,9 +43,47 @@ struct elf_rela {
     uint64_t info;
     int64_t  addend;
 } __attribute__((packed));
+#define ELFCLASS_NATIVE 2
+#define RELA_SYM(info)  ((uint32_t)((info) >> 32))
+#define RELA_TYPE(info) ((uint32_t)((info) & 0xFFFFFFFF))
+#else
+struct elf_ehdr {
+    uint8_t  ident[16];
+    uint16_t type, machine;
+    uint32_t version;
+    uint32_t entry, phoff, shoff;
+    uint32_t flags;
+    uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx;
+} __attribute__((packed));
+
+struct elf_shdr {
+    uint32_t name, type, flags, addr, offset, size, link, info, addralign, entsize;
+} __attribute__((packed));
+
+struct elf_sym {
+    uint32_t name, value, size;
+    uint8_t  info, other;
+    uint16_t shndx;
+} __attribute__((packed));
+
+struct elf_rela {
+    uint32_t offset;
+    uint32_t info;
+    int32_t  addend;
+} __attribute__((packed));
+#define ELFCLASS_NATIVE 1
+#define RELA_SYM(info)  ((info) >> 8)
+#define RELA_TYPE(info) ((info) & 0xFF)
+#endif
 
 #define ET_REL       1
 #define EM_X86_64    62
+#define EM_PPC       20
+#if defined(__x86_64__)
+#define EM_NATIVE EM_X86_64
+#elif defined(__powerpc__)
+#define EM_NATIVE EM_PPC
+#endif
 #define SHT_PROGBITS 1
 #define SHT_SYMTAB   2
 #define SHT_NOBITS   8
@@ -54,14 +92,6 @@ struct elf_rela {
 #define SHN_UNDEF    0
 #define SHN_ABS      0xFFF1
 #define SHN_COMMON   0xFFF2
-
-#define R_X86_64_NONE  0
-#define R_X86_64_64    1
-#define R_X86_64_PC32  2
-#define R_X86_64_PLT32 4
-#define R_X86_64_32    10
-#define R_X86_64_32S   11
-#define R_X86_64_PC64  24
 
 static struct module *modules;
 static spinlock_t module_lock = SPINLOCK_INIT;
@@ -79,94 +109,60 @@ void module_init_ksyms(void)
     kprintf("modules: %lu exported kernel symbols\n", (unsigned long)(__ksymtab_end - __ksymtab_start));
 }
 
-static int apply_rela(uint8_t *base_of_target, const struct elf_rela *r, uint64_t symval, const char *symname)
-{
-    uint8_t *P = base_of_target + r->offset;
-    uint64_t S = symval;
-    int64_t  A = r->addend;
-    uint32_t type = (uint32_t)(r->info & 0xFFFFFFFF);
-    int64_t val;
-
-    switch (type) {
-    case R_X86_64_NONE:
-        return 0;
-    case R_X86_64_64:
-        *(uint64_t *)P = S + (uint64_t)A;
-        return 0;
-    case R_X86_64_PC32:
-    case R_X86_64_PLT32:
-        val = (int64_t)(S + (uint64_t)A) - (int64_t)(uint64_t)P;
-        if (val != (int32_t)val) goto range;
-        *(int32_t *)P = (int32_t)val;
-        return 0;
-    case R_X86_64_32:
-        val = (int64_t)(S + (uint64_t)A);
-        if ((uint64_t)val >> 32) goto range;
-        *(uint32_t *)P = (uint32_t)val;
-        return 0;
-    case R_X86_64_32S:
-        val = (int64_t)(S + (uint64_t)A);
-        if (val != (int32_t)val) goto range;
-        *(int32_t *)P = (int32_t)val;
-        return 0;
-    case R_X86_64_PC64:
-        *(uint64_t *)P = S + (uint64_t)A - (uint64_t)P;
-        return 0;
-    default:
-        kprintf("module: unsupported relocation type %u against %s\n", type, symname);
-        return -ENOEXEC;
-    }
-range:
-    kprintf("module: relocation against %s out of range\n", symname);
-    return -ENOEXEC;
-}
-
 int module_load(const void *image, size_t len, const char *params)
 {
     (void)params;
     const uint8_t *img = image;
     const struct elf_ehdr *eh = image;
 
-    if (len < sizeof(*eh) || memcmp(eh->ident, "\x7f" "ELF", 4) != 0 || eh->ident[4] != 2)
+    if (len < sizeof(*eh) || memcmp(eh->ident, "\x7f" "ELF", 4) != 0 || eh->ident[4] != ELFCLASS_NATIVE)
         return -ENOEXEC;
-    if (eh->type != ET_REL || eh->machine != EM_X86_64 || eh->shentsize != sizeof(struct elf_shdr))
+    if (eh->type != ET_REL || eh->machine != EM_NATIVE || eh->shentsize != sizeof(struct elf_shdr))
         return -ENOEXEC;
-    if (eh->shoff + (uint64_t)eh->shnum * sizeof(struct elf_shdr) > len)
+    if ((uint64_t)eh->shoff + (uint64_t)eh->shnum * sizeof(struct elf_shdr) > len)
         return -ENOEXEC;
 
     const struct elf_shdr *sh = (const void *)(img + eh->shoff);
     for (uint16_t i = 0; i < eh->shnum; i++)
-        if (sh[i].type != SHT_NOBITS && sh[i].offset + sh[i].size > len)
+        if (sh[i].type != SHT_NOBITS && (uint64_t)sh[i].offset + sh[i].size > len)
             return -ENOEXEC;
 
-    /* Lay out the allocatable sections back to back. */
-    uint64_t *secaddr = kzalloc(sizeof(uint64_t) * eh->shnum);
+    /* Lay out the allocatable sections back to back, then room for the
+     * architecture's branch stubs (one per relocation entry, worst case). */
+    uintptr_t *secaddr = kzalloc(sizeof(uintptr_t) * eh->shnum);
     if (!secaddr)
         return -ENOMEM;
-    uint64_t total = 0;
+    uintptr_t total = 0;
+    size_t nrelocs = 0;
     for (uint16_t i = 0; i < eh->shnum; i++) {
+        if (sh[i].type == SHT_RELA && sh[i].info < eh->shnum && (sh[sh[i].info].flags & SHF_ALLOC))
+            nrelocs += sh[i].size / sizeof(struct elf_rela);
         if (!(sh[i].flags & SHF_ALLOC) || sh[i].size == 0)
             continue;
-        uint64_t align = sh[i].addralign ? sh[i].addralign : 1;
+        uintptr_t align = sh[i].addralign ? sh[i].addralign : 1;
         total = (total + align - 1) & ~(align - 1);
         secaddr[i] = total;                 /* offset for now */
         total += sh[i].size;
     }
+    total = (total + 15) & ~15UL;
+    uintptr_t stub_off = total;
+    total += nrelocs * MODULE_STUB_SIZE;
     size_t pages = PAGE_ALIGN_UP(total) / PAGE_SIZE;
-    uint64_t base = pages ? pmm_alloc_pages_below(pages, MODULE_ADDR_LIMIT) : 0;
-    if (pages && !base) {
+    uint8_t *mem = pages ? arch_module_alloc(pages) : NULL;
+    if (pages && !mem) {
         kfree(secaddr);
         return -ENOMEM;
     }
-    uint8_t *mem = (uint8_t *)base;         /* identity mapped */
     memset(mem, 0, pages * PAGE_SIZE);
     for (uint16_t i = 0; i < eh->shnum; i++) {
         if (!(sh[i].flags & SHF_ALLOC) || sh[i].size == 0)
             continue;
-        secaddr[i] += base;
+        secaddr[i] += (uintptr_t)mem;
         if (sh[i].type != SHT_NOBITS)
             memcpy((void *)secaddr[i], img + sh[i].offset, sh[i].size);
     }
+    uint8_t *stubs = mem + stub_off;
+    size_t stub_used = 0;
 
     /* Resolve symbols. */
     int rc = -ENOEXEC;
@@ -181,7 +177,7 @@ int module_load(const void *image, size_t len, const char *params)
     const struct elf_sym *syms = (const void *)(img + symtab->offset);
     size_t nsyms = symtab->size / sizeof(struct elf_sym);
     const char *strtab = (const char *)(img + sh[symtab->link].offset);
-    uint64_t *symval = kzalloc(sizeof(uint64_t) * nsyms);
+    uintptr_t *symval = kzalloc(sizeof(uintptr_t) * nsyms);
     if (!symval) {
         rc = -ENOMEM;
         goto fail;
@@ -198,7 +194,7 @@ int module_load(const void *image, size_t len, const char *params)
                 kfree(symval);
                 goto fail;
             }
-            symval[i] = (uint64_t)k->addr;
+            symval[i] = (uintptr_t)k->addr;
         } else if (syms[i].shndx == SHN_ABS) {
             symval[i] = syms[i].value;
         } else if (syms[i].shndx == SHN_COMMON || syms[i].shndx >= eh->shnum) {
@@ -222,18 +218,21 @@ int module_load(const void *image, size_t len, const char *params)
         const struct elf_rela *rel = (const void *)(img + sh[i].offset);
         size_t n = sh[i].size / sizeof(*rel);
         for (size_t j = 0; j < n; j++) {
-            uint32_t si = (uint32_t)(rel[j].info >> 32);
-            if (si >= nsyms || rel[j].offset + 8 > sh[sh[i].info].size + 4) {
+            uint32_t si = RELA_SYM(rel[j].info);
+            if (si >= nsyms || (uint64_t)rel[j].offset + sizeof(uintptr_t) > (uint64_t)sh[sh[i].info].size + 4) {
                 kfree(symval);
                 goto fail;
             }
-            if (apply_rela((uint8_t *)secaddr[sh[i].info], &rel[j], symval[si], strtab + syms[si].name) != 0) {
+            uint8_t *P = (uint8_t *)secaddr[sh[i].info] + rel[j].offset;
+            if (arch_module_reloc(P, RELA_TYPE(rel[j].info), symval[si], (long)rel[j].addend,
+                                  stubs, &stub_used, strtab + syms[si].name) != 0) {
                 kfree(symval);
                 goto fail;
             }
         }
     }
     kfree(symval);
+    arch_module_flush(mem, pages * PAGE_SIZE);
 
     if (!modname || !init) {
         kprintf("module: missing module_name or init_module\n");
@@ -279,7 +278,7 @@ int module_load(const void *image, size_t len, const char *params)
 
 fail:
     if (pages)
-        pmm_free_pages(base, pages);
+        arch_module_free(mem, pages);
     kfree(secaddr);
     return rc;
 }
@@ -298,7 +297,7 @@ int module_unload(const char *name)
         return -ENOENT;
     if (m->exit)
         m->exit();
-    pmm_free_pages((uint64_t)m->base, m->size / PAGE_SIZE);
+    arch_module_free(m->base, m->size / PAGE_SIZE);
     kprintf("module: unloaded %s\n", m->name);
     kfree(m);
     return 0;
@@ -316,7 +315,7 @@ long module_list(char *buf, size_t len)
         line[n++] = ' ';
         static const char hex[] = "0123456789abcdef";
         line[n++] = '0'; line[n++] = 'x';
-        for (int i = 7; i >= 0; i--) line[n++] = hex[((uint64_t)m->base >> (i * 4)) & 0xF];
+        for (int i = 2 * (int)sizeof(void *) - 1; i >= 0; i--) line[n++] = hex[((uintptr_t)m->base >> (i * 4)) & 0xF];
         line[n++] = ' ';
         char num[24]; int k = 0; size_t v = m->size;
         do { num[k++] = (char)('0' + v % 10); v /= 10; } while (v);

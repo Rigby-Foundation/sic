@@ -3,6 +3,7 @@
 /* NVMe: a minimal polled driver. One admin and one I/O queue pair per
  * controller, one command in flight, transfers of up to one page. */
 #include "drivers/nvme.h"
+#include "endian.h"
 #include "drivers/pci.h"
 #include "fs/blkdev.h"
 #include "mm/vmm.h"
@@ -11,7 +12,7 @@
 #include "string.h"
 #include "printf.h"
 #include "spinlock.h"
-#include "arch/x86_64/timer.h"
+#include "asm/timer.h"
 
 #define REG_CAP   0x00
 #define REG_VS    0x08
@@ -74,10 +75,10 @@ struct nvme {
     uint32_t lba_shift;
 };
 
-static inline uint32_t rd32(struct nvme *c, uint32_t r) { return *(volatile uint32_t *)(c->regs + r); }
-static inline uint64_t rd64(struct nvme *c, uint32_t r) { return *(volatile uint64_t *)(c->regs + r); }
-static inline void wr32(struct nvme *c, uint32_t r, uint32_t v) { *(volatile uint32_t *)(c->regs + r) = v; }
-static inline void wr64(struct nvme *c, uint32_t r, uint64_t v) { *(volatile uint64_t *)(c->regs + r) = v; }
+static inline uint32_t rd32(struct nvme *c, uint32_t r) { return mmio_read32(c->regs + r); }
+static inline uint64_t rd64(struct nvme *c, uint32_t r) { return mmio_read64(c->regs + r); }
+static inline void wr32(struct nvme *c, uint32_t r, uint32_t v) { mmio_write32(c->regs + r, v); }
+static inline void wr64(struct nvme *c, uint32_t r, uint64_t v) { mmio_write64(c->regs + r, v); }
 
 static void doorbell_sq(struct nvme *c, struct queue *q) { wr32(c, 0x1000 + (2 * q->id) * (4 << c->dstrd), q->sq_tail); }
 static void doorbell_cq(struct nvme *c, struct queue *q) { wr32(c, 0x1000 + (2 * q->id + 1) * (4 << c->dstrd), q->cq_head); }
@@ -103,20 +104,30 @@ static int queue_alloc(struct queue *q, uint16_t id)
 static int submit(struct nvme *c, struct queue *q, struct sqe *cmd, uint32_t *result)
 {
     cmd->cid = c->cid++;
-    q->sq[q->sq_tail] = *cmd;
+    /* the queue entry is little-endian, whatever the CPU */
+    struct sqe *d = &q->sq[q->sq_tail];
+    d->opcode = cmd->opcode; d->flags = cmd->flags;
+    d->cid = htole16(cmd->cid);
+    d->nsid = htole32(cmd->nsid);
+    d->reserved = 0;
+    d->mptr = htole64(cmd->mptr);
+    d->prp1 = htole64(cmd->prp1);
+    d->prp2 = htole64(cmd->prp2);
+    d->cdw10 = htole32(cmd->cdw10); d->cdw11 = htole32(cmd->cdw11); d->cdw12 = htole32(cmd->cdw12);
+    d->cdw13 = htole32(cmd->cdw13); d->cdw14 = htole32(cmd->cdw14); d->cdw15 = htole32(cmd->cdw15);
     q->sq_tail = (q->sq_tail + 1) % QUEUE_DEPTH;
     doorbell_sq(c, q);
 
     struct cqe *e = &q->cq[q->cq_head];
     uint64_t deadline = timer_ticks() + 2000;
-    while ((e->status & 1) != q->phase) {
-        __asm__ volatile("pause");
+    while ((le16toh(e->status) & 1) != q->phase) {
+        cpu_relax();
         if (timer_ticks() > deadline)
             return -1;
     }
-    int status = e->status >> 1;
+    int status = le16toh(e->status) >> 1;
     if (result)
-        *result = e->result;
+        *result = le32toh(e->result);
     q->cq_head = (q->cq_head + 1) % QUEUE_DEPTH;
     if (q->cq_head == 0)
         q->phase ^= 1;
@@ -147,7 +158,7 @@ static int nvme_rw(struct blkdev *d, uint64_t lba, uint32_t count, void *buf, in
         };
         int st = submit(c, &c->io, &cmd, NULL);
         if (st != 0) {
-            kprintf("nvme: %s lba %lu failed, status %x\n", write ? "write" : "read", lba, st);
+            kprintf("nvme: %s lba %llu failed, status %x\n", write ? "write" : "read", lba, st);
             rc = -1;
             break;
         }
@@ -222,8 +233,7 @@ static int nvme_probe(const struct pci_dev *pd, int index)
 
     /* Namespace 1. */
     if (identify(c, 0, 1, id) != 0) { kprintf("nvme: identify namespace failed\n"); return -1; }
-    uint64_t nsze;
-    memcpy(&nsze, id, 8);
+    uint64_t nsze = get_le64(id);
     uint8_t flbas = id[26] & 0xF;
     uint8_t lbads = id[128 + flbas * 4 + 2];
     c->lba_shift = lbads;

@@ -72,3 +72,4 @@ struct zaeboot_info {
 #define ZAEBOOT_FW_UNKNOWN 0
 #define ZAEBOOT_FW_UEFI    1
 #define ZAEBOOT_FW_BIOS    2
+#define ZAEBOOT_FW_OPENFIRMWARE 3   /* powerpc: the kernel built the info itself from the device tree */

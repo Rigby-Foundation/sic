@@ -6,7 +6,7 @@
 #include "printf.h"
 #include "fs/vfs.h"
 #include "string.h"
-#include "arch/x86_64/timer.h"
+#include "asm/timer.h"
 
 const char module_name[] = "hello";
 

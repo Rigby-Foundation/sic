@@ -2,7 +2,7 @@
 /* Copyright (C) 2026 Rigby Foundation */
 /* ARP: a small cache with one packet parked per unresolved entry. */
 #include "net/net.h"
-#include "arch/x86_64/timer.h"
+#include "asm/timer.h"
 #include "string.h"
 
 struct arp_hdr {

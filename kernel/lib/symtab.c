@@ -29,7 +29,7 @@ void kprint_sym(uint64_t addr)
     uint64_t off;
     const char *n = ksym_name(addr, &off);
     if (n)
-        kprintf("%p <%s+0x%lx>", (void *)addr, n, off);
+        kprintf("%p <%s+0x%llx>", (void *)addr, n, off);
     else
         kprintf("%p", (void *)addr);
 }

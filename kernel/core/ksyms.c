@@ -9,8 +9,8 @@
 #include "fs/vfs.h"
 #include "fs/blkdev.h"
 #include "proc/sched.h"
-#include "arch/x86_64/timer.h"
-#include "arch/x86_64/idt.h"
+#include "asm/timer.h"
+#include "asm/irq.h"
 #include "drivers/pci.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
@@ -70,3 +70,23 @@ EXPORT_SYMBOL(pmm_alloc_page);
 EXPORT_SYMBOL(pmm_free_page);
 EXPORT_SYMBOL(module_load);
 EXPORT_SYMBOL(ksym_lookup);
+
+#if BITS_PER_LONG == 32
+/* What the compiler emits calls to on a 32-bit target (kernel/lib/int64.c). */
+uint64_t __udivdi3(uint64_t n, uint64_t d);
+uint64_t __umoddi3(uint64_t n, uint64_t d);
+int64_t  __divdi3(int64_t n, int64_t d);
+int64_t  __moddi3(int64_t n, int64_t d);
+uint64_t __atomic_fetch_or_8(volatile void *p, uint64_t v, int order);
+uint64_t __atomic_fetch_and_8(volatile void *p, uint64_t v, int order);
+uint64_t __atomic_load_8(const volatile void *p, int order);
+void     __atomic_store_8(volatile void *p, uint64_t v, int order);
+EXPORT_SYMBOL(__udivdi3);
+EXPORT_SYMBOL(__umoddi3);
+EXPORT_SYMBOL(__divdi3);
+EXPORT_SYMBOL(__moddi3);
+EXPORT_SYMBOL(__atomic_fetch_or_8);
+EXPORT_SYMBOL(__atomic_fetch_and_8);
+EXPORT_SYMBOL(__atomic_load_8);
+EXPORT_SYMBOL(__atomic_store_8);
+#endif

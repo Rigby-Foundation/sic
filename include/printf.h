@@ -5,7 +5,7 @@
 
 void kputc(char c);
 void kputs(const char *s);
-void kprintf(const char *fmt, ...);
+void kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /* kernel/lib/symtab.c: name kernel addresses in diagnostics */
 const char *ksym_name(uint64_t addr, uint64_t *off);

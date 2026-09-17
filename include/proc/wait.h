@@ -5,7 +5,7 @@
 #include "types.h"
 #include "spinlock.h"
 #include "proc/sched.h"
-#include "arch/x86_64/timer.h"
+#include "asm/timer.h"
 
 struct wait_entry {
     struct task *task;
