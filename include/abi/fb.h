@@ -12,6 +12,14 @@
 #define FBIOPUT_VSCREENINFO 0x4601
 #define FBIOGET_FSCREENINFO 0x4602
 
+/* sic: on a display that only shows the framebuffer when asked (virtio-gpu),
+ * push it to the screen now; a no-op on scanout hardware. */
+#define FBIOPRESENT 0x46F0
+/* ... just this rectangle of it (a struct fb_rect): what a compositor
+ * changed, instead of the whole screen every time. */
+#define FBIOPRESENT_RECT 0x46F1
+struct fb_rect { uint32_t x, y, w, h; };
+
 /* Console display mode ioctls */
 #define KDSETMODE 0x4B3A
 #define KDGETMODE 0x4B3B

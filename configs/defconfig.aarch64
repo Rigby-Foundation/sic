@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 Rigby Foundation
+#
+# sic default configuration for aarch64 (QEMU virt).
+CONFIG_SMP=y               # the other CPUs, via PSCI CPU_ON
+CONFIG_FB_CONSOLE=y        # a virtio-gpu, if one is on the PCI bus
+CONFIG_SERIAL=y            # the PL011: the console
+CONFIG_KEYBOARD=y          # console input: the serial port and virtio-input keyboards
+CONFIG_MOUSE=y             # /dev/mouse, fed by virtio-input (no PS/2 here)
+CONFIG_VIRTIO_GPU=y        # QEMU -device virtio-gpu-pci
+CONFIG_VIRTIO_INPUT=y      # QEMU -device virtio-keyboard-pci / virtio-mouse-pci
+CONFIG_PCI=y               # the generic ECAM host bridge
+CONFIG_NVME=y
+CONFIG_AHCI=n
+CONFIG_IDE=n
+CONFIG_HDA=y               # QEMU -device intel-hda (a PCI device on virt too)
+CONFIG_NET=y
+CONFIG_E1000=y
+CONFIG_ZAEFS=y
+CONFIG_FAT=y
+CONFIG_MODULES=y
+CONFIG_SIGNALS=y
+CONFIG_PIPES=y
+CONFIG_SELFTEST=y
