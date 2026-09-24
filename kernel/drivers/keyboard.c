@@ -19,7 +19,6 @@
 #include "abi/abi.h"
 #include "fs/vfs.h"
 
-#ifdef __x86_64__
 #define KBD_DATA 0x60
 
 static const char map_lower[128] = {
@@ -36,7 +35,6 @@ static const char map_upper[128] = {
 };
 
 static int shift, caps, ctrl;
-#endif
 
 /* Input ring buffer; one blocked reader at a time is plenty for a console. */
 #define RING 256
@@ -45,6 +43,9 @@ static volatile uint32_t rhead, rtail;
 static spinlock_t kbd_lock = SPINLOCK_INIT;
 static struct waitqueue readers = WAITQUEUE_INIT;
 static volatile uint32_t fg_pid;            /* foreground process for ^C (TIOCSPGRP) */
+
+static int kbd_mode = K_XLATE;
+static struct file *kbd_owner;              /* the fd that set K_RAW */
 
 static void push_char(char c)
 {
@@ -61,6 +62,8 @@ static void push_char(char c)
 
 void keyboard_push_char(char c)
 {
+    if (kbd_mode == K_RAW)                              /* serial input has no scancodes to offer */
+        return;
     if (c == 3) {                                       /* ^C from serial */
         kputs("^C\n");
         struct task *t = fg_pid ? task_find(fg_pid) : NULL;
@@ -76,7 +79,18 @@ void keyboard_push_char(char c)
 /* Drains the serial port. Called from the receive interrupt and from readers
  * that are about to block; the two must not interleave on the port (the UART
  * holds one byte, and status-then-data from two contexts reads it twice). */
+static int serial_has_irq;      /* receive interrupts deliver it: no polling from read/poll */
+
+static void drain_serial(void);
+/* Readers look at the UART themselves only where it has no interrupt:
+ * under a hypervisor every register read is a trap out of the guest,
+ * and a window server polls its input hundreds of times a second. */
 static void poll_serial_input(void)
+{
+    if (!serial_has_irq) drain_serial();
+}
+
+static void drain_serial(void)
 {
 #ifdef CONFIG_SERIAL
     static spinlock_t serial_in_lock = SPINLOCK_INIT;
@@ -93,12 +107,20 @@ static void poll_serial_input(void)
 
 /* Drain up to len characters. If nonblock is set and no input is available,
  * returns -EAGAIN. Otherwise blocks until input arrives. Returns -EINTR on signal. */
-long keyboard_read(char *buf, size_t len, int nonblock)
+/* In raw mode the bytes are scancodes meant for the file that asked for
+ * them; any other reader (the shell that started the program, typically)
+ * waits until the mode is back to cooked. */
+static int ring_ready_for(struct file *f)
+{
+    return rhead != rtail && (kbd_owner == NULL || kbd_owner == f);
+}
+
+long keyboard_read(struct file *file, char *buf, size_t len, int nonblock)
 {
     for (;;) {
         poll_serial_input();
         uint64_t f = spin_lock_irqsave(&kbd_lock);
-        if (rhead != rtail) {
+        if (ring_ready_for(file)) {
             size_t n = 0;
             while (rhead != rtail && n < len) {
                 buf[n++] = ring[rtail % RING];
@@ -110,23 +132,21 @@ long keyboard_read(char *buf, size_t len, int nonblock)
         spin_unlock_irqrestore(&kbd_lock, f);
         if (nonblock)
             return -EAGAIN;
-        if (wait_event_interruptible(&readers, (poll_serial_input(), rhead != rtail)) != 0)
+        if (wait_event_interruptible(&readers, (poll_serial_input(), ring_ready_for(file))) != 0)
             return -EINTR;
     }
 }
 
-int keyboard_poll(struct waitqueue **wq)
+int keyboard_poll(struct file *file, struct waitqueue **wq)
 {
     poll_serial_input();
     *wq = &readers;
-    return rhead != rtail ? POLLIN : 0;
+    return ring_ready_for(file) ? POLLIN : 0;
 }
 
 void keyboard_set_foreground(uint32_t pid) { fg_pid = pid; }
 uint32_t keyboard_get_foreground(void)     { return fg_pid; }
 
-static int kbd_mode = K_XLATE;
-static struct file *kbd_owner;              /* the fd that set K_RAW */
 
 int keyboard_set_mode(struct file *f, int mode)
 {
@@ -135,11 +155,10 @@ int keyboard_set_mode(struct file *f, int mode)
     uint64_t fl = spin_lock_irqsave(&kbd_lock);
     kbd_mode = mode;
     kbd_owner = mode == K_RAW ? f : NULL;
-#ifdef __x86_64__
     shift = ctrl = 0;
-#endif
     rhead = rtail = 0;                      /* don't mix cooked and raw bytes */
     spin_unlock_irqrestore(&kbd_lock, fl);
+    waitqueue_wake_all(&readers);           /* cooked readers may proceed again */
     return 0;
 }
 
@@ -152,13 +171,12 @@ void keyboard_release(struct file *f)
         keyboard_set_mode(NULL, K_XLATE);
 }
 
-#ifdef __x86_64__
 static int e0;
 
-static void keyboard_irq(struct interrupt_frame *f)
+/* One scancode-set-1 byte, from the i8042 or a virtio-input keyboard
+ * (whose Linux key codes are set 1 for the main block). */
+void keyboard_scancode(uint8_t raw)
 {
-    (void)f;
-    uint8_t raw = inb(KBD_DATA);
     if (kbd_mode == K_RAW) {
         push_char((char)raw);
         return;
@@ -210,13 +228,20 @@ static void keyboard_irq(struct interrupt_frame *f)
         kputc(c);                   /* echo */
     push_char(c);
 }
+
+#ifdef __x86_64__
+static void keyboard_irq(struct interrupt_frame *f)
+{
+    (void)f;
+    keyboard_scancode(inb(KBD_DATA));
+}
 #endif
 
 #ifdef CONFIG_SERIAL
 static void serial_irq(struct interrupt_frame *f)
 {
     (void)f;
-    poll_serial_input();
+    drain_serial();
 }
 #endif
 
@@ -233,6 +258,7 @@ void keyboard_init(void)
     if (irq >= 0) {
         irq_install((uint8_t)irq, serial_irq);
         irq_unmask((uint8_t)irq);
+        serial_has_irq = 1;
     }
 #endif
 }

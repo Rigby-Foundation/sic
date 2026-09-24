@@ -14,7 +14,7 @@ ifeq ($(origin LD),default)
 LD := $(if $(LLD_PREFIX),$(LLD_PREFIX)/bin/ld.lld,ld.lld)
 endif
 
-# Target architecture: x86_64 (default) or powerpc (32-bit big-endian, G4).
+# Target architecture: x86_64 (default), powerpc (32-bit big-endian, G4) or aarch64.
 # Each has kernel/arch/<arch>/ (code, linker script, arch.mk with the flags)
 # and include/arch/<arch>/asm/ (the headers the generic code includes as asm/*).
 ARCH    ?= x86_64
@@ -41,12 +41,16 @@ CONFIG_SMP        := $(call cfg,CONFIG_SMP)
 CONFIG_FB_CONSOLE := $(call cfg,CONFIG_FB_CONSOLE)
 CONFIG_SERIAL     := $(call cfg,CONFIG_SERIAL)
 CONFIG_KEYBOARD   := $(call cfg,CONFIG_KEYBOARD)
+CONFIG_MOUSE      := $(call cfg,CONFIG_MOUSE)
+CONFIG_VIRTIO_GPU := $(call cfg,CONFIG_VIRTIO_GPU)
+CONFIG_VIRTIO_INPUT := $(call cfg,CONFIG_VIRTIO_INPUT)
 CONFIG_PCI        := $(call cfg,CONFIG_PCI)
 CONFIG_NVME       := $(call cfg,CONFIG_NVME)
 CONFIG_AHCI       := $(call cfg,CONFIG_AHCI)
 CONFIG_IDE        := $(call cfg,CONFIG_IDE)
 CONFIG_NET        := $(call cfg,CONFIG_NET)
 CONFIG_E1000      := $(call cfg,CONFIG_E1000)
+CONFIG_HDA        := $(call cfg,CONFIG_HDA)
 CONFIG_ZAEFS      := $(call cfg,CONFIG_ZAEFS)
 CONFIG_FAT        := $(call cfg,CONFIG_FAT)
 CONFIG_MODULES    := $(call cfg,CONFIG_MODULES)
@@ -66,26 +70,32 @@ LDFLAGS := $(ARCH_LDFLAGS) -T $(LINKER_SCRIPT) -nostdlib -static -z max-page-siz
 
 # Sources live in kernel/<subsystem>/ (arch/x86_64, mm, fs, drivers, proc, lib, core).
 # Optional pieces are listed per config option; everything else is always built.
-OPTIONAL := kernel/arch/x86_64/smp.c kernel/arch/x86_64/ap_trampoline.S kernel/arch/powerpc/escc.c \
-            kernel/arch/x86_64/module.c kernel/arch/powerpc/module.c \
-            kernel/drivers/fb.c kernel/drivers/font.c kernel/drivers/serial.c kernel/drivers/keyboard.c \
+OPTIONAL := kernel/arch/x86_64/smp.c kernel/arch/x86_64/ap_trampoline.S kernel/arch/aarch64/smp.c kernel/arch/powerpc/escc.c kernel/arch/aarch64/pl011.c \
+            kernel/arch/x86_64/module.c kernel/arch/powerpc/module.c kernel/arch/aarch64/module.c \
+            kernel/drivers/fb.c kernel/drivers/font.c kernel/drivers/serial.c kernel/drivers/keyboard.c kernel/drivers/mouse.c \
             kernel/drivers/pci.c kernel/drivers/nvme.c kernel/drivers/ahci.c kernel/drivers/ide.c \
+            kernel/drivers/virtio.c kernel/drivers/virtio_gpu.c kernel/drivers/virtio_input.c \
             kernel/fs/zaefs.c kernel/fs/fat.c \
-            kernel/net/core.c kernel/net/arp.c kernel/net/ip.c kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c \
-            kernel/drivers/e1000.c \
+            kernel/net/core.c kernel/net/arp.c kernel/net/ip.c kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c kernel/net/unix.c \
+            kernel/drivers/e1000.c kernel/drivers/hda.c kernel/drivers/dsp.c \
             kernel/core/module.c kernel/core/ksyms.c kernel/proc/signal.c kernel/fs/pipe.c \
             kernel/core/selftest.c
 SRC-y :=
-SRC-$(CONFIG_SMP)        += kernel/arch/x86_64/smp.c kernel/arch/x86_64/ap_trampoline.S
+SRC-$(CONFIG_SMP)        += $(ARCH_SMP_SRC)
 SRC-$(CONFIG_FB_CONSOLE) += kernel/drivers/fb.c kernel/drivers/font.c
 SRC-$(CONFIG_SERIAL)     += $(ARCH_SERIAL_SRC)
 SRC-$(CONFIG_KEYBOARD)   += kernel/drivers/keyboard.c
+SRC-$(CONFIG_MOUSE)      += kernel/drivers/mouse.c
+SRC-$(CONFIG_VIRTIO_GPU) += kernel/drivers/virtio_gpu.c
+SRC-$(CONFIG_VIRTIO_INPUT) += kernel/drivers/virtio_input.c
+SRC-y += $(if $(CONFIG_VIRTIO_GPU)$(CONFIG_VIRTIO_INPUT),kernel/drivers/virtio.c,)
 SRC-$(CONFIG_PCI)        += kernel/drivers/pci.c
 SRC-$(CONFIG_NVME)       += kernel/drivers/nvme.c
 SRC-$(CONFIG_AHCI)       += kernel/drivers/ahci.c
 SRC-$(CONFIG_IDE)        += kernel/drivers/ide.c
-SRC-$(CONFIG_NET)        += kernel/net/core.c kernel/net/arp.c kernel/net/ip.c kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c
+SRC-$(CONFIG_NET)        += kernel/net/core.c kernel/net/arp.c kernel/net/ip.c kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c kernel/net/unix.c
 SRC-$(CONFIG_E1000)      += kernel/drivers/e1000.c
+SRC-$(CONFIG_HDA)        += kernel/drivers/hda.c kernel/drivers/dsp.c
 SRC-$(CONFIG_ZAEFS)      += kernel/fs/zaefs.c
 SRC-$(CONFIG_FAT)        += kernel/fs/fat.c
 SRC-$(CONFIG_MODULES)    += kernel/core/module.c kernel/core/ksyms.c kernel/arch/$(ARCH)/module.c
@@ -108,8 +118,14 @@ MOD_CFLAGS := $(CFLAGS) -fno-common
 
 .PHONY: all clean modules install defconfig config
 
-all: $(TARGET) modules
+all: $(TARGET) $(ARCH_IMAGE) modules
 modules: $(MOD_KOS)
+
+# A raw image beside the ELF where the boot protocol wants one (aarch64: a
+# Linux-style Image that QEMU's -kernel loads with the initrd and the device tree).
+OBJCOPY := $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-objcopy,llvm-objcopy)
+$(BUILD)/sic.img: $(TARGET)
+	$(OBJCOPY) -O binary $< $@
 
 defconfig:
 	cp configs/defconfig .config
@@ -134,6 +150,7 @@ FORCE:
 install: all
 	@mkdir -p $(SYSROOT)/boot $(SYSROOT)/lib/modules $(SYSROOT)/usr/include/abi $(SYSROOT)/usr/share/sic/abi
 	cp $(TARGET) $(SYSROOT)/boot/sic.elf
+	@[ -z "$(ARCH_IMAGE)" ] || cp $(ARCH_IMAGE) $(SYSROOT)/boot/sic.img
 	cp include/abi/*.h $(SYSROOT)/usr/include/abi/
 	cp abi/syscall.tbl abi/gen.py $(SYSROOT)/usr/share/sic/abi/
 	@rm -f $(SYSROOT)/lib/modules/*.ko; [ -z "$(MOD_KOS)" ] || cp $(MOD_KOS) $(SYSROOT)/lib/modules/

@@ -6,10 +6,14 @@ CONFIG_SMP=n
 CONFIG_FB_CONSOLE=y
 CONFIG_SERIAL=y            # ESCC channel A (COM1 equivalent)
 CONFIG_KEYBOARD=y          # console input: the serial port (ADB / USB keyboards: not yet)
+CONFIG_MOUSE=n             # the PS/2 driver is x86; ADB/USB mice: not yet
+CONFIG_VIRTIO_GPU=y        # virtio-gpu on the PCI bus (QEMU -device virtio-gpu-pci)
+CONFIG_VIRTIO_INPUT=n      # virtio-keyboard-pci / virtio-mouse-pci (input comes from PS/2 / serial here)
 CONFIG_PCI=y
 CONFIG_NVME=y             # PCI NVMe (QEMU -device nvme; a real Mac would need a PCIe adapter)
 CONFIG_AHCI=n
 CONFIG_IDE=y               # the mac-io ATA cells (QEMU: -drive if=ide / -hda)
+CONFIG_HDA=n               # no HD Audio on a G4
 CONFIG_NET=y
 CONFIG_E1000=y             # a PCI e1000 in QEMU
 CONFIG_ZAEFS=y

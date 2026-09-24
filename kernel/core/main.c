@@ -7,15 +7,20 @@
 #include "asm/arch.h"
 #include "proc/syscall.h"
 #include "proc/elf.h"
+#include "core/prof.h"
 #include "fs/vfs.h"
+#include "mm/shm.h"
 #include "drivers/pci.h"
 #include "drivers/nvme.h"
 #include "drivers/ahci.h"
 #include "drivers/ide.h"
+#include "drivers/sound.h"
 #include "net/net.h"
 #include "drivers/e1000.h"
 #include "module.h"
 #include "drivers/keyboard.h"
+#include "drivers/mouse.h"
+#include "drivers/virtio_gpu.h"
 #include "proc/sched.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
@@ -77,7 +82,7 @@ void kernel_main(struct zaeboot_info *info)
     if (info->fb.base == 0 && info->size >= sizeof(*info) && info->firmware == ZAEBOOT_FW_BIOS)
         fb_init_text();             /* the loader left the BIOS text screen: keep using it */
     else
-        fb_init(&info->fb);
+        fb_init(&info->fb, (void *)(uintptr_t)info->fb.base, 0);  /* identity / BAT mapped */
     fb_set_color(0xE0E0E0, 0x101018);
     fb_clear();
 #endif
@@ -125,6 +130,7 @@ void kernel_main(struct zaeboot_info *info)
         if (f) { file_write(f, mode, strlen(mode)); file_close(f); }
     }
     vfs_mkdev("/dev/console", &console_ops, NULL);
+    shm_init();
 #ifdef CONFIG_FB_CONSOLE
     fb_dev_init();
 #endif
@@ -139,7 +145,18 @@ void kernel_main(struct zaeboot_info *info)
 #ifdef CONFIG_KEYBOARD
     keyboard_init();
 #endif
+#ifdef CONFIG_MOUSE
+    mouse_init();
+#endif
+#ifdef CONFIG_VIRTIO_INPUT
+    virtio_input_init();            /* keyboards and mice on the PCI bus */
+#endif
     sched_init();
+    prof_init();                    /* /proc/prof: where the CPUs spend their ticks */
+#if defined(CONFIG_VIRTIO_GPU) && defined(CONFIG_FB_CONSOLE)
+    virtio_gpu_init();              /* needs the scheduler (present thread) and the timer */
+    fb_dev_init();                  /* /dev/fb0, if the display only appeared now (aarch64: no firmware framebuffer) */
+#endif
     interrupts_enable();
     arch_init_smp();
 #ifdef CONFIG_NVME
@@ -150,6 +167,9 @@ void kernel_main(struct zaeboot_info *info)
 #endif
 #ifdef CONFIG_IDE
     ide_init();
+#endif
+#ifdef CONFIG_HDA
+    hda_init();
 #endif
 #ifdef CONFIG_NET
     net_init();
@@ -165,6 +185,9 @@ void kernel_main(struct zaeboot_info *info)
     kprintf("\nstarting /bin/init\n");
     if (!process_spawn("/bin/init", NULL, NULL))
         kprintf("could not start init\n");
+    /* The boot task is done. It must not stay runnable: as an ordinary task
+     * it would be scheduled round-robin and hold the CPU for a full slice
+     * doing nothing (that cost every wakeup on a busy CPU up to 10 ms). */
     for (;;)
-        arch_idle();
+        task_block();
 }

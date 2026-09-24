@@ -42,6 +42,8 @@ static long pipe_read(struct file *f, void *buf, size_t len)
         spin_unlock(&p->lock);
         if (eof)
             return 0;
+        if (f->flags & O_NONBLOCK)
+            return -EAGAIN;
         if (wait_event_interruptible(&p->readable, p->count > 0 || p->writers == 0) != 0)
             return -EINTR;
     }
@@ -72,6 +74,8 @@ static long pipe_write(struct file *f, const void *buf, size_t len)
             continue;
         }
         spin_unlock(&p->lock);
+        if (f->flags & O_NONBLOCK)
+            return done ? (long)done : -EAGAIN;
         if (wait_event_interruptible(&p->writable, p->count < PIPE_SIZE || p->readers == 0) != 0)
             return done ? (long)done : -EINTR;
     }

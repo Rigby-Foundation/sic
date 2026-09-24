@@ -12,7 +12,7 @@
 static long console_read(struct file *f, void *buf, size_t len)
 {
 #ifdef CONFIG_KEYBOARD
-    return keyboard_read(buf, len, (f->flags & O_NONBLOCK) != 0);
+    return keyboard_read(f, buf, len, (f->flags & O_NONBLOCK) != 0);
 #else
     (void)f; (void)buf; (void)len;
     return 0;                       /* no input device: EOF */
@@ -32,7 +32,7 @@ static int console_poll(struct file *f, struct waitqueue **wq)
 {
     (void)f;
 #ifdef CONFIG_KEYBOARD
-    return keyboard_poll(wq) | POLLOUT;
+    return keyboard_poll(f, wq) | POLLOUT;
 #else
     *wq = NULL;
     return POLLIN | POLLOUT;        /* reads return EOF at once */

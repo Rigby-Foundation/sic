@@ -13,12 +13,16 @@ CONFIG_SMP=y            # start the application processors listed in the MADT
 CONFIG_FB_CONSOLE=y     # text console on the framebuffer
 CONFIG_SERIAL=y         # COM1 output (and the only console if FB_CONSOLE=n)
 CONFIG_KEYBOARD=y       # PS/2 keyboard -> /dev/console input
+CONFIG_MOUSE=y          # PS/2 mouse -> /dev/mouse
+CONFIG_VIRTIO_GPU=y        # virtio-gpu display (QEMU -vga virtio); needs PCI and FB_CONSOLE
+CONFIG_VIRTIO_INPUT=n      # virtio-keyboard-pci / virtio-mouse-pci (input comes from PS/2 / serial here)
 
 # --- buses & storage --------------------------------------------------------
 CONFIG_PCI=y            # PCI enumeration (needed by every PCI driver below)
 CONFIG_NVME=y           # NVMe controllers -> /dev/nvmeXnY  (needs PCI)
 CONFIG_AHCI=y           # SATA (AHCI) controllers -> /dev/sdX (needs PCI)
 CONFIG_IDE=y            # legacy IDE/ATA, PIO -> /dev/hdX (needs PCI)
+CONFIG_HDA=y            # Intel HD Audio -> /dev/dsp (OSS-style playback; needs PCI)
 
 # --- networking -------------------------------------------------------------
 CONFIG_NET=y            # IPv4 stack, sockets, loopback
