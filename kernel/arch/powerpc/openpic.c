@@ -24,7 +24,8 @@
 #define VP_POLARITY  0x00800000u       /* active high */
 
 static volatile uint8_t *pic;
-static irq_handler_t handlers[IRQ_COUNT];
+#define IRQ_SHARE 4                         /* PCI lines are shared: every handler on a line runs */
+static irq_handler_t handlers[IRQ_COUNT][IRQ_SHARE];
 static uint32_t nsources;
 
 static inline uint32_t rd(uint32_t off) { return mmio_read32(pic + off); }
@@ -52,8 +53,9 @@ void ppc_openpic_init(void)
 
 void irq_install(uint8_t irq, irq_handler_t handler)
 {
-    if (irq < IRQ_COUNT)
-        handlers[irq] = handler;
+    if (irq >= IRQ_COUNT) return;
+    for (int i = 0; i < IRQ_SHARE; i++)
+        if (!handlers[irq][i] || handlers[irq][i] == handler) { handlers[irq][i] = handler; return; }
 }
 
 void irq_mask(uint8_t irq)
@@ -93,8 +95,9 @@ void ppc_openpic_dispatch(struct interrupt_frame *f)
     uint32_t vec = rd(OPENPIC_CPU_IACK) & 0xFF;
     if (vec == 0xFF)
         return;                                                    /* spurious */
-    if (vec < IRQ_COUNT && handlers[vec])
-        handlers[vec](f);
+    if (vec < IRQ_COUNT && handlers[vec][0])
+        for (int i = 0; i < IRQ_SHARE && handlers[vec][i]; i++)
+            handlers[vec][i](f);
     else
         kprintf("[unhandled irq %u]\n", vec);
     wr(OPENPIC_CPU_EOI, 0);
