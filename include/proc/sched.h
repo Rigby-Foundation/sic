@@ -35,6 +35,10 @@ struct task {
     uint64_t clear_child_tid;   /* CLONE_CHILD_CLEARTID / set_tid_address */
     volatile int group_exit;    /* the process is exiting: die at the next delivery point */
     int      killed_sig;        /* nonzero if terminated by a fault */
+    /* the last TASK_TRACE system calls (number, first argument, result): printed when a fault kills the task */
+#define TASK_TRACE 16
+    struct { uint16_t nr; unsigned long a1; long ret; } trace[TASK_TRACE];
+    unsigned trace_i;
     uint64_t sig_pending, sig_blocked;
     uint64_t sig_saved_mask;    /* mask to restore after a sigsuspend handler */
     int      sig_saved_mask_valid;
@@ -62,6 +66,7 @@ struct task *task_alloc(const char *name, task_entry_t entry, void *arg);
 struct task *task_alloc_reserve(const char *name, task_entry_t entry, void *arg, size_t reserve);
 void         task_start(struct task *t);
 struct task *task_current(void);
+int          sched_started(void);       /* tasks may sleep (past sched_init) */
 
 void task_yield(void);
 void task_sleep_ms(uint64_t ms);
