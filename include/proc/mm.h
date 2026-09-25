@@ -11,6 +11,7 @@ struct mm {
     uint64_t mmap_next;             /* bump pointer for anonymous mmap */
     int      refs;
     spinlock_t lock;                /* brk/mmap bookkeeping */
+    char     exe[256];              /* the executable's absolute path (readlink /proc/self/exe) */
 };
 
 struct mm *mm_create(uint64_t pgd);
