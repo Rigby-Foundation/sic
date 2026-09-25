@@ -27,6 +27,11 @@ void     vmm_flush_range(uint64_t virt, size_t pages);                 /* TLB sh
  * private user mappings (USER_BASE..USER_END). */
 pgd_t    vmm_create_address_space(void);
 pgd_t    vmm_clone_address_space(pgd_t src);            /* deep copy of the user part */
+/* Code the kernel wrote (exec, fork) that a user mapping will run: the
+ * instruction cache is not coherent with data writes on arm and powerpc.
+ * Clean each written range, then invalidate once. */
+void     arch_dcache_clean(const void *kva, size_t len);
+void     arch_icache_invalidate_all(void);
 void     vmm_destroy_address_space(pgd_t pgd);          /* frees user frames and tables */
 int      vmm_map_user_page(pgd_t pgd, uint64_t virt, uint64_t phys, uint64_t flags);
 uint64_t vmm_unmap_user_page(pgd_t pgd, uint64_t virt);         /* returns phys or 0 */

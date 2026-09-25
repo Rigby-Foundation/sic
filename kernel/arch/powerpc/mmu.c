@@ -338,6 +338,7 @@ pgd_t vmm_clone_address_space(pgd_t src)
             uint64_t ph = pmm_alloc_page();
             if (!ph) goto fail;
             memcpy(P2V(ph), P2V(pte & 0xFFFFF000u), 4096);
+            if (!(flags & PTE_NX)) arch_dcache_clean(P2V(ph), 4096);
             if (sw_map(d->pgdir, d->ctx, va, (uint32_t)ph, flags) != 0) { pmm_free_page(ph); goto fail; }
         }
     }
@@ -346,6 +347,19 @@ fail:
     vmm_destroy_address_space(np);
     return 0;
 }
+
+/* The 7450's L1 I-cache is physically indexed: icbi through the direct
+ * map reaches the user's lines too. */
+void arch_dcache_clean(const void *kva, size_t len)
+{
+    uintptr_t a = (uintptr_t)kva & ~31UL, e = (uintptr_t)kva + len;
+    for (uintptr_t p = a; p < e; p += 32) __asm__ volatile("dcbst 0, %0" : : "r"(p) : "memory");
+    __asm__ volatile("sync" ::: "memory");
+    for (uintptr_t p = a; p < e; p += 32) __asm__ volatile("icbi 0, %0" : : "r"(p) : "memory");
+    __asm__ volatile("sync; isync" ::: "memory");
+}
+
+void arch_icache_invalidate_all(void) { __asm__ volatile("isync" ::: "memory"); }
 
 void vmm_destroy_address_space(pgd_t pgd)
 {
