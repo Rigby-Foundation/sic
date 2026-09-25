@@ -16,6 +16,7 @@
 
 #define REG_CAP   0x00
 #define REG_VS    0x08
+#define REG_INTMS 0x0C
 #define REG_CC    0x14
 #define REG_CSTS  0x1C
 #define REG_AQA   0x24
@@ -209,6 +210,7 @@ static int nvme_probe(const struct pci_dev *pd, int index)
     wr32(c, REG_AQA, ((QUEUE_DEPTH - 1) << 16) | (QUEUE_DEPTH - 1));
     wr64(c, REG_ASQ, c->admin.sq_phys);
     wr64(c, REG_ACQ, c->admin.cq_phys);
+    wr32(c, REG_INTMS, 0xFFFFFFFF);                  /* polled: no INTx, which would sit asserted on a shared line */
     wr32(c, REG_CC, CC_IOSQES | CC_IOCQES | CC_EN);   /* MPS = 0 (4 KiB), CSS = NVM */
     deadline = timer_ticks() + timeout_ms + 100;
     while (!(rd32(c, REG_CSTS) & CSTS_RDY)) {

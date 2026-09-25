@@ -5,3 +5,4 @@ ARCH_CFLAGS  := --target=x86_64-elf -fno-pic -fno-pie -mno-red-zone -mgeneral-re
 ARCH_ASFLAGS := --target=x86_64-elf
 ARCH_LDFLAGS := -m elf_x86_64
 ARCH_SERIAL_SRC := kernel/drivers/serial.c      # COM1
+ARCH_SMP_SRC := kernel/arch/x86_64/smp.c kernel/arch/x86_64/ap_trampoline.S
