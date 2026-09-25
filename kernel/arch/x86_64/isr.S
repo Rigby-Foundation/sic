@@ -80,6 +80,7 @@ ISR_NOERR 53
 ISR_NOERR 54
 ISR_NOERR 55
 ISR_NOERR 240                          /* TLB shootdown IPI */
+ISR_NOERR 241                          /* reschedule IPI: wakes an idle CPU */
 ISR_NOERR 255                          /* LAPIC spurious */
 
 isr_common:

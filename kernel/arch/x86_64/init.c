@@ -63,6 +63,16 @@ void arch_halt_forever(void)
         __asm__ volatile("cli; hlt");
 }
 
+void arch_wake_cpu(struct cpu *c)
+{
+#ifdef CONFIG_SMP
+    if (c != this_cpu() && c->online)
+        lapic_send_ipi(c->lapic_id, 241);       /* IPI_RESCHED */
+#else
+    (void)c;
+#endif
+}
+
 void arch_hypervisor_id(char out[13])
 {
     uint32_t eax, ebx, ecx, edx;

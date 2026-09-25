@@ -3,6 +3,7 @@
 #pragma once
 #include "types.h"
 #include "asm/irqflags.h"
+struct cpu;
 
 struct zaeboot_info;
 
@@ -14,3 +15,4 @@ void arch_init_smp(void);
 void arch_halt_forever(void) __attribute__((noreturn));
 void arch_hypervisor_id(char out[13]);
 static inline void arch_idle(void) { interrupts_enable(); __asm__ volatile("sync; isync"); }
+static inline void arch_wake_cpu(struct cpu *c) { (void)c; }     /* one CPU, and it doesn't halt */

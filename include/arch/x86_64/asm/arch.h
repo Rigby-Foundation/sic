@@ -5,6 +5,7 @@
 #pragma once
 #include "types.h"
 #include "asm/irqflags.h"
+struct cpu;
 
 struct zaeboot_info;
 
@@ -24,3 +25,5 @@ void arch_halt_forever(void) __attribute__((noreturn));
 void arch_hypervisor_id(char out[13]);
 /* Wait for the next interrupt with interrupts enabled (the boot task's idle loop). */
 static inline void arch_idle(void) { __asm__ volatile("sti; hlt"); }
+/* Kick a CPU out of arch_idle() so it looks at the run queue now. */
+void arch_wake_cpu(struct cpu *c);

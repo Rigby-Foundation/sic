@@ -262,7 +262,16 @@ void sched_enter_idle(void)
     arch_switch_first(c->idle);
 }
 
-struct task *task_current(void) { return CUR; }
+/* The CPU, then its current task: with interrupts on, a preemption between
+ * the two loads can move us to another CPU and answer with its task. */
+struct task *task_current(void)
+{
+    unsigned long f = irq_save();
+    struct task *t = CUR;
+    irq_restore(f);
+    return t;
+}
+int sched_started(void) { return started; }
 
 void task_yield(void)
 {
@@ -297,13 +306,27 @@ void task_block(void)
     spin_unlock_irqrestore(&sched_lock, f);
 }
 
+/* A task became runnable: an idle CPU is kicked out of its halt so it
+ * picks the task up now instead of at its next tick. */
+static void wake_hint(struct task *t)
+{
+    (void)t;
+    for (uint32_t i = 0; i < cpu_count; i++)
+        if (cpus[i].online && cpus[i].current == cpus[i].idle && &cpus[i] != this_cpu()) {
+            arch_wake_cpu(&cpus[i]);
+            return;
+        }
+}
+
 void task_wake(struct task *t)
 {
     uint64_t f = spin_lock_irqsave(&sched_lock);
-    if (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING)
+    if (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) {
         rq_push(t);
-    else if (t->state != TASK_ZOMBIE)
+        wake_hint(t);
+    } else if (t->state != TASK_ZOMBIE) {
         t->wake_pending = 1;
+    }
     spin_unlock_irqrestore(&sched_lock, f);
 }
 
@@ -361,12 +384,22 @@ static void clear_child_tid(struct task *t)
     }
 }
 
+/* Drop the file table now rather than when the zombie is reaped: the other
+ * end of a pipe or socket must see the hangup as soon as we are gone. */
+static void release_files(struct task *t)
+{
+    struct fdtable *fdt = t->fdt;
+    t->fdt = NULL;
+    fdt_put(fdt);
+}
+
 void task_exit_code(int code)
 {
     struct task *t = CUR;
     if (t->is_user && !t->is_thread && !t->group_exit)
         task_exit_group(code);              /* the leader leaving ends the process */
     clear_child_tid(t);
+    release_files(t);
     spin_lock_irqsave(&sched_lock);
     t->exit_code = code;
     CUR->state = TASK_ZOMBIE;
@@ -413,6 +446,7 @@ void task_exit_group(int code)
     /* The leader's zombie is what the parent waits for; a thread that called
      * exit_group ends itself here, and the leader dies at its next delivery point. */
     clear_child_tid(self);
+    release_files(self);
     spin_lock_irqsave(&sched_lock);
     self->state = TASK_ZOMBIE;
     schedule();

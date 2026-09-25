@@ -8,9 +8,12 @@
 #include "asm/cpu.h"
 #include "proc/signal.h"
 #include "mm/vmm.h"
+#include "proc/elf.h"
 
 extern void vmm_shootdown_ipi(void);
 #define IPI_TLB_SHOOTDOWN 240
+#define IPI_RESCHED       241
+extern void isr241(void);
 
 struct idt_entry {
     uint16_t offset_low;
@@ -53,7 +56,10 @@ static void (*const isr_stubs[NUM_STUBS])(void) = {
     isr48, isr49, isr50, isr51, isr52, isr53, isr54, isr55,
 };
 
-static irq_handler_t irq_handlers[IRQ_COUNT];
+/* PCI lines are shared: every handler installed on an IRQ runs (each one
+ * checks its own device). */
+#define IRQ_SHARE 4
+static irq_handler_t irq_handlers[IRQ_COUNT][IRQ_SHARE];
 static int use_apic;
 
 static const char *const exception_names[32] = {
@@ -85,6 +91,7 @@ void idt_init(void)
         idt_set_gate((uint8_t)i, isr_stubs[i], 0x8E);   /* present, DPL0, interrupt gate */
     idt_set_gate(APIC_SPURIOUS_VECTOR, isr255, 0x8E);
     idt_set_gate(IPI_TLB_SHOOTDOWN, isr240, 0x8E);
+    idt_set_gate(IPI_RESCHED, isr241, 0x8E);
     idt_load_current();
 }
 
@@ -96,8 +103,10 @@ void idt_load_current(void)
 
 void irq_install(uint8_t irq, irq_handler_t handler)
 {
-    if (irq < IRQ_COUNT)
-        irq_handlers[irq] = handler;
+    if (irq >= IRQ_COUNT) return;
+    for (int i = 0; i < IRQ_SHARE; i++)
+        if (!irq_handlers[irq][i] || irq_handlers[irq][i] == handler) { irq_handlers[irq][i] = handler; return; }
+    kprintf("irq %u: too many handlers\n", irq);
 }
 
 void irq_use_apic(void)
@@ -139,8 +148,9 @@ static void handle_irq(struct interrupt_frame *f)
 
     if (!use_apic && pic_is_spurious(irq))
         return;
-    if (irq_handlers[irq])
-        irq_handlers[irq](f);
+    if (irq_handlers[irq][0])
+        for (int i = 0; i < IRQ_SHARE && irq_handlers[irq][i]; i++)
+            irq_handlers[irq][i](f);
     else
         kprintf("[unhandled irq %u]\n", irq);
 
@@ -160,6 +170,11 @@ void isr_handler(struct interrupt_frame *f)
         lapic_eoi();
         return;
     }
+    if (f->vector == IPI_RESCHED) {         /* nothing to do: the idle loop looks at the run queue on the way out */
+        lapic_eoi();
+        sched_preempt();
+        return;
+    }
     if (f->vector >= IRQ_BASE && f->vector < IRQ_BASE + IRQ_COUNT) {
         handle_irq(f);
         signal_deliver_irq(f);
@@ -174,10 +189,18 @@ void isr_handler(struct interrupt_frame *f)
     }
 
     if (f->cs & 3) {
-        /* A user process faulted: kill it, the kernel is fine. */
+        /* A user process faulted: kill it, the kernel is fine. Interrupts
+         * go back on first, as in a syscall: growing the stack or printing
+         * the post-mortem with them off would leave another CPU waiting
+         * for our TLB-shootdown ack while we wait on its locks. */
         uint64_t cr2 = 0;
         if (f->vector == 14)
             __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        __asm__ volatile("sti");
+        if (f->vector == 14) {
+            if (!(f->error_code & 1) && process_grow_stack(task_current(), cr2) == 0)
+                return;                     /* the stack grew under it */
+        }
         int sig = f->vector == 14 ? 11 : f->vector == 6 ? 4 : f->vector == 0 || f->vector == 16 || f->vector == 19 ? 8 : 7;
 #ifdef CONFIG_SIGNALS
         if (signal_fault(f, sig, cr2))
@@ -187,6 +210,14 @@ void isr_handler(struct interrupt_frame *f)
                 "  rsp=%llx rdi=%llx rsi=%llx rdx=%llx rcx=%llx rax=%llx\n",
                 task_current()->name, task_current()->id, name, f->rip, cr2, f->error_code,
                 f->rsp, f->rdi, f->rsi, f->rdx, f->rcx, f->rax);
+        kprintf("  rbx=%llx rbp=%llx r8=%llx r9=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n", f->rbx, f->rbp, f->r8, f->r9, f->r12, f->r13, f->r14, f->r15);
+        if (user_ok(f->rsp, 32 * sizeof(uint64_t))) {     /* the top of the stack: return addresses, mostly */
+            const uint64_t *sp = (const uint64_t *)f->rsp;
+            kprintf("  stack:");
+            for (int i = 0; i < 32; i++) kprintf(" %llx", sp[i]);
+            kprintf("\n");
+        }
+        task_print_trace(task_current());
         task_current()->killed_sig = sig;
         task_exit_code(128 + sig);
     }
