@@ -41,6 +41,7 @@
 #define ENAMETOOLONG 36
 #define ENOSYS      38
 #define ENOTEMPTY   39
+#define EXDEV       18
 #define EBUSY       16
 #define EPIPE       32
 #define ETIMEDOUT  110
@@ -68,6 +69,23 @@
 #define F_GETFD         1
 #define F_SETFD         2
 #define F_GETFL         3
+#define F_GETLK  5
+#define F_SETLK  6
+#define F_SETLKW 7
+#define F_GETLK64  12
+#define F_SETLK64  13
+#define F_SETLKW64 14
+#define F_OFD_GETLK  36
+#define F_OFD_SETLK  37
+#define F_OFD_SETLKW 38
+#define F_RDLCK 0
+#define F_WRLCK 1
+#define F_UNLCK 2
+struct abi_flock {                  /* musl x86_64 / ppc: short l_type, l_whence; off_t start, len; pid_t pid */
+    int16_t l_type, l_whence;
+    int64_t l_start, l_len;
+    int32_t l_pid;
+};
 #define F_SETFL         4
 #define F_DUPFD_CLOEXEC 1030
 
@@ -122,6 +140,23 @@ struct abi_stat {                       /* musl arch/x86_64/bits/stat.h, 144 byt
     int64_t  st_blocks;
     struct abi_timespec st_atim, st_mtim, st_ctim;
     int64_t  __unused[3];
+};
+#elif defined(__aarch64__)
+struct abi_stat {                       /* musl arch/aarch64/bits/stat.h (the generic kstat), 128 bytes */
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint32_t st_mode;
+    uint32_t st_nlink;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint64_t st_rdev;
+    uint64_t __pad;
+    int64_t  st_size;
+    int32_t  st_blksize;
+    int32_t  __pad2;
+    int64_t  st_blocks;
+    struct abi_timespec st_atim, st_mtim, st_ctim;
+    uint32_t __unused[2];
 };
 #elif defined(__powerpc__)
 struct abi_stat {                       /* musl arch/powerpc/kstat.h, 104 bytes */
@@ -192,6 +227,7 @@ struct abi_utsname { char sysname[65], nodename[65], release[65], version[65], m
 #define SIGILL   4
 #define SIGFPE   8
 #define SIGBUS   7
+#define SIGTRAP  5
 
 /* clocks */
 #define CLOCK_REALTIME  0
@@ -288,6 +324,11 @@ struct abi_sockaddr_in {
     uint16_t sin_port;              /* network byte order */
     uint32_t sin_addr;              /* network byte order */
     uint8_t  sin_zero[8];
+};
+
+struct abi_sockaddr_un {
+    uint16_t sun_family;
+    char     sun_path[108];
 };
 
 struct abi_msghdr {                 /* musl: pointers and ints, naturally aligned */

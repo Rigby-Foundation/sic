@@ -23,6 +23,7 @@ struct socket *sock_create(int type, int proto)
     struct socket *s = kzalloc(sizeof(*s));
     if (!s)
         return NULL;
+    s->domain = AF_INET;
     s->type = type;
     s->proto = proto;
     s->refs = 1;
@@ -56,6 +57,7 @@ void sock_put(struct socket *s)
         pkt_free(p);
     }
     tcp_destroy(s);
+    if (s->un) unix_close(s);
     kfree(s);
 }
 
@@ -88,6 +90,7 @@ static int dgram_poll(struct socket *s)
 
 static int sock_poll_locked(struct socket *s)
 {
+    if (s->domain == AF_UNIX) return unix_poll(s);
     return s->type == SOCK_STREAM ? tcp_poll(s) : dgram_poll(s);
 }
 
@@ -105,7 +108,9 @@ static void sock_release(struct file *f)
 {
     struct socket *s = sock_of(f);
     spin_lock(&net_lock);
-    if (s->type == SOCK_STREAM)
+    if (s->domain == AF_UNIX)
+        unix_close(s);
+    else if (s->type == SOCK_STREAM)
         tcp_close(s);
     sock_put(s);
     spin_unlock(&net_lock);
@@ -121,7 +126,7 @@ static long sock_write(struct file *f, const void *buf, size_t len) { return do_
 static const struct dev_ops sock_dev_ops = { .read = sock_read, .write = sock_write };
 static const struct file_ops sock_fops = { .release = sock_release, .poll = sock_poll };
 
-static struct file *sock_file(struct socket *s, int flags)
+struct file *sock_file(struct socket *s, int flags)
 {
     struct vnode *n = vnode_alloc("socket", 6, VNODE_DEV, NULL);
     struct file *f = kzalloc(sizeof(*f));
@@ -160,6 +165,33 @@ static int sock_wait(struct socket *s, int want, long timeo_ms)
 }
 
 /* ---- addresses ------------------------------------------------------------------ */
+/* A sockaddr_un from user space as a NUL-terminated path (sizeof path >= 108). */
+static int addr_un(uint64_t uaddr, uint64_t ulen, char *path)
+{
+    if (ulen < 2 || ulen > sizeof(struct abi_sockaddr_un) || !user_ok(uaddr, ulen))
+        return -EINVAL;
+    const struct abi_sockaddr_un *a = (const void *)uaddr;
+    if (a->sun_family != AF_UNIX) return -EAFNOSUPPORT;
+    size_t n = ulen - 2;
+    memcpy(path, a->sun_path, n);
+    path[n < 107 ? n : 107] = 0;
+    return 0;
+}
+
+static int addr_un_out(uint64_t uaddr, uint64_t ulenp, const char *path)
+{
+    if (!uaddr) return 0;
+    if (!user_ok(ulenp, 4)) return -EFAULT;
+    uint32_t len = *(uint32_t *)ulenp;
+    struct abi_sockaddr_un a = { .sun_family = AF_UNIX };
+    strcpy(a.sun_path, path);
+    uint32_t full = 2 + (uint32_t)strlen(path) + 1, n = len < full ? len : full;
+    if (!user_ok(uaddr, n)) return -EFAULT;
+    memcpy((void *)uaddr, &a, n);
+    *(uint32_t *)ulenp = full;
+    return 0;
+}
+
 static int addr_in(uint64_t uaddr, uint64_t ulen, struct abi_sockaddr_in *out)
 {
     if (ulen < sizeof(*out) || !user_ok(uaddr, sizeof(*out)))
@@ -224,9 +256,11 @@ static int bind_locked(struct socket *s, uint32_t ip, uint16_t port)
 /* ---- system calls --------------------------------------------------------------- */
 long sys_socket(long domain, long type, long proto)
 {
+    int flags = (int)type & ~SOCK_TYPE_MASK;
+    if (domain == AF_UNIX)
+        return unix_socket((int)type, flags);
     if (domain != AF_INET)
         return -EAFNOSUPPORT;
-    int flags = (int)type & ~SOCK_TYPE_MASK;
     type &= SOCK_TYPE_MASK;
     switch (type) {
     case SOCK_STREAM: if (proto == 0) proto = IPPROTO_TCP; if (proto != IPPROTO_TCP) return -EPROTONOSUPPORT; break;
@@ -267,6 +301,11 @@ long sys_bind(long fd, uint64_t uaddr, uint64_t ulen)
     struct file *f;
     struct socket *s = sock_fd(fd, &f);
     if (!s) return fd_get(fd) ? -ENOTSOCK : -EBADF;
+    if (s->domain == AF_UNIX) {
+        char path[108];
+        int r = addr_un(uaddr, ulen, path);
+        return r ? r : unix_bind(s, path);
+    }
     struct abi_sockaddr_in a;
     int r = addr_in(uaddr, ulen, &a);
     if (r) return r;
@@ -282,6 +321,7 @@ long sys_listen(long fd, long backlog)
     struct socket *s = sock_fd(fd, &f);
     if (!s) return fd_get(fd) ? -ENOTSOCK : -EBADF;
     if (s->type != SOCK_STREAM) return -EOPNOTSUPP;
+    if (s->domain == AF_UNIX) return unix_listen(s, (int)backlog);
     spin_lock(&net_lock);
     int r = 0;
     if (!s->bound)
@@ -301,6 +341,11 @@ long sys_connect(long fd, uint64_t uaddr, uint64_t ulen)
     struct file *f;
     struct socket *s = sock_fd(fd, &f);
     if (!s) return fd_get(fd) ? -ENOTSOCK : -EBADF;
+    if (s->domain == AF_UNIX) {
+        char path[108];
+        int r = addr_un(uaddr, ulen, path);
+        return r ? r : unix_connect(s, path);
+    }
     struct abi_sockaddr_in a;
     int r = addr_in(uaddr, ulen, &a);
     if (r) return r;
@@ -350,6 +395,11 @@ long sys_accept4(long fd, uint64_t uaddr, uint64_t ulenp, long flags)
     struct socket *s = sock_fd(fd, &f);
     if (!s) return fd_get(fd) ? -ENOTSOCK : -EBADF;
     if (s->type != SOCK_STREAM || !s->listening) return -EINVAL;
+    if (s->domain == AF_UNIX) {
+        long r = unix_accept(s, f, (int)flags);
+        if (r >= 0 && uaddr) addr_un_out(uaddr, ulenp, "");
+        return r;
+    }
     struct socket *c = NULL;
     for (;;) {
         spin_lock(&net_lock);
@@ -397,7 +447,8 @@ long sys_shutdown(long fd, long how)
     if (how == SHUT_RD || how == SHUT_RDWR) s->shut_rd = 1;
     if (how == SHUT_WR || how == SHUT_RDWR) {
         s->shut_wr = 1;
-        if (s->type == SOCK_STREAM) tcp_shutdown_wr(s);
+        if (s->domain == AF_UNIX) unix_shutdown(s, (int)how);
+        else if (s->type == SOCK_STREAM) tcp_shutdown_wr(s);
     }
     waitqueue_wake_all(&s->wq);
     spin_unlock(&net_lock);
@@ -409,6 +460,7 @@ long sys_getsockname(long fd, uint64_t uaddr, uint64_t ulenp)
     struct file *f;
     struct socket *s = sock_fd(fd, &f);
     if (!s) return fd_get(fd) ? -ENOTSOCK : -EBADF;
+    if (s->domain == AF_UNIX) return addr_un_out(uaddr, ulenp, unix_name(s));
     return addr_out(uaddr, ulenp, s->local_ip, s->local_port);
 }
 
@@ -418,6 +470,7 @@ long sys_getpeername(long fd, uint64_t uaddr, uint64_t ulenp)
     struct socket *s = sock_fd(fd, &f);
     if (!s) return fd_get(fd) ? -ENOTSOCK : -EBADF;
     if (!s->connected) return -ENOTCONN;
+    if (s->domain == AF_UNIX) return addr_un_out(uaddr, ulenp, "");
     return addr_out(uaddr, ulenp, s->remote_ip, s->remote_port);
 }
 
@@ -443,6 +496,7 @@ long sys_setsockopt(long fd, long level, long name, uint64_t uval, uint64_t len)
         }
         return -ENOPROTOOPT;
     }
+    if (s->domain == AF_UNIX) return -ENOPROTOOPT;
     if (level == SOL_TCP && name == TCP_NODELAY) return 0;     /* there is no Nagle to disable */
     if (level == IPPROTO_IP) return 0;
     return -ENOPROTOOPT;
@@ -463,7 +517,7 @@ long sys_getsockopt(long fd, long level, long name, uint64_t uval, uint64_t ulen
         case SO_REUSEADDR: v = s->reuseaddr; break;
         case SO_BROADCAST: v = s->broadcast; break;
         case SO_KEEPALIVE: v = 0; break;
-        case SO_SNDBUF: case SO_RCVBUF: v = TCP_BUF_SIZE; break;
+        case SO_SNDBUF: case SO_RCVBUF: v = s->domain == AF_UNIX ? 256 * 1024 : TCP_BUF_SIZE; break;
         case 3 /* SO_TYPE */: v = s->type; break;
         default: return -ENOPROTOOPT;
         }
@@ -481,6 +535,7 @@ long sys_getsockopt(long fd, long level, long name, uint64_t uval, uint64_t ulen
 static long do_sendto(struct file *f, const void *buf, size_t len, int flags, const struct abi_sockaddr_in *to)
 {
     struct socket *s = sock_of(f);
+    if (s->domain == AF_UNIX) return to ? -EISCONN : unix_send(f, buf, len, flags);
     if (s->type == SOCK_STREAM) {
         if (to) return -EISCONN;
         size_t done = 0;
@@ -533,6 +588,7 @@ out:
 static long do_recvfrom(struct file *f, void *buf, size_t len, int flags, struct abi_sockaddr_in *from)
 {
     struct socket *s = sock_of(f);
+    if (s->domain == AF_UNIX) return unix_recv(f, buf, len, flags);
     if (s->type == SOCK_STREAM) {
         for (;;) {
             spin_lock(&net_lock);
@@ -598,7 +654,7 @@ long sys_recvfrom(long fd, uint64_t ubuf, uint64_t len, long flags, uint64_t uad
     struct abi_sockaddr_in a = { 0 };
     long r = do_recvfrom(f, (void *)ubuf, len, (int)flags, uaddr ? &a : NULL);
     if (r >= 0 && uaddr) {
-        int e = addr_out(uaddr, ulenp, a.sin_addr, a.sin_port);
+        int e = s->domain == AF_UNIX ? addr_un_out(uaddr, ulenp, "") : addr_out(uaddr, ulenp, a.sin_addr, a.sin_port);
         if (e) return e;
     }
     return r;
