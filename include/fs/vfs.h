@@ -23,6 +23,7 @@ struct dev_ops {
     long (*ioctl)(struct file *f, long req, uint64_t arg);  /* optional */
     int  (*mmap)(struct file *f, uint64_t virt, size_t pages, uint64_t off, int prot); /* optional */
     void (*release)(struct file *f);   /* optional: last reference to an open file dropped */
+    long (*open)(struct file *f);      /* optional: a new open file; < 0 (-errno) refuses it */
 };
 
 /* Per-filesystem operations. Directory entries are cached as child vnodes
@@ -31,6 +32,8 @@ struct vnode_ops {
     struct vnode *(*lookup)(struct vnode *dir, const char *name, size_t len);
     struct vnode *(*create)(struct vnode *dir, const char *name, size_t len, enum vnode_type type);
     int  (*unlink)(struct vnode *dir, struct vnode *n);           /* n has no children/open users */
+    int  (*rename)(struct vnode *olddir, struct vnode *n, struct vnode *newdir, const char *name, size_t len);
+                                    /* move the on-disk entry; optional (an in-memory fs needs none) */
     long (*read)(struct vnode *n, uint64_t pos, void *buf, size_t len);
     long (*write)(struct vnode *n, uint64_t pos, const void *buf, size_t len);
     int  (*truncate)(struct vnode *n, uint64_t size);
@@ -54,6 +57,8 @@ struct vnode {
     int      is_sock;               /* VNODE_DEV that is a socket (priv = struct socket) */
     int      seekable;              /* VNODE_DEV with a position (framebuffer, initrd) */
     struct vnode *mounted;          /* a filesystem's root mounted on this directory */
+    struct file *lock_owner;        /* fcntl record lock: one whole-file lock per file, held by an open file */
+    uint32_t lock_pid;
     struct vnode *mountpoint;       /* for a mounted root: the directory it sits on */
 };
 
@@ -93,6 +98,8 @@ struct file {
     int      flags;
     int      refs;
     const struct file_ops *fops;
+    void    *priv_gpu;              /* a device's per-open state (virtio-gpu contexts, shm segments) */
+    uint32_t fb_gen;                /* /dev/fb0: the mode generation this file last read */
 };
 
 struct stat {
@@ -125,6 +132,7 @@ struct vnode *vfs_lookup(struct vnode *cwd, const char *path);
 struct vnode *vfs_create(struct vnode *cwd, const char *path, enum vnode_type type);
 int           vfs_mkdev(const char *path, const struct dev_ops *ops, void *priv);
 int           vfs_unlink(struct vnode *cwd, const char *path);
+int           vfs_rename(struct vnode *cwd, const char *oldpath, struct vnode *newcwd, const char *newpath);   /* -errno */
 int           vfs_path_of(struct vnode *n, char *buf, size_t len);
 void          vfs_load_tar(const void *tar, size_t size);
 
