@@ -536,6 +536,15 @@ static int zaefs_unlink(struct vnode *dir, struct vnode *n)
     return 0;
 }
 
+/* Move the directory entry: the inode and its blocks stay. */
+static int zaefs_rename(struct vnode *olddir, struct vnode *n, struct vnode *newdir, const char *name, size_t len)
+{
+    struct zinode *zi = zi_of(n);
+    if (len > ZAEFS_NAME_MAX) return -1;
+    if (dir_remove(olddir, zi->ino) != 0) return -1;
+    return dir_add(newdir, name, len, zi->ino, (uint8_t)zi->di.type);
+}
+
 static int zaefs_readdir(struct vnode *dir, size_t index, struct dirent *out)
 {
     struct zaefs *fs = fs_of(dir);
@@ -570,6 +579,7 @@ static const struct vnode_ops zaefs_ops = {
     .lookup   = zaefs_lookup,
     .create   = zaefs_create,
     .unlink   = zaefs_unlink,
+    .rename   = zaefs_rename,
     .read     = zaefs_read,
     .write    = zaefs_write,
     .truncate = zaefs_truncate,
