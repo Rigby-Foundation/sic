@@ -254,6 +254,43 @@ int vfs_unlink(struct vnode *cwd, const char *path)
     return rc;
 }
 
+/* rename(2): within one filesystem. An existing target file is replaced.
+ * The entry cache is the truth for tmpfs; a disk filesystem moves its
+ * directory entry through its rename op. */
+int vfs_rename(struct vnode *cwd, const char *oldpath, struct vnode *newcwd, const char *newpath)
+{
+    spin_lock(&vfs_lock);
+    int rc = 0;
+    struct vnode *n = lookup_locked(cwd, oldpath);
+    const char *last; size_t len;
+    struct vnode *newdir = walk_parent(newcwd, newpath, &last, &len);
+    if (!n || !n->parent) rc = -ENOENT;
+    else if (!newdir || newdir->type != VNODE_DIR || len == 0 || len >= VFS_NAME_MAX) rc = -ENOENT;
+    else if (n->mountpoint || n->mounted) rc = -EBUSY;
+    else if (newdir->mnt != n->mnt) rc = -EXDEV;
+    else if (!n->ops->rename && !(n->mnt && n->mnt->type && strcmp(n->mnt->type->name, "tmpfs") == 0)) rc = -ENOSYS;
+    if (rc) goto out;
+    struct vnode *target = dir_find(newdir, last, len);
+    if (target == n) goto out;
+    if (target) {
+        if (target->type == VNODE_DIR && (target->children || n->type != VNODE_DIR)) { rc = target->children ? -ENOTEMPTY : -EISDIR; goto out; }
+        if (target->type != VNODE_DIR && n->type == VNODE_DIR) { rc = -ENOTDIR; goto out; }
+        if (target->ops && target->ops->unlink && target->ops->unlink(newdir, target) != 0) { rc = -EIO; goto out; }
+        detach(target);
+        vnode_free(target);
+    }
+    if (n->ops->rename && n->ops->rename(n->parent, n, newdir, last, len) != 0) { rc = -EIO; goto out; }
+    detach(n);
+    memset(n->name, 0, sizeof n->name);
+    memcpy(n->name, last, len);
+    n->parent = newdir;
+    n->sibling = newdir->children;
+    newdir->children = n;
+out:
+    spin_unlock(&vfs_lock);
+    return rc;
+}
+
 int vfs_path_of(struct vnode *n, char *buf, size_t len)
 {
     char tmp[VFS_PATH_MAX];
@@ -305,6 +342,10 @@ struct file *vfs_open(struct vnode *cwd, const char *path, int flags)
     f->refs = 1;
     if ((flags & O_APPEND) && n->type == VNODE_FILE)
         f->pos = n->size;
+    if (n->type == VNODE_DEV && n->dev && n->dev->open && n->dev->open(f) < 0) {
+        kfree(f);                       /* the device said no (busy) */
+        return NULL;
+    }
     return f;
 }
 
@@ -317,6 +358,7 @@ struct file *file_dup(struct file *f)
 void file_close(struct file *f)
 {
     if (f && __atomic_sub_fetch(&f->refs, 1, __ATOMIC_SEQ_CST) == 0) {
+        if (f->node->lock_owner == f) f->node->lock_owner = NULL;   /* a record lock dies with its file */
         if (f->fops && f->fops->release)
             f->fops->release(f);
         else if (f->node->type == VNODE_DEV && f->node->dev && f->node->dev->release)
