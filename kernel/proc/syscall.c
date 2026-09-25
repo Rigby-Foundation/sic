@@ -33,6 +33,17 @@
 
 /* The caller's address space is live, so a range is usable once we've
  * checked it lies in user space and every page of it is mapped. */
+/* The post-mortem's last lines: what the task asked for before it died. */
+void task_print_trace(const struct task *t)
+{
+    kprintf("  last syscalls (nr(arg1)=result):");
+    for (unsigned k = 0; k < TASK_TRACE; k++) {
+        unsigned i = (t->trace_i + k) % TASK_TRACE;
+        if (t->trace[i].nr || t->trace[i].ret) kprintf(" %u(%lx)=%ld", t->trace[i].nr, t->trace[i].a1, t->trace[i].ret);
+    }
+    kprintf("\n");
+}
+
 int user_ok(uint64_t ptr, uint64_t len)
 {
     if (len == 0)
@@ -267,6 +278,18 @@ static long sys_getdents64(long fd, uint64_t ubuf, uint64_t len)
     return (long)used;
 }
 
+static long sys_renameat(long olddirfd, uint64_t uold, long newdirfd, uint64_t unew)
+{
+    char old[VFS_PATH_MAX], new[VFS_PATH_MAX];
+    long rc = user_str(uold, old, sizeof old);
+    if (rc) return rc;
+    rc = user_str(unew, new, sizeof new);
+    if (rc) return rc;
+    struct vnode *od = at_dir(olddirfd), *nd = at_dir(newdirfd);
+    if (!od || !nd) return -EBADF;
+    return vfs_rename(od, old, nd, new);
+}
+
 static long path_op(long dirfd, uint64_t upath, int op)
 {
     char path[VFS_PATH_MAX];
@@ -309,6 +332,23 @@ static long sys_getcwd(uint64_t ubuf, uint64_t len)
     return (long)(strlen(tmp) + 1);
 }
 
+/* readlink: sic has no symbolic links; /proc/self/exe is the one link
+ * there is, the running program's path. */
+static long sys_readlinkat(long dirfd, uint64_t upath, uint64_t ubuf, uint64_t len)
+{
+    (void)dirfd;
+    char path[VFS_PATH_MAX];
+    long rc = user_str(upath, path, sizeof(path));
+    if (rc < 0) return rc;
+    if (!user_ok(ubuf, len)) return -EFAULT;
+    struct task *t = task_current();
+    if (strcmp(path, "/proc/self/exe") != 0 || !t->mm) return -EINVAL;      /* not a link */
+    size_t n = strlen(t->mm->exe);
+    if (n > len) n = len;
+    memcpy((void *)ubuf, t->mm->exe, n);
+    return (long)n;
+}
+
 static long sys_dup(long fd)
 {
     struct file *f = fd_get(fd);
@@ -347,6 +387,28 @@ static long sys_fcntl(long fd, long cmd, long arg)
     case F_SETFD: return 0;
     case F_GETFL: return f->flags & (O_ACCMODE | O_APPEND | O_NONBLOCK);
     case F_SETFL: f->flags = (f->flags & ~(O_APPEND | O_NONBLOCK)) | (int)(arg & (O_APPEND | O_NONBLOCK)); return 0;
+    case F_GETLK: case F_SETLK: case F_SETLKW: case F_OFD_GETLK: case F_OFD_SETLK: case F_OFD_SETLKW:
+    case F_GETLK64: case F_SETLK64: case F_SETLKW64: {                /* 32-bit musl (ppc) uses the 64 names */
+        /* Record locks, whole-file granularity: one holder per file, a
+         * second open file gets EAGAIN (EACCES). Enough for lock files. */
+        if (!user_ok((uint64_t)arg, sizeof(struct abi_flock))) return -EFAULT;
+        struct abi_flock *fl = (void *)arg;
+        struct vnode *n = f->node;
+        int wait = cmd == F_SETLKW || cmd == F_OFD_SETLKW || cmd == F_SETLKW64;
+        if (cmd == F_GETLK || cmd == F_OFD_GETLK || cmd == F_GETLK64) {
+            if (!n->lock_owner || n->lock_owner == f) fl->l_type = F_UNLCK;
+            else { fl->l_type = F_WRLCK; fl->l_pid = (int32_t)n->lock_pid; }
+            return 0;
+        }
+        if (fl->l_type == F_UNLCK) { if (n->lock_owner == f) n->lock_owner = NULL; return 0; }
+        if (fl->l_type != F_RDLCK && fl->l_type != F_WRLCK) return -EINVAL;
+        for (;;) {
+            if (!n->lock_owner || n->lock_owner == f) { n->lock_owner = f; n->lock_pid = task_current()->id; return 0; }
+            if (!wait) return -EAGAIN;
+            if (task_signal_pending(task_current())) return -EINTR;
+            task_sleep_ms(10);
+        }
+    }
     }
     return -EINVAL;
 }
@@ -477,19 +539,13 @@ static long sys_ppoll(uint64_t ufds, long n, uint64_t uts)
     return sys_poll(ufds, n, timeout);
 }
 
-/* pselect6 on top of poll: fd_sets in, fd_sets out. */
-static long sys_pselect6(long n, uint64_t urd, uint64_t uwr, uint64_t uex, uint64_t uts)
+/* select on top of poll: fd_sets in, fd_sets out; timeout in ms, -1 = forever. */
+static long do_select(long n, uint64_t urd, uint64_t uwr, uint64_t uex, long timeout)
 {
     if (n < 0 || n > POLL_MAX) return -EINVAL;
     size_t bytes = ((size_t)n + 7) / 8;
     if ((urd && !user_ok(urd, bytes)) || (uwr && !user_ok(uwr, bytes)) || (uex && !user_ok(uex, bytes)))
         return -EFAULT;
-    long timeout = -1;
-    if (uts) {
-        if (!user_ok(uts, sizeof(struct abi_timespec))) return -EFAULT;
-        const struct abi_timespec *ts = (const void *)uts;
-        timeout = ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
-    }
     uint8_t *rd = (uint8_t *)urd, *wr = (uint8_t *)uwr, *ex = (uint8_t *)uex;
     struct abi_pollfd fds[POLL_MAX];
     int cnt = 0;
@@ -517,6 +573,30 @@ static long sys_pselect6(long n, uint64_t urd, uint64_t uwr, uint64_t uex, uint6
         if (ex && (fds[i].events & POLLPRI) && (fds[i].revents & POLLPRI)) { ex[fd / 8] |= 1 << (fd % 8); total++; }
     }
     return total;
+}
+
+static long sys_pselect6(long n, uint64_t urd, uint64_t uwr, uint64_t uex, uint64_t uts)
+{
+    long timeout = -1;
+    if (uts) {
+        if (!user_ok(uts, sizeof(struct abi_timespec))) return -EFAULT;
+        const struct abi_timespec *ts = (const void *)uts;
+        timeout = ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
+    }
+    return do_select(n, urd, uwr, uex, timeout);
+}
+
+/* The timeval flavour (musl's select() on x86_64); the remaining time is
+ * not written back, musl does not look. */
+static long sys_select(long n, uint64_t urd, uint64_t uwr, uint64_t uex, uint64_t utv)
+{
+    long timeout = -1;
+    if (utv) {
+        if (!user_ok(utv, sizeof(struct abi_ktimeval))) return -EFAULT;
+        const struct abi_ktimeval *tv = (const void *)utv;
+        timeout = tv->tv_sec * 1000 + tv->tv_usec / 1000;
+    }
+    return do_select(n, urd, uwr, uex, timeout);
 }
 
 #ifdef CONFIG_PIPES
@@ -589,7 +669,7 @@ static long sys_mmap(uint64_t addr, uint64_t len, long prot, long flags, long fd
     size_t pages = PAGE_ALIGN_UP(len) / PAGE_SIZE;
     spin_lock(&mm->lock);
     uint64_t virt = mm->mmap_next;
-    if (virt + pages * PAGE_SIZE > USER_STACK_TOP - USER_STACK_SIZE - PAGE_SIZE) {
+    if (virt + pages * PAGE_SIZE > USER_STACK_TOP - USER_STACK_MAX - PAGE_SIZE) {
         spin_unlock(&mm->lock);
         return -ENOMEM;
     }
@@ -936,12 +1016,16 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_mkdir:         ret = path_op(AT_FDCWD, a1, 0); break;
     case SYS_mkdirat:       ret = path_op((long)a1, a2, 0); break;
     case SYS_unlink:        ret = path_op(AT_FDCWD, a1, 1); break;
+    case SYS_rename:        ret = sys_renameat(AT_FDCWD, a1, AT_FDCWD, a2); break;
+    case SYS_renameat:      ret = sys_renameat((long)a1, a2, (long)a3, a4); break;
     case SYS_unlinkat:      ret = path_op((long)a1, a2, (a3 & 0x200) ? 2 : 1); break;   /* AT_REMOVEDIR */
     case SYS_rmdir:         ret = path_op(AT_FDCWD, a1, 2); break;
     case SYS_access:        ret = path_op(AT_FDCWD, a1, 3); break;
     case SYS_faccessat:     ret = path_op((long)a1, a2, 3); break;
     case SYS_chdir:         ret = path_op(AT_FDCWD, a1, 4); break;
     case SYS_getcwd:        ret = sys_getcwd(a1, a2); break;
+    case SYS_readlink:      ret = sys_readlinkat(AT_FDCWD, a1, a2, a3); break;
+    case SYS_readlinkat:    ret = sys_readlinkat((long)a1, a2, a3, a4); break;
     case SYS_dup:           ret = sys_dup((long)a1); break;
     case SYS_dup2:          ret = sys_dup3((long)a1, (long)a2, 0); break;
     case SYS_dup3:          ret = sys_dup3((long)a1, (long)a2, (long)a3); break;
@@ -959,6 +1043,7 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_poll:          ret = sys_poll(a1, (long)a2, (long)(int)a3); break;
     case SYS_ppoll:         ret = sys_ppoll(a1, (long)a2, a3); break;
     case SYS_pselect6:      ret = sys_pselect6((long)a1, a2, a3, a4, a5); break;
+    case SYS_select:        ret = sys_select((long)a1, a2, a3, a4, a5); break;
 
 #ifdef CONFIG_NET
     case SYS_socket:      ret = sys_socket((long)a1, (long)a2, (long)a3); break;
@@ -1037,6 +1122,11 @@ int syscall_dispatch(struct syscall_frame *f)
         if (SYSCALL_NR(f) > SYS_sic_max)
             kprintf("[%s: bad syscall %lu]\n", task_current()->name, (unsigned long)SYSCALL_NR(f));
         ret = -ENOSYS;
+    }
+    {   /* the last few calls, for the post-mortem a fatal fault prints */
+        struct task *t = task_current();
+        unsigned i = t->trace_i++ % TASK_TRACE;
+        t->trace[i].nr = (uint16_t)SYSCALL_NR(f); t->trace[i].a1 = a1; t->trace[i].ret = ret;
     }
     SYSCALL_SET_RET(f, ret);
     signal_deliver_syscall(f);              /* may redirect the return into a handler */

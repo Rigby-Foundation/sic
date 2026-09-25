@@ -57,10 +57,13 @@ struct elf_phdr {
 #define ET_EXEC   2
 #define EM_X86_64 62
 #define EM_PPC    20
+#define EM_AARCH64 183
 #if defined(__x86_64__)
 #define EM_NATIVE EM_X86_64
 #elif defined(__powerpc__)
 #define EM_NATIVE EM_PPC
+#elif defined(__aarch64__)
+#define EM_NATIVE EM_AARCH64
 #endif
 typedef uintptr_t elf_word_t;           /* the size of a pointer on the initial stack */
 
@@ -138,6 +141,7 @@ static int copy_to_space(uint64_t pgd, uint64_t virt, const void *src, size_t le
 struct image {
     uint64_t pgd, entry, brk;
     uint64_t phdr_addr, phnum, phent;     /* for auxv */
+    char exe[256];                        /* where the file is, absolute */
 };
 
 static int elf_load(struct image *im, const void *data, size_t size)
@@ -156,6 +160,7 @@ static int elf_load(struct image *im, const void *data, size_t size)
 
     const struct elf_phdr *ph = (const void *)((const uint8_t *)data + eh->phoff);
     uint64_t top = 0;
+    int code = 0;
     for (uint16_t i = 0; i < eh->phnum; i++) {
         if (ph[i].type != PT_LOAD || ph[i].memsz == 0)
             continue;
@@ -174,9 +179,19 @@ static int elf_load(struct image *im, const void *data, size_t size)
             return -ENOMEM;
         if (copy_to_space(im->pgd, ph[i].vaddr, (const uint8_t *)data + ph[i].offset, ph[i].filesz) != 0)
             return -ENOMEM;
+        if (ph[i].flags & PF_X) {
+            /* the frames may have held another program's code: make the
+             * new code what instruction fetches see */
+            for (uint64_t va = start; va < end; va += PAGE_SIZE) {
+                uint64_t pa = vmm_translate_in(im->pgd, va);
+                if (pa) arch_dcache_clean(P2V(pa & ~(uint64_t)(PAGE_SIZE - 1)), PAGE_SIZE);
+            }
+            code = 1;
+        }
         if (end > top)
             top = end;
     }
+    if (code) arch_icache_invalidate_all();
 
     /* AT_PHDR must be where the program headers really are in memory: the
      * libc derives the load base from it (AT_PHDR - PT_PHDR.p_vaddr) and
@@ -239,6 +254,15 @@ static uint32_t rng(void)
     rng_state ^= rng_state >> 17;
     rng_state ^= rng_state << 5;
     return rng_state ^ (uint32_t)timer_ticks();
+}
+
+/* A fault below the mapped stack but inside its limit: map the page. */
+int process_grow_stack(struct task *t, uint64_t addr)
+{
+    if (!t || !t->mm || addr >= USER_STACK_TOP || addr < USER_STACK_TOP - USER_STACK_MAX) return -1;
+    uint64_t page = addr & ~(uint64_t)0xFFF;
+    if (vmm_translate_in(t->mm->pgd, page)) return -1;         /* mapped: a real fault */
+    return map_zeroed(t->mm->pgd, page, 1, PTE_WRITE | PTE_NX);
 }
 
 /* Build the initial stack; returns the user rsp (pointing at argc). */
@@ -309,6 +333,7 @@ static int build_image(const char *path, const struct argpack *ap, struct image 
         return -ENOMEM;
 
     memset(im, 0, sizeof(*im));
+    if (vfs_path_of(n, im->exe, sizeof(im->exe)) != 0) { size_t k = strlen(path); if (k > sizeof(im->exe) - 1) k = sizeof(im->exe) - 1; memcpy(im->exe, path, k); }
     im->pgd = vmm_create_address_space();
     int rc = elf_load(im, data, size);
     kfree(data);
@@ -342,6 +367,7 @@ static struct mm *apply_image(struct task *t, const struct image *im)
         return NULL;
     mm->brk_start = mm->brk_end = im->brk;
     mm->mmap_next = MMAP_BASE;
+    memcpy(mm->exe, im->exe, sizeof(mm->exe));
     struct mm *old = t->mm;
     t->mm = mm;
     t->pgd = mm->pgd;
@@ -455,6 +481,7 @@ long process_exec(const char *path, const char *const argv[], const char *const 
 
 /* ---- fork --------------------------------------------------------------------------- */
 
+
 long process_fork(struct syscall_frame *f)
 {
     struct task *parent = task_current();
@@ -475,6 +502,7 @@ long process_fork(struct syscall_frame *f)
     mm->brk_start = parent->mm->brk_start;
     mm->brk_end = parent->mm->brk_end;
     mm->mmap_next = parent->mm->mmap_next;
+    memcpy(mm->exe, parent->mm->exe, sizeof(mm->exe));
     spin_unlock(&parent->mm->lock);
 
     arch_task_fork(child, parent, f, 0, 0);

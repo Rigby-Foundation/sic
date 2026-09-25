@@ -17,7 +17,8 @@
 #define USER_BASE   0x0000008000000000UL
 #define USER_END    0x0000800000000000UL
 #define USER_STACK_TOP  0x00007FFFFFFFF000UL
-#define USER_STACK_SIZE (64UL * 1024)
+#define USER_STACK_SIZE (64UL * 1024)          /* mapped at exec; grows on demand up to USER_STACK_MAX */
+#define USER_STACK_MAX  (8UL * 1024 * 1024)
 #define USER_MMAP_BASE  0x0000010000000000UL    /* 1 TiB: where mmap() hands out ranges */
 #define VMM_TEST_VIRT   0xFFFFD00000000000UL    /* self test: a free page-mappable kernel address */
 

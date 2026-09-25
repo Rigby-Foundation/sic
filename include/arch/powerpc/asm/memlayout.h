@@ -19,7 +19,8 @@
 #define USER_BASE   0x00001000UL
 #define USER_END    0x80000000UL
 #define USER_STACK_TOP  0x7FFFF000UL
-#define USER_STACK_SIZE (64UL * 1024)
+#define USER_STACK_SIZE (64UL * 1024)          /* mapped at exec; grows on demand up to USER_STACK_MAX */
+#define USER_STACK_MAX  (8UL * 1024 * 1024)
 #define USER_MMAP_BASE  0x40000000UL
 #define PCI_MEM_IDENTITY_BASE 0x80000000UL   /* .. +1 GiB, supervisor only */
 #define VMM_TEST_VIRT   0xFFF00000UL            /* self test: a free page-mappable kernel address */

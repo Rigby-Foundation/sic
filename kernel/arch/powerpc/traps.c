@@ -11,6 +11,7 @@
 #include "proc/sched.h"
 #include "proc/syscall.h"
 #include "proc/signal.h"
+#include "proc/elf.h"
 #include "printf.h"
 #include "string.h"
 
@@ -103,6 +104,8 @@ void ppc_trap(struct pt_regs *r)
         int write = r->trap == 0x300 && (r->dsisr & 0x02000000);
         if (ppc_mmu_fault(addr, write, user) == 0)
             break;                                      /* hash table refilled from the page tables */
+        if (user && process_grow_stack(task_current(), addr) == 0 && ppc_mmu_fault(addr, write, user) == 0)
+            break;                                      /* the stack grew under it */
         if (user) {
 #ifdef CONFIG_SIGNALS
             if (signal_fault(f, SIGSEGV, addr))
@@ -110,6 +113,7 @@ void ppc_trap(struct pt_regs *r)
 #endif
             kprintf("[%s (pid %u) killed: %s at nip=%x, addr=%x, dsisr=%x]\n",
                     task_current()->name, task_current()->id, trap_name(r->trap), r->nip, addr, r->dsisr);
+            task_print_trace(task_current());
             task_current()->killed_sig = SIGSEGV;
             task_exit_code(128 + SIGSEGV);
         }
@@ -137,6 +141,7 @@ void ppc_trap(struct pt_regs *r)
                 break;
 #endif
             kprintf("[%s (pid %u) killed: %s at nip=%x]\n", task_current()->name, task_current()->id, trap_name(r->trap), r->nip);
+            task_print_trace(task_current());
             task_current()->killed_sig = sig;
             task_exit_code(128 + sig);
         }

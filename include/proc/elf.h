@@ -24,6 +24,7 @@ long process_clone(struct syscall_frame *f, uint64_t flags, uint64_t stack, uint
 
 /* Anonymous memory for user processes (mmap/brk). Pages are zeroed.
  * `prot` uses the PROT_* bits from abi.h. */
+int  process_grow_stack(struct task *t, uint64_t addr);   /* demand-grow the user stack; 0 if the fault is fixed */
 int  process_map_anon(struct task *t, uint64_t virt, size_t pages, int prot);
 int  process_protect(struct task *t, uint64_t virt, size_t pages, int prot);
 void process_unmap(struct task *t, uint64_t virt, size_t pages);
