@@ -7,6 +7,7 @@
 #include "asm/of.h"
 #include "asm/ptrace.h"
 #include "proc/sched.h"
+#include "core/prof.h"
 #include "printf.h"
 
 static uint32_t dec_reload;
@@ -31,6 +32,7 @@ void ppc_decrementer(struct interrupt_frame *f)
     (void)f;
     mtdec(dec_reload);
     ticks++;
+    prof_tick(f);
     sched_tick();
     sched_preempt();
 }

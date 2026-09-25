@@ -281,10 +281,19 @@ void vmm_destroy_address_space(uint64_t pml4)
     for (int i = 1; i < 256; i++)                   /* only the private user part */
         if (t[i] & PTE_PRESENT)
             free_table_recursive(t[i] & PTE_ADDR_MASK, 3);
+    /* Still loaded here (a process freeing itself on the way out)? Leave it:
+     * the root page may come straight back for the next process, and a
+     * switch that sees the same CR3 value would not flush the dead one's TLB. */
+    if (read_cr3() == pml4)
+        write_cr3(kernel_pml4);
     pmm_free_page(pml4);
 }
 
 /* Copy every user page of `src` into a fresh address space (no COW yet). */
+/* x86 keeps instruction fetches coherent with stores. */
+void arch_dcache_clean(const void *kva, size_t len) { (void)kva; (void)len; }
+void arch_icache_invalidate_all(void) {}
+
 uint64_t vmm_clone_address_space(uint64_t src)
 {
     uint64_t dst = vmm_create_address_space();

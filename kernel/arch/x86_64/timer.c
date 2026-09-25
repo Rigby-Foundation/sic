@@ -5,6 +5,7 @@
 #include "asm/apic.h"
 #include "asm/pit.h"
 #include "proc/sched.h"
+#include "core/prof.h"
 #include "printf.h"
 #include "asm/cpu.h"
 
@@ -15,6 +16,7 @@ static void timer_irq(struct interrupt_frame *f)
     (void)f;
     if (this_cpu()->index == 0)
         ticks++;
+    prof_tick(f);
     sched_tick();
 }
 
