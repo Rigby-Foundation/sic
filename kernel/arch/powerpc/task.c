@@ -50,15 +50,13 @@ void arch_task_init_user(struct task *t)
 /* The child of fork/clone resumes from a copy of the parent's frame with r3 = 0. */
 static void fork_thunk(void *arg)
 {
-    (void)arg;
-    struct pt_regs *r = (struct pt_regs *)(uintptr_t)(task_current()->kstack_top - sizeof(struct pt_regs) - 16);
-    enter_frame(r);
+    enter_frame(arg);                   /* the frame, not task_current(): see aarch64/task.c */
 }
 
 void arch_task_fork(struct task *child, struct task *parent, const struct syscall_frame *f, uint64_t stack, uint64_t tls)
 {
-    arch_task_setup(child, fork_thunk, NULL, sizeof(struct pt_regs) + 16);
     struct pt_regs *cf = (struct pt_regs *)(uintptr_t)(child->kstack_top - sizeof(struct pt_regs) - 16);
+    arch_task_setup(child, fork_thunk, cf, sizeof(struct pt_regs) + 16);
     *cf = f->r;
     cf->gpr[3] = 0;
     cf->ccr &= ~0x10000000u;                 /* success: SO clear */

@@ -37,14 +37,13 @@ void arch_task_init_user(struct task *t)
 /* The child resumes right after the syscall instruction with rax = 0. */
 static void fork_thunk(void *arg)
 {
-    (void)arg;
-    fork_return((struct syscall_frame *)(task_current()->kstack_top - sizeof(struct syscall_frame)));
+    fork_return(arg);                   /* the frame, not task_current(): see aarch64/task.c */
 }
 
 void arch_task_fork(struct task *child, struct task *parent, const struct syscall_frame *f, uint64_t stack, uint64_t tls)
 {
-    arch_task_setup(child, fork_thunk, NULL, sizeof(struct syscall_frame));
     struct syscall_frame *cf = (struct syscall_frame *)(child->kstack_top - sizeof(*cf));
+    arch_task_setup(child, fork_thunk, cf, sizeof(struct syscall_frame));
     *cf = *f;
     cf->rax = 0;
     if (stack)
