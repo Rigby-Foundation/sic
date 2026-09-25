@@ -126,6 +126,7 @@ struct tcp_pcb {
     uint32_t rcv_head, rcv_len;
     int      fin_queued, fin_sent, fin_rcvd;
     uint64_t rto_at, rto_ms;        /* retransmit timer, 0 = off */
+    uint64_t retry_at;              /* a send failed (ring full, no route yet): try again then, 0 = off */
     int      retries;
     uint64_t timewait_at;
     int      dup_acks;
@@ -139,6 +140,7 @@ struct tcp_pcb {
     uint32_t recover;               /* fast retransmit: only holes below this are resent */
     /* delayed ACK (RFC 1122): one ACK per two full segments or 40 ms */
     int      ack_pending, ack_segs;
+    uint32_t rcv_wnd_adv;           /* the window the last segment we sent advertised */
     uint64_t delack_at;
 };
 
@@ -148,7 +150,9 @@ struct tcp_ooo {
     uint8_t *data;
 };
 
+struct unix_pcb;
 struct socket {
+    int domain;                     /* AF_INET or AF_UNIX */
     int type, proto;                /* SOCK_STREAM/DGRAM/RAW, IPPROTO_* */
     uint32_t local_ip, remote_ip;
     uint16_t local_port, remote_port;
@@ -161,6 +165,7 @@ struct socket {
     struct waitqueue wq;            /* everything about this socket */
     int  refs, listed;              /* listed: on its protocol's socket list */
     struct tcp_pcb *tcp;
+    struct unix_pcb *un;            /* AF_UNIX (unix.c) */
     struct socket *accept_head, *accept_tail, *accept_next;  /* listener: connections ready */
     int  backlog, accept_count;
     struct socket *listener;        /* for connections still in the backlog */
@@ -187,6 +192,20 @@ uint16_t udp_ephemeral_port(void);
 int   udp_send(struct socket *s, uint32_t dst_ip, uint16_t dst_port, struct pkt *p);   /* takes p */
 void  tcp_destroy(struct socket *s);
 extern struct socket *udp_sockets, *tcp_sockets, *raw_sockets;
+struct file *sock_file(struct socket *s, int flags);   /* a file over a socket (SOCK_NONBLOCK honoured) */
+
+/* AF_UNIX stream sockets (unix.c); the ones marked so run with net_lock held */
+long  unix_socket(int type, int flags);                 /* an fd or -errno */
+int   unix_bind(struct socket *s, const char *path);
+int   unix_listen(struct socket *s, int backlog);
+int   unix_connect(struct socket *s, const char *path);
+long  unix_accept(struct socket *l, struct file *f, int flags);
+long  unix_send(struct file *f, const void *buf, size_t len, int flags);
+long  unix_recv(struct file *f, void *buf, size_t len, int flags);
+int   unix_poll(struct socket *s);                      /* locked */
+void  unix_shutdown(struct socket *s, int how);         /* locked */
+void  unix_close(struct socket *s);                     /* locked: disconnect, unbind, free the pcb */
+const char *unix_name(struct socket *s);
 
 /* ---- ioctl / init ------------------------------------------------------------- */
 long net_ioctl(long req, void *arg);

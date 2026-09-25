@@ -182,6 +182,7 @@ static int tcp_send_seg(struct socket *s, uint32_t seq, uint8_t flags, const voi
     struct tcp_pcb *t = s->tcp;
     uint32_t wnd = rcv_space(t);
     if (wnd > 65535) wnd = 65535;
+    t->rcv_wnd_adv = wnd;
     uint8_t opts[40];
     uint32_t optlen = 0;
     if (flags & TH_SYN)
@@ -329,8 +330,12 @@ static void tcp_output(struct socket *s)
             break;
         uint8_t flags = TH_ACK;
         if (inflight + n == t->snd_len) flags |= TH_PSH;
-        if (tcp_send_seg(s, t->snd_nxt, flags, t->sndbuf + inflight, n, 0) < 0)
+        if (tcp_send_seg(s, t->snd_nxt, flags, t->sndbuf + inflight, n, 0) < 0) {
+            /* not out (the NIC's ring is full, the route is being set up):
+             * with nothing in flight no ACK would ever bring us back here */
+            if (!t->retry_at) t->retry_at = timer_ms() + 10;
             break;
+        }
         t->snd_nxt += n;
         arm_rto(t);
     }
@@ -772,6 +777,10 @@ void tcp_timer(uint64_t now)
         }
         if (t->ack_pending && t->delack_at && now >= t->delack_at)
             tcp_send_ack(s);
+        if (t->retry_at && now >= t->retry_at) {
+            t->retry_at = 0;
+            tcp_output(s);
+        }
         if (t->rto_at && now >= t->rto_at) {
             if (++t->retries > MAX_RETRIES) {
                 tcp_abort(s, t->state == TCP_SYN_SENT ? ETIMEDOUT : ETIMEDOUT);
@@ -859,11 +868,17 @@ int tcp_recv(struct socket *s, void *buf, size_t len, int peek)
     memcpy(buf, t->rcvbuf + t->rcv_head, first);
     memcpy((uint8_t *)buf + first, t->rcvbuf, n - first);
     if (!peek) {
-        int was_full = rcv_space(t) < t->mss;
         t->rcv_head = (t->rcv_head + n) % TCP_BUF_SIZE;
         t->rcv_len -= n;
-        if (was_full && t->state != TCP_CLOSED)
-            tcp_send_ack(s);        /* window update */
+        /* Window update (receiver-side SWS avoidance): the sender only knows
+         * the window from our last segment. Once we've opened it by a full
+         * segment or half the buffer, tell it now rather than when the next
+         * (possibly delayed) ACK happens to go out. A sender stalled on a
+         * small window otherwise waits out the delayed-ACK timer each time. */
+        uint32_t space = rcv_space(t);
+        if (t->state != TCP_CLOSED && space > t->rcv_wnd_adv &&
+            (space - t->rcv_wnd_adv >= t->mss || space - t->rcv_wnd_adv >= TCP_BUF_SIZE / 2))
+            tcp_send_ack(s);
     }
     return (int)n;
 }
