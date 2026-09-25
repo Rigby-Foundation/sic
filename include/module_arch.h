@@ -8,7 +8,7 @@
 
 /* Bytes of scratch per relocation entry for out-of-range branches (PowerPC
  * puts a `lis/ori/mtctr/bctr` stub there; x86_64 needs none). */
-#ifdef __powerpc__
+#if defined(__powerpc__) || defined(__aarch64__)
 #define MODULE_STUB_SIZE 16
 #else
 #define MODULE_STUB_SIZE 0

@@ -25,6 +25,7 @@ static inline void arch_pci_write32(uint8_t bus, uint8_t slot, uint8_t func, uin
 static inline void arch_pci_init(void) { }
 
 /* The interrupt line register, as the firmware routed it through the PIC. */
+static inline int arch_pci_windows(uint64_t *mb, uint64_t *ms, uint64_t *ib, uint64_t *is) { (void)mb; (void)ms; (void)ib; (void)is; return 0; }   /* the firmware assigned the BARs */
 static inline int arch_pci_irq(uint8_t bus, uint8_t slot, uint8_t func)
 {
     uint8_t line = arch_pci_read32(bus, slot, func, 0x3C) & 0xFF;

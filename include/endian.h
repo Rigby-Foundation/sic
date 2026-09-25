@@ -63,6 +63,10 @@ static inline void put_le64(void *p, uint64_t v) { uint8_t *b = p; for (int i = 
 #define dma_wmb()   __asm__ volatile("sync" ::: "memory")
 #define dma_rmb()   __asm__ volatile("lwsync" ::: "memory")
 #define mmio_fence() __asm__ volatile("eieio" ::: "memory")
+#elif defined(__aarch64__)
+#define dma_wmb()   __asm__ volatile("dsb sy" ::: "memory")
+#define dma_rmb()   __asm__ volatile("dsb sy" ::: "memory")
+#define mmio_fence() __asm__ volatile("dmb sy" ::: "memory")
 #else
 #define dma_wmb()   __asm__ volatile("" ::: "memory")
 #define dma_rmb()   __asm__ volatile("" ::: "memory")

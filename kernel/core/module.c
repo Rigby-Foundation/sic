@@ -79,10 +79,13 @@ struct elf_rela {
 #define ET_REL       1
 #define EM_X86_64    62
 #define EM_PPC       20
+#define EM_AARCH64   183
 #if defined(__x86_64__)
 #define EM_NATIVE EM_X86_64
 #elif defined(__powerpc__)
 #define EM_NATIVE EM_PPC
+#elif defined(__aarch64__)
+#define EM_NATIVE EM_AARCH64
 #endif
 #define SHT_PROGBITS 1
 #define SHT_SYMTAB   2
