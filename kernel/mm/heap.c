@@ -27,7 +27,7 @@
 #define SLAB_MAGIC      0x534C4142u     /* "SLAB" */
 #define LARGE_MAGIC     0x4C52474Cu     /* "LRGL" */
 #define OWNER_LARGE     1UL             /* low bit tag; slab pointers are page aligned */
-#define MAX_FREE_RUNS   256
+#define MAX_FREE_RUNS   1024
 #define MAX_SMALL       2048
 
 /* ---- page layer ------------------------------------------------------------ */
@@ -68,24 +68,29 @@ static int64_t take_virtual_pages(size_t count)
 
 static void give_virtual_pages(uint64_t page, size_t count)
 {
+    /* Join the runs on both sides, so churn does not leave the range in
+     * ever smaller pieces that no big allocation fits. */
+    for (size_t i = 0; i < free_run_count; ) {
+        if (free_runs[i].page + free_runs[i].count == page) {
+            page = free_runs[i].page;
+            count += free_runs[i].count;
+        } else if (page + count == free_runs[i].page) {
+            count += free_runs[i].count;
+        } else {
+            i++;
+            continue;
+        }
+        free_runs[i] = free_runs[--free_run_count];
+        i = 0;                              /* the joined run may meet another */
+    }
     if (page + count == bump_page) {        /* shrink the bump pointer */
         bump_page = page;
         return;
     }
-    for (size_t i = 0; i < free_run_count; i++) {
-        if (free_runs[i].page + free_runs[i].count == page) {
-            free_runs[i].count += count;
-            return;
-        }
-        if (page + count == free_runs[i].page) {
-            free_runs[i].page = page;
-            free_runs[i].count += count;
-            return;
-        }
-    }
     if (free_run_count < MAX_FREE_RUNS)
         free_runs[free_run_count++] = (struct free_run){ page, count };
-    /* else: leak the virtual range (physical pages were already returned) */
+    else
+        kprintf("heap: free-run table full, %llu pages of address space lost\n", (unsigned long long)count);
 }
 
 static void *alloc_pages_locked(size_t count);

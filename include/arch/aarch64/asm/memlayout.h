@@ -17,15 +17,15 @@
 #define HHDM_BASE   0xffff000000000000UL
 #define HHDM_SIZE   0x100000000UL
 #define HEAP_BASE   0xffff000100000000UL
-#define HEAP_SIZE   (256UL * 1024 * 1024)
-#define MMIO_BASE   0xffff000110000000UL
+#define HEAP_SIZE   (1024UL * 1024 * 1024)      /* virtual room; the root filesystem alone takes ~170 MB with the desktop */
+#define MMIO_BASE   0xffff000180000000UL
 #define USER_BASE   0x0000000000001000UL
 #define USER_END    0x0000800000000000UL
 #define USER_STACK_TOP  0x00007ffffffff000UL
 #define USER_STACK_SIZE (64UL * 1024)          /* mapped at exec; grows on demand up to USER_STACK_MAX */
 #define USER_STACK_MAX  (8UL * 1024 * 1024)
 #define USER_MMAP_BASE  0x0000100000000000UL
-#define VMM_TEST_VIRT   0xffff000120000000UL   /* self test: a free page-mappable kernel address */
+#define VMM_TEST_VIRT   0xffff0001c0000000UL   /* self test: a free page-mappable kernel address */
 
 #define P2V(p) ((void *)((uintptr_t)(p) + HHDM_BASE))
 #define V2P(v) ((uint64_t)((uintptr_t)(v) - HHDM_BASE))

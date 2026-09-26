@@ -12,7 +12,7 @@
 
 #define HHDM_BASE   0xFFFF800000000000UL
 #define HEAP_BASE   0xFFFFC00000000000UL
-#define HEAP_SIZE   (256UL * 1024 * 1024)
+#define HEAP_SIZE   (1024UL * 1024 * 1024)      /* virtual room; the root filesystem alone takes ~170 MB with the desktop */
 #define MMIO_BASE   0xFFFFE00000000000UL
 #define USER_BASE   0x0000008000000000UL
 #define USER_END    0x0000800000000000UL
