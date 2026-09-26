@@ -158,12 +158,26 @@ void sched_unlock_new_task(void)
 
 /* ---- tasks ------------------------------------------------------------------------ */
 
+/* The idle task is switched out only while it waits for an interrupt.
+ * Anywhere else in its loop it may hold a lock (reaping frees memory under
+ * the heap's), and it never sits in the run queue: it only comes back when
+ * its CPU has nothing else to run, which is never while that CPU spins on
+ * the lock the idle task holds. */
+static volatile int idle_waiting[MAX_CPUS];
+
 static void idle_main(void *arg)
 {
     (void)arg;
+    uint32_t me = this_cpu()->index;        /* an idle task never leaves its CPU */
     for (;;) {
         reap_zombies();
+        if (rq_head) {                      /* work came in meanwhile: no need to wait for a tick */
+            task_yield();
+            continue;
+        }
+        idle_waiting[me] = 1;
         arch_idle();
+        idle_waiting[me] = 0;
     }
 }
 
@@ -496,7 +510,8 @@ void sched_preempt(void)
     if (!started || !this_cpu()->current)
         return;
     spin_lock(&sched_lock);
-    if (rq_head && (CUR->slice_left == 0 || is_idle(CUR)))
+    struct task *t = CUR;
+    if (rq_head && (is_idle(t) ? idle_waiting[this_cpu()->index] : t->slice_left == 0))
         schedule();
     spin_unlock(&sched_lock);
 }
