@@ -947,6 +947,8 @@ int syscall_dispatch(struct syscall_frame *f)
     unsigned long a1 = SYSCALL_ARG1(f), a2 = SYSCALL_ARG2(f), a3 = SYSCALL_ARG3(f),
                   a4 = SYSCALL_ARG4(f), a5 = SYSCALL_ARG5(f), a6 = SYSCALL_ARG6(f);
     long ret;
+    task_current()->sys_nr = (int)SYSCALL_NR(f);
+    task_current()->sys_a1 = a1;
 
 #ifdef CONFIG_SIGNALS
     if (SYSCALL_NR(f) == SYS_rt_sigreturn) {    /* restores the whole frame, result register included */
@@ -1127,6 +1129,7 @@ int syscall_dispatch(struct syscall_frame *f)
         struct task *t = task_current();
         unsigned i = t->trace_i++ % TASK_TRACE;
         t->trace[i].nr = (uint16_t)SYSCALL_NR(f); t->trace[i].a1 = a1; t->trace[i].ret = ret;
+        t->sys_nr = -1;
     }
     SYSCALL_SET_RET(f, ret);
     signal_deliver_syscall(f);              /* may redirect the return into a handler */

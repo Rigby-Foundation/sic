@@ -40,6 +40,26 @@ static void fork_thunk(void *arg)
     fork_return(arg);                   /* the frame, not task_current(): see aarch64/task.c */
 }
 
+/* Its switch_context frame (r15..rbx, rbp, the return address), then the
+ * rbp chain, staying on its own stack. */
+int arch_task_backtrace(const struct task *t, uint64_t *pcs, int max)
+{
+    uint64_t lo = (uint64_t)(uintptr_t)t->stack, hi = t->kstack_top;
+    const uint64_t *sw = (const uint64_t *)(uintptr_t)t->arch.rsp;
+    if ((uint64_t)(uintptr_t)sw < lo || (uint64_t)(uintptr_t)sw + 56 > hi) return 0;
+    int n = 0;
+    pcs[n++] = sw[6];
+    uint64_t fp = sw[5];
+    while (n < max && fp >= lo && fp + 16 <= hi && !(fp & 7)) {
+        const uint64_t *fr = (const uint64_t *)(uintptr_t)fp;
+        if (!fr[1]) break;
+        pcs[n++] = fr[1];
+        if (fr[0] <= fp) break;
+        fp = fr[0];
+    }
+    return n;
+}
+
 void arch_task_fork(struct task *child, struct task *parent, const struct syscall_frame *f, uint64_t stack, uint64_t tls)
 {
     struct syscall_frame *cf = (struct syscall_frame *)(child->kstack_top - sizeof(*cf));

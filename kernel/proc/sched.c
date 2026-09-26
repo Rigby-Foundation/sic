@@ -5,6 +5,9 @@
 #include "proc/sched.h"
 #include "asm/cpu.h"
 #include "mm/heap.h"
+#ifdef CONFIG_NET
+#include "net/net.h"
+#endif
 #include "asm/timer.h"
 #include "mm/vmm.h"
 #include "string.h"
@@ -158,6 +161,10 @@ void sched_unlock_new_task(void)
 
 /* ---- tasks ------------------------------------------------------------------------ */
 
+/* Scroll Lock: what is everyone doing? The dump runs from the idle loop,
+ * which keeps running when every task is stuck waiting. */
+static volatile int dump_requested;
+
 /* The idle task is switched out only while it waits for an interrupt.
  * Anywhere else in its loop it may hold a lock (reaping frees memory under
  * the heap's), and it never sits in the run queue: it only comes back when
@@ -171,6 +178,13 @@ static void idle_main(void *arg)
     uint32_t me = this_cpu()->index;        /* an idle task never leaves its CPU */
     for (;;) {
         reap_zombies();
+        if (dump_requested && __atomic_exchange_n(&dump_requested, 0, __ATOMIC_SEQ_CST)) {
+            sched_dump();
+            heap_dump();
+#ifdef CONFIG_NET
+            tcp_dump();
+#endif
+        }
         if (rq_head) {                      /* work came in meanwhile: no need to wait for a tick */
             task_yield();
             continue;
@@ -198,6 +212,7 @@ struct task *task_alloc_reserve(const char *name, task_entry_t entry, void *arg,
         return NULL;
     }
     t->kstack_top = (uint64_t)(uintptr_t)t->stack + STACK_PAGES * 4096;
+    t->sys_nr = -1;
     t->pgd = vmm_kernel_pgd();
     if (signal_init_task(t) != 0) {
         kstack_free(t->stack, STACK_PAGES);
@@ -516,14 +531,32 @@ void sched_preempt(void)
     spin_unlock(&sched_lock);
 }
 
+/* Where a task that is not running sits in the kernel: return addresses
+ * from its saved context (arch_task_backtrace), with symbols. */
+static void dump_chain(struct task *t)
+{
+    uint64_t pcs[8];
+    int n = arch_task_backtrace(t, pcs, 8);
+    for (int i = 0; i < n; i++) {
+        uint64_t off;
+        const char *s = ksym_name(pcs[i], &off);
+        kprintf(" %s+%llx", s ? s : "?", off);
+    }
+}
+
 void sched_dump(void)
 {
     static const char *const names[] = { "ready", "running", "sleeping", "blocked", "zombie" };
     uint64_t f = spin_lock_irqsave(&sched_lock);
     kprintf("tasks:\n");
-    for (struct task *t = all_tasks; t; t = t->next)
-        kprintf("  %2u %-12s %-8s cpu %u  runtime %llu ms%s\n",
-                t->id, t->name, names[t->state], t->last_cpu,
+    for (struct task *t = all_tasks; t; t = t->next) {
+        kprintf("  %2u %-12s %-8s cpu %u  runtime %llu ms%s", t->id, t->name, names[t->state], t->last_cpu,
                 t->runtime * 1000 / TIMER_HZ, t->is_user ? "  [user]" : "");
+        if (t->is_user && t->sys_nr >= 0) kprintf("  in syscall %d(%lx)", t->sys_nr, t->sys_a1);
+        if (t->state == TASK_SLEEPING || t->state == TASK_BLOCKED || t->state == TASK_READY) { kprintf("  at"); dump_chain(t); }
+        kprintf("\n");
+    }
     spin_unlock_irqrestore(&sched_lock, f);
 }
+
+void sched_dump_request(void) { dump_requested = 1; }

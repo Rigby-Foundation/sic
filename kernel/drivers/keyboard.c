@@ -177,6 +177,7 @@ static int e0;
  * (whose Linux key codes are set 1 for the main block). */
 void keyboard_scancode(uint8_t raw)
 {
+    if (raw == 0x46) sched_dump_request();      /* Scroll Lock (make code, not after E0): the task dump */
     if (kbd_mode == K_RAW) {
         push_char((char)raw);
         return;

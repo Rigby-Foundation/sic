@@ -48,6 +48,26 @@ static void fork_thunk(void *arg)
     enter_frame(arg);
 }
 
+/* Its switch_context frame (x19..x28, x29, x30), then the frame record
+ * chain, staying on its own stack. */
+int arch_task_backtrace(const struct task *t, uint64_t *pcs, int max)
+{
+    uint64_t lo = (uint64_t)(uintptr_t)t->stack, hi = t->kstack_top;
+    const uint64_t *sw = (const uint64_t *)(uintptr_t)t->arch.sp;
+    if ((uint64_t)(uintptr_t)sw < lo || (uint64_t)(uintptr_t)sw + 96 > hi) return 0;
+    int n = 0;
+    pcs[n++] = sw[11];
+    uint64_t fp = sw[10];
+    while (n < max && fp >= lo && fp + 16 <= hi && !(fp & 15)) {
+        const uint64_t *fr = (const uint64_t *)(uintptr_t)fp;
+        if (!fr[1]) break;
+        pcs[n++] = fr[1];
+        if (fr[0] <= fp) break;
+        fp = fr[0];
+    }
+    return n;
+}
+
 void arch_task_fork(struct task *child, struct task *parent, const struct syscall_frame *f, uint64_t stack, uint64_t tls)
 {
     struct pt_regs *cf = (struct pt_regs *)(uintptr_t)(child->kstack_top - sizeof(struct pt_regs));

@@ -39,6 +39,8 @@ struct task {
 #define TASK_TRACE 16
     struct { uint16_t nr; unsigned long a1; long ret; } trace[TASK_TRACE];
     unsigned trace_i;
+    int      sys_nr;            /* the system call it is in now, -1 if none (sched_dump) */
+    unsigned long sys_a1;
     uint64_t sig_pending, sig_blocked;
     uint64_t sig_saved_mask;    /* mask to restore after a sigsuspend handler */
     int      sig_saved_mask_valid;
@@ -67,6 +69,8 @@ struct task *task_alloc_reserve(const char *name, task_entry_t entry, void *arg,
 void         task_start(struct task *t);
 struct task *task_current(void);
 int          sched_started(void);       /* tasks may sleep (past sched_init) */
+int          arch_task_backtrace(const struct task *t, uint64_t *pcs, int max);   /* a task that is switched out */
+void         sched_dump_request(void);  /* sched_dump with call chains, from the idle loop (any context) */
 
 void task_yield(void);
 void task_sleep_ms(uint64_t ms);

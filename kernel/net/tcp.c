@@ -803,6 +803,23 @@ void tcp_timer(uint64_t now)
     }
 }
 
+/* For the Scroll Lock dump: how many connections sit in each state. No
+ * lock: it only reads, and a torn count is fine for a diagnostic. */
+void tcp_dump(void)
+{
+    static const char *const names[] = { "closed", "listen", "syn-sent", "syn-rcvd", "established", "fin-wait-1",
+                                         "fin-wait-2", "close-wait", "closing", "last-ack", "time-wait" };
+    unsigned n[11] = { 0 }, total = 0, bare = 0;
+    for (struct socket *s = tcp_sockets; s; s = s->next) {
+        total++;
+        if (!s->tcp) bare++;
+        else if (s->tcp->state < 11) n[s->tcp->state]++;
+    }
+    kprintf("tcp: %u sockets (%u without state):", total, bare);
+    for (int i = 0; i < 11; i++) if (n[i]) kprintf(" %s %u", names[i], n[i]);
+    kprintf("\n");
+}
+
 /* ---- socket-layer entry points (net_lock held) -------------------------------- */
 int tcp_connect(struct socket *s)
 {

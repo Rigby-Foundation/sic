@@ -53,6 +53,8 @@ static void fork_thunk(void *arg)
     enter_frame(arg);                   /* the frame, not task_current(): see aarch64/task.c */
 }
 
+int arch_task_backtrace(const struct task *t, uint64_t *pcs, int max) { (void)t; (void)pcs; (void)max; return 0; }
+
 void arch_task_fork(struct task *child, struct task *parent, const struct syscall_frame *f, uint64_t stack, uint64_t tls)
 {
     struct pt_regs *cf = (struct pt_regs *)(uintptr_t)(child->kstack_top - sizeof(struct pt_regs) - 16);

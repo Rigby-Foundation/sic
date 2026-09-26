@@ -111,6 +111,7 @@ enum tcp_state { TCP_CLOSED, TCP_LISTEN, TCP_SYN_SENT, TCP_SYN_RCVD, TCP_ESTABLI
                  TCP_FIN_WAIT_1, TCP_FIN_WAIT_2, TCP_CLOSE_WAIT, TCP_CLOSING, TCP_LAST_ACK, TCP_TIME_WAIT };
 
 #define TCP_BUF_SIZE (32 * 1024)
+void tcp_dump(void);    /* connections per state, for the Scroll Lock dump */
 #define TCP_MSS      1460
 #define TCP_MAX_SACK 8
 
