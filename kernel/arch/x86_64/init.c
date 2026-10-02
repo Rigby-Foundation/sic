@@ -12,6 +12,7 @@
 #include "proc/syscall.h"
 #include "zaeboot.h"
 #include "string.h"
+#include "asm/io.h"
 
 #define MSR_EFER   0xC0000080
 #define MSR_STAR   0xC0000081
@@ -84,4 +85,17 @@ void arch_hypervisor_id(char out[13])
     memcpy(out, &ebx, 4);
     memcpy(out + 4, &ecx, 4);
     memcpy(out + 8, &edx, 4);
+}
+
+/* reboot(2): the keyboard controller's reset line, then a triple fault if
+ * that does nothing. No ACPI power-off yet: halt instead. */
+void arch_reboot(int power_off)
+{
+    if (!power_off) {
+        for (int i = 0; i < 100000 && (inb(0x64) & 2); i++) ;
+        outb(0x64, 0xfe);
+        static const struct { uint16_t limit; uint64_t base; } __attribute__((packed)) none = { 0, 0 };
+        __asm__ volatile("lidt %0; int3" : : "m"(none));
+    }
+    arch_halt_forever();
 }
