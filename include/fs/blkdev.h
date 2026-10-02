@@ -11,6 +11,7 @@ struct blkdev {
     uint64_t sectors;
     int  (*read)(struct blkdev *d, uint64_t lba, uint32_t count, void *buf);
     int  (*write)(struct blkdev *d, uint64_t lba, uint32_t count, const void *buf);
+    int  (*flush)(struct blkdev *d);    /* optional: the drive's write cache onto the medium */
     void *priv;
     struct blkdev *parent;          /* partitions: the whole disk */
     uint64_t start;                 /* partitions: first sector on the parent */
@@ -20,6 +21,7 @@ struct blkdev {
 void           blkdev_register(struct blkdev *d);     /* creates /dev/<name>, scans partitions */
 struct blkdev *blkdev_find(const char *name);
 void           blkdev_rescan(struct blkdev *disk);     /* pick up a new partition table */
+void           blkdev_flush_all(void);                 /* sync, unmount: every drive's cache onto the medium */
 struct blkdev *blkdev_from_vnode(struct vnode *n);    /* NULL if not a block device node */
 
 /* Byte-granular helpers used by the device node and filesystems. */

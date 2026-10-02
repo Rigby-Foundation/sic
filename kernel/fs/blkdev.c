@@ -9,7 +9,7 @@
 
 static struct blkdev *devices;
 
-/* Partial-sector transfers go through a bounce sector. */
+/* Whole sectors go to the driver in runs; partial ones through a bounce sector. */
 long blkdev_read_bytes(struct blkdev *d, uint64_t off, void *buf, size_t len)
 {
     uint64_t total = d->sectors * d->sector_size;
@@ -29,7 +29,10 @@ long blkdev_read_bytes(struct blkdev *d, uint64_t off, void *buf, size_t len)
         if (n > len - done)
             n = len - done;
         if (in == 0 && n == d->sector_size) {
-            if (d->read(d, lba, 1, out + done) != 0) break;
+            uint32_t k = (uint32_t)((len - done) / d->sector_size);   /* every whole sector from here, at once */
+            if (k > 2048) k = 2048;
+            if (d->read(d, lba, k, out + done) != 0) break;
+            n = (size_t)k * d->sector_size;
         } else {
             if (d->read(d, lba, 1, bounce) != 0) break;
             memcpy(out + done, bounce + in, n);
@@ -59,7 +62,10 @@ long blkdev_write_bytes(struct blkdev *d, uint64_t off, const void *buf, size_t 
         if (n > len - done)
             n = len - done;
         if (at == 0 && n == d->sector_size) {
-            if (d->write(d, lba, 1, in + done) != 0) break;
+            uint32_t k = (uint32_t)((len - done) / d->sector_size);
+            if (k > 2048) k = 2048;
+            if (d->write(d, lba, k, in + done) != 0) break;
+            n = (size_t)k * d->sector_size;
         } else {
             if (d->read(d, lba, 1, bounce) != 0) break;
             memcpy(bounce + at, in + done, n);
@@ -229,6 +235,13 @@ struct blkdev *blkdev_find(const char *name)
         if (strcmp(d->name, name) == 0)
             return d;
     return NULL;
+}
+
+void blkdev_flush_all(void)
+{
+    for (struct blkdev *d = devices; d; d = d->next)
+        if (!d->parent && d->flush)
+            d->flush(d);
 }
 
 struct blkdev *blkdev_from_vnode(struct vnode *n)

@@ -886,25 +886,58 @@ static long sys_query_module(uint64_t ubuf, uint64_t len)
 
 /* ---- time & misc ------------------------------------------------------------------ */
 
+/* reboot(2): restart or power off, the disks' caches emptied first. The
+ * machine-specific part is the architecture's; without one, halt. */
+__attribute__((weak)) void arch_reboot(int power_off) { (void)power_off; arch_halt_forever(); }
+__attribute__((weak)) void arch_reboot_mode(const char *mode) { (void)mode; arch_reboot(0); }
+__attribute__((weak)) int arch_reboot_reason(const char *mode) { (void)mode; return -1; }
+
+static long sys_reboot(uint64_t magic, uint64_t magic2, uint64_t cmd, uint64_t arg)
+{
+    (void)magic2;
+    if ((uint32_t)magic != 0xfee1dead) return -EINVAL;
+    if ((uint32_t)cmd == 0xa1b2c3d4) {                          /* RESTART2: with a mode ("bootloader") */
+        char mode[32] = "";
+        for (int i = 0; i < 31 && user_ok(arg + (uint64_t)i, 1); i++) { mode[i] = ((const char *)arg)[i]; if (!mode[i]) break; }
+        kprintf("\nrestarting (%s)\n", mode);
+        blkdev_flush_all();
+        arch_reboot_mode(mode);
+        return 0;
+    }
+    if ((uint32_t)cmd == 0x5ee1dead) {                          /* (sic) set the restart reason, do not restart */
+        char mode[32] = "";
+        for (int i = 0; i < 31 && user_ok(arg + (uint64_t)i, 1); i++) { mode[i] = ((const char *)arg)[i]; if (!mode[i]) break; }
+        return arch_reboot_reason(mode) == 0 ? 0 : -EIO;
+    }
+    if ((uint32_t)cmd != 0x01234567 && (uint32_t)cmd != 0x4321fedc && (uint32_t)cmd != 0xcdef0123) return -EINVAL;
+    kprintf("\n%s\n", (uint32_t)cmd == 0x01234567 ? "restarting" : "halting");
+    blkdev_flush_all();
+    arch_reboot((uint32_t)cmd != 0x01234567);
+    return 0;
+}
+
 static long sys_clock_gettime(long clk, uint64_t uts)
 {
     if (clk != CLOCK_REALTIME && clk != CLOCK_MONOTONIC) return -EINVAL;
     if (!user_ok(uts, sizeof(struct abi_timespec))) return -EFAULT;
     uint64_t ms = timer_ms();
+    if (clk == CLOCK_REALTIME) ms += timer_boot_epoch() * 1000;
     struct abi_timespec *ts = (void *)uts;
     ts->tv_sec = (int64_t)(ms / 1000);
     ts->tv_nsec = (int64_t)(ms % 1000) * 1000000;
     return 0;
 }
 
-static long sys_nanosleep(uint64_t ureq, long flags)
+static long sys_nanosleep(uint64_t ureq, long flags, long clk)
 {
     if (!user_ok(ureq, sizeof(struct abi_timespec))) return -EFAULT;
     const struct abi_timespec *ts = (const void *)ureq;
     if (ts->tv_sec < 0 || ts->tv_nsec < 0) return -EINVAL;
     uint64_t ms = (uint64_t)ts->tv_sec * 1000 + (uint64_t)ts->tv_nsec / 1000000;
-    if (flags & 1)                                  /* TIMER_ABSTIME */
+    if (flags & 1) {                                /* TIMER_ABSTIME */
+        if (clk == CLOCK_REALTIME) ms = ms > timer_boot_epoch() * 1000 ? ms - timer_boot_epoch() * 1000 : 0;
         ms = ms > timer_ms() ? ms - timer_ms() : 0;
+    }
     uint64_t until = timer_ticks() + ms * TIMER_HZ / 1000;
     do {
         task_sleep_ms(ms ? ms : 1);
@@ -992,8 +1025,8 @@ int syscall_dispatch(struct syscall_frame *f)
 #endif
 
     /* time & system */
-    case SYS_nanosleep:     ret = sys_nanosleep(a1, 0); break;
-    case SYS_clock_nanosleep: ret = sys_nanosleep(a3, (long)a2); break;
+    case SYS_nanosleep:     ret = sys_nanosleep(a1, 0, CLOCK_MONOTONIC); break;
+    case SYS_clock_nanosleep: ret = sys_nanosleep(a3, (long)a2, (long)a1); break;
     case SYS_clock_gettime: ret = sys_clock_gettime((long)a1, a2); break;
     case SYS_clock_getres:
         if (a2 && user_ok(a2, 16)) { ((struct abi_timespec *)a2)->tv_sec = 0; ((struct abi_timespec *)a2)->tv_nsec = 1000000; }
@@ -1034,8 +1067,11 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_fcntl:         ret = sys_fcntl((long)a1, (long)a2, (long)a3); break;
     case SYS_ioctl:         ret = sys_ioctl((long)a1, (long)a2, a3); break;
     case SYS_fsync: case SYS_fdatasync: case SYS_sync:
-        ret = fd_get((long)a1) || SYSCALL_NR(f) == SYS_sync ? 0 : -EBADF; break;
+        ret = fd_get((long)a1) || SYSCALL_NR(f) == SYS_sync ? 0 : -EBADF;
+        if (ret == 0) blkdev_flush_all();
+        break;
     case SYS_umask:         ret = 022; break;
+    case SYS_reboot:        ret = sys_reboot(a1, a2, a3, a4); break;
 #ifdef CONFIG_PIPES
     case SYS_pipe:          ret = sys_pipe2(a1, 0); break;
     case SYS_pipe2:         ret = sys_pipe2(a1, (long)a2); break;

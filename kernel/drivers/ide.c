@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
 /* IDE/ATA in PIO mode, LBA48 and LBA28. Slow but universal: the legacy
- * compatibility ports (0x1F0/0x170) of BIOS-era PCs and IDE-mode chipsets,
- * and the memory-mapped ATA cells in a PowerMac's mac-io (the same taskfile,
- * registers 16 bytes apart, control register at +0x160). */
+ * compatibility ports (0x1F0/0x170) of BIOS-era PCs, the native-mode ports
+ * of SATA controllers in IDE mode, and the memory-mapped ATA cells in a
+ * PowerMac's mac-io (the same taskfile, registers 16 bytes apart, control
+ * register at +0x160). */
 #include "drivers/ide.h"
 #include "endian.h"
 #include "drivers/pci.h"
@@ -139,15 +140,20 @@ static int ide_rw(struct blkdev *b, uint64_t lba, uint32_t count, void *buf, int
         for (uint32_t s = 0; s < n && rc == 0; s++) {
             if (wait_ready(&d->ch, 1) != 0) { rc = -1; break; }
             uint16_t *w = (uint16_t *)(p + s * 512);
+#ifdef __x86_64__
+            if (!d->ch.mmio) {                                /* little-endian: the sector as it is */
+                if (write) outsw(d->ch.base + REG_DATA, w, 256);
+                else       insw(d->ch.base + REG_DATA, w, 256);
+                continue;
+            }
+#endif
             if (write)
                 for (int i = 0; i < 256; i++) wr16(&d->ch, le16toh(w[i]));   /* sector bytes in order */
             else
                 for (int i = 0; i < 256; i++) w[i] = htole16(rd16(&d->ch));
         }
-        if (write && rc == 0) {
-            wr8(&d->ch, REG_CMD, 0xE7);                      /* FLUSH CACHE */
-            wait_ready(&d->ch, 0);
-        }
+        if (write && rc == 0 && wait_ready(&d->ch, 0) != 0)   /* the last sector onto the drive */
+            rc = -1;
         p += n * 512;
         lba += n;
         count -= n;
@@ -160,6 +166,19 @@ static int ide_rw(struct blkdev *b, uint64_t lba, uint32_t count, void *buf, int
 
 static int ide_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)        { return ide_rw(b, lba, count, buf, 0); }
 static int ide_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf) { return ide_rw(b, lba, count, (void *)buf, 1); }
+
+/* The drive's write cache stays on (flushing after every command made a
+ * big copy take hours); sync and unmount empty it. */
+static int ide_flush(struct blkdev *b)
+{
+    struct ide_dev *d = b->priv;
+    spin_lock(&d->lock);
+    select(d);
+    wr8(&d->ch, REG_CMD, d->lba48 ? 0xEA : 0xE7);          /* FLUSH CACHE (EXT) */
+    int rc = wait_ready(&d->ch, 0);
+    spin_unlock(&d->lock);
+    return rc;
+}
 
 static int next_disk;
 
@@ -199,6 +218,7 @@ static void probe(const struct ide_chan *c, int slave)
     d->bdev.sectors = sectors;
     d->bdev.read = ide_read;
     d->bdev.write = ide_write;
+    d->bdev.flush = ide_flush;
     d->bdev.priv = d;
     kprintf("ide: %s: %s (%s)\n", d->bdev.name, model, d->lba48 ? "lba48" : "lba28");
     blkdev_register(&d->bdev);
@@ -207,13 +227,30 @@ static void probe(const struct ide_chan *c, int slave)
 void ide_init(void)
 {
 #ifdef __x86_64__
-    /* Only worth probing when a PCI IDE controller exists (or on very old
-     * machines, but they also have one). Compatibility-mode ports assumed. */
-    if (!pci_find_class(0x01, 0x01, 0)) return;
-    static const struct ide_chan chans[2] = { { 0x1F0, 0x3F6, NULL }, { 0x170, 0x376, NULL } };
-    for (int i = 0; i < 2; i++) {
-        probe(&chans[i], 0);
-        probe(&chans[i], 1);
+    /* Every PCI IDE controller. A channel in native mode (prog_if bit 0 or
+     * 2: SATA controllers in IDE mode, like the SB600's) has its ports in
+     * BAR0/1 or BAR2/3, the control register 2 bytes into the odd BAR; one
+     * in compatibility mode uses the legacy ports, probed only once. */
+    static const struct ide_chan legacy[2] = { { 0x1F0, 0x3F6, NULL }, { 0x170, 0x376, NULL } };
+    int legacy_done[2] = { 0, 0 };
+    const struct pci_dev *pd;
+    for (size_t n = 0; (pd = pci_find_class(0x01, 0x01, n)) != NULL; n++) {
+        uint32_t cmd = pci_read32(pd->bus, pd->slot, pd->func, 0x04);
+        if (!(cmd & 1)) pci_write32(pd->bus, pd->slot, pd->func, 0x04, cmd | 1);     /* I/O decode */
+        for (int i = 0; i < 2; i++) {
+            struct ide_chan c;
+            if (pd->prog_if & (1 << (i * 2))) {
+                if (!pd->bar_is_io[i * 2] || !pd->bar[i * 2] || !pd->bar[i * 2 + 1]) continue;
+                c = (struct ide_chan){ (uint16_t)pd->bar[i * 2], (uint16_t)(pd->bar[i * 2 + 1] + 2), NULL };
+                kprintf("ide: %02x:%02x.%x channel %d native at %x/%x\n", pd->bus, pd->slot, pd->func, i, c.base, c.ctl);
+            } else {
+                if (legacy_done[i]) continue;
+                legacy_done[i] = 1;
+                c = legacy[i];
+            }
+            probe(&c, 0);
+            probe(&c, 1);
+        }
     }
 #endif
 #ifdef __powerpc__

@@ -8,6 +8,7 @@
 #include "string.h"
 #include "printf.h"
 #include "spinlock.h"
+#include "fs/blkdev.h"
 
 static struct vnode *root;
 static struct vfs_mount root_mount;
@@ -205,6 +206,7 @@ int vfs_umount(struct vnode *dir)
     if (mnt->type->unmount)
         mnt->type->unmount(mnt);
     kfree(mnt);
+    blkdev_flush_all();
     return 0;
 }
 
