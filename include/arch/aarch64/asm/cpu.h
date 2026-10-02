@@ -17,6 +17,8 @@ struct cpu {
     struct task *idle;
     volatile int online;
     uint64_t     mpidr;         /* what PSCI knows it as */
+    uint64_t     boot_stack;    /* bring-up: the stack it starts on (head.S reads it at offset 56) */
+    volatile int abandoned;     /* bring-up gave up waiting: if it arrives after all, it parks */
 };
 
 extern struct cpu cpus[MAX_CPUS];
