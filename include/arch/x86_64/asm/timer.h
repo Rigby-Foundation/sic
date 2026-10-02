@@ -8,4 +8,5 @@
 void     timer_init(void);      /* LAPIC timer if available, else PIT via the PIC */
 uint64_t timer_ticks(void);
 uint64_t timer_ms(void);
+uint64_t timer_boot_epoch(void);  /* the date at boot (CMOS clock), seconds since 1970; 0 if unknown */
 const char *timer_source(void);   /* "lapic", "pit", "decrementer": for diagnostics */

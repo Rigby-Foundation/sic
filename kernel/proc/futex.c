@@ -56,6 +56,10 @@ static long futex_wait(uint64_t uaddr, uint32_t val, uint64_t utimeout, int abso
         const struct abi_timespec *ts = (const void *)utimeout;
         if (ts->tv_sec < 0 || ts->tv_nsec < 0) return -EINVAL;
         uint64_t ticks = (uint64_t)ts->tv_sec * TIMER_HZ + (uint64_t)ts->tv_nsec * TIMER_HZ / 1000000000;
+        if (absolute == 2) {                            /* CLOCK_REALTIME: the date, not the uptime */
+            uint64_t epoch = timer_boot_epoch() * TIMER_HZ;
+            ticks = ticks > epoch ? ticks - epoch : 0;
+        }
         deadline = absolute ? ticks : timer_ticks() + ticks;
         if (deadline <= timer_ticks())
             deadline = timer_ticks() + 1;
@@ -116,7 +120,7 @@ long sys_futex(uint64_t uaddr, int op, uint32_t val, uint64_t utimeout, uint64_t
     int absolute = op & FUTEX_CLOCK_REALTIME;
     switch (op & FUTEX_CMD_MASK) {
     case FUTEX_WAIT:        return futex_wait(uaddr, val, utimeout, 0);
-    case FUTEX_WAIT_BITSET: return futex_wait(uaddr, val, utimeout, 1 || absolute);
+    case FUTEX_WAIT_BITSET: return futex_wait(uaddr, val, utimeout, absolute ? 2 : 1);
     case FUTEX_WAKE:
     case FUTEX_WAKE_BITSET: {
         uint64_t key = key_of(uaddr);

@@ -6,4 +6,5 @@
 void     timer_init(void);      /* the decrementer, from the timebase frequency in the device tree */
 uint64_t timer_ticks(void);
 uint64_t timer_ms(void);
+static inline uint64_t timer_boot_epoch(void) { return 0; }   /* no clock read yet: time counts from boot */
 const char *timer_source(void);
