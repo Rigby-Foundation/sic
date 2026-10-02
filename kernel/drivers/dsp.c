@@ -3,7 +3,9 @@
 /* /dev/dsp: OSS-style PCM playback over a pcm_hw ring. write() copies
  * frames into the ring ahead of the hardware's position and blocks when it
  * is full; fragments the writer did not refill are silenced so an underrun
- * plays quiet, not stale sound. One opener at a time. */
+ * plays quiet, not stale sound. One opener at a time. The volume
+ * (/dev/mixer) is a gain on the samples as they go into the ring, so it
+ * works the same on every card; it starts at 50. */
 #include "drivers/sound.h"
 #include "abi/soundcard.h"
 #include "fs/vfs.h"
@@ -19,6 +21,29 @@ static int dsp_open;
 static int running;
 static uint64_t wr;                         /* bytes written since start */
 static uint64_t rd;                         /* bytes the hardware has finished */
+static uint32_t volume = 50 | 50 << 8;      /* OSS: left | right << 8, 0-100 */
+static int32_t gain[2] = { 16384, 16384 };  /* per side, 1.0 = 65536 */
+
+/* Loudness is roughly logarithmic: a square law makes the slider feel even. */
+static void set_volume(uint32_t v)
+{
+    uint32_t l = v & 0xFF, r = (v >> 8) & 0xFF;
+    if (l > 100) l = 100;
+    if (r > 100) r = 100;
+    volume = l | r << 8;
+    gain[0] = (int32_t)(l * l * 65536 / 10000);
+    gain[1] = (int32_t)(r * r * 65536 / 10000);
+}
+
+/* Copy frames into the ring, scaled by the volume. */
+static void copy_scaled(uint8_t *dst, const uint8_t *src, size_t n)
+{
+    if (gain[0] == 65536 && gain[1] == 65536) { memcpy(dst, src, n); return; }
+    int16_t *d = (int16_t *)dst;
+    const int16_t *s = (const int16_t *)src;
+    for (size_t i = 0; i < n / 2; i++)
+        d[i] = (int16_t)(((int32_t)s[i] * gain[i & 1]) >> 16);
+}
 
 static uint64_t ring_bytes(void) { return (uint64_t)hw->frags * hw->frag_size; }
 
@@ -88,8 +113,8 @@ static long dsp_write(struct file *f, const void *buf, size_t len)
             size_t n = (size_t)space < len - done ? (size_t)space : len - done;
             uint64_t off = wr % ring_bytes();
             size_t first = ring_bytes() - off < n ? (size_t)(ring_bytes() - off) : n;
-            memcpy(hw->ring + off, p + done, first);
-            if (n > first) memcpy(hw->ring, p + done + first, n - first);
+            copy_scaled(hw->ring + off, p + done, first);
+            if (n > first) copy_scaled(hw->ring, p + done + first, n - first);
             wr += n;
             done += n;
         }
@@ -230,11 +255,76 @@ static long dsp_do_open(struct file *f)
 static const struct dev_ops dsp_ops = { .write = dsp_write, .poll = dsp_poll, .ioctl = dsp_ioctl,
                                         .release = dsp_release, .open = dsp_do_open };
 
+/* ---- /dev/mixer ------------------------------------------------------------------ */
+
+static long mixer_ioctl(struct file *f, long req, uint64_t arg)
+{
+    (void)f;
+    int *ip = (int *)arg;
+    switch ((uint32_t)req) {
+    case SOUND_MIXER_WRITE_VOLUME:
+    case SOUND_MIXER_WRITE_PCM:
+        if (!user_ok(arg, sizeof(int))) return -EFAULT;
+        set_volume((uint32_t)*ip);
+        *ip = (int)volume;
+        return 0;
+    case SOUND_MIXER_READ_VOLUME:
+    case SOUND_MIXER_READ_PCM:
+        if (!user_ok(arg, sizeof(int))) return -EFAULT;
+        *ip = (int)volume;
+        return 0;
+    case SOUND_MIXER_READ_DEVMASK:
+    case SOUND_MIXER_READ_STEREODEVS:
+        if (!user_ok(arg, sizeof(int))) return -EFAULT;
+        *ip = 1 << SOUND_MIXER_VOLUME | 1 << SOUND_MIXER_PCM;
+        return 0;
+    case SOUND_MIXER_READ_RECMASK:
+    case SOUND_MIXER_READ_RECSRC:
+    case SOUND_MIXER_READ_CAPS:
+        if (!user_ok(arg, sizeof(int))) return -EFAULT;
+        *ip = 0;
+        return 0;
+    }
+    return -ENOTTY;
+}
+
+/* Reading gives the volume as text ("50 50\n"); writing "N" or "L R" sets it. */
+static long mixer_read(struct file *f, void *buf, size_t len)
+{
+    char t[16];
+    int n = ksnprintf(t, sizeof t, "%u %u\n", volume & 0xFF, volume >> 8);
+    if (f->pos >= (uint64_t)n) return 0;
+    size_t k = (size_t)n - (size_t)f->pos < len ? (size_t)n - (size_t)f->pos : len;
+    memcpy(buf, t + f->pos, k);
+    f->pos += k;
+    return (long)k;
+}
+
+static long mixer_write(struct file *f, const void *buf, size_t len)
+{
+    (void)f;
+    const char *p = buf, *end = p + len;
+    uint32_t v[2] = { 0, 0 }; int got = 0;
+    while (p < end && got < 2) {
+        while (p < end && (*p < '0' || *p > '9')) p++;
+        if (p == end) break;
+        uint32_t x = 0;
+        while (p < end && *p >= '0' && *p <= '9') x = x * 10 + (uint32_t)(*p++ - '0');
+        v[got++] = x > 100 ? 100 : x;
+    }
+    if (!got) return -EINVAL;
+    set_volume(v[0] | (got == 2 ? v[1] : v[0]) << 8);
+    return (long)len;
+}
+
+static const struct dev_ops mixer_ops = { .read = mixer_read, .write = mixer_write, .ioctl = mixer_ioctl };
+
 void pcm_register(struct pcm_hw *h)
 {
     if (hw) return;                             /* one card is plenty */
     hw = h;
     h->wq = (struct waitqueue)WAITQUEUE_INIT;
     vfs_mkdev("/dev/dsp", &dsp_ops, NULL);
+    vfs_mkdev("/dev/mixer", &mixer_ops, NULL);
     kprintf("dsp: /dev/dsp on %s, %u Hz s16le stereo, %u x %u byte fragments\n", h->name, PCM_RATE, h->frags, h->frag_size);
 }

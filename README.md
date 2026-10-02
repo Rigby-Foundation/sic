@@ -88,9 +88,12 @@ virtio-gpu display (QEMU `-vga virtio`: a framebuffer in RAM pushed to the
 host by a kernel thread and on `FBIOPRESENT`, following the host window's
 size -- `/dev/fb0` reports the new mode and polls `POLLPRI`; with a virgl host,
 `-device virtio-vga-gl`, also `/dev/gpu0`: contexts, resources and command
-submission to the host GPU for [zgl](../zgl)), Intel HD Audio (`/dev/dsp`:
-OSS-style playback, 48 kHz 16-bit stereo, `beep` to try it), the NVMe/AHCI (SATA)/legacy IDE
-disk drivers, the network stack and the e1000 NIC driver, the zaefs and FAT
+submission to the host GPU for [zgl](../zgl)), Radeon Xpress IGPs (the
+panel's mode, and `/dev/radeongpu`: their 3D engine for zgl, with
+checked command streams; AMD's microcode in `firmware/`), Intel HD Audio (`/dev/dsp`:
+OSS-style playback, 48 kHz 16-bit stereo, `beep` to try it; `/dev/mixer` the volume;
+`/proc/hda` the codec's widgets and raw verbs), the NVMe/AHCI (SATA)/IDE (legacy and PCI native)
+disk drivers, the network stack and the e1000 and Broadcom 440x NIC drivers, the zaefs and FAT
 filesystems, loadable modules, signals, pipes, and the boot-time self tests.
 
 ```bash

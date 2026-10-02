@@ -4,7 +4,8 @@
  * (SDL's "dsp" backend, plain write() of PCM). The request numbers are
  * Linux's so <sys/soundcard.h> code compiles unchanged. The hardware plays
  * one format; SETFMT/CHANNELS/SPEED report what it is, the caller
- * converts (SDL does). */
+ * converts (SDL does). /dev/mixer: one control, the master volume (also
+ * answered as PCM), 0-100 per side, left | right << 8. */
 #pragma once
 #ifdef SIC_KERNEL
 #include "types.h"
@@ -74,3 +75,17 @@ typedef struct count_info {
     int32_t blocks;             /* fragments since the last call */
     int32_t ptr;                /* position in the buffer */
 } count_info;
+
+#define SOUND_MIXER_VOLUME      0
+#define SOUND_MIXER_PCM         4
+#define SOUND_MIXER_READ_VOLUME 0x80044D00
+#define SOUND_MIXER_WRITE_VOLUME 0xC0044D00
+#define SOUND_MIXER_READ_PCM    0x80044D04
+#define SOUND_MIXER_WRITE_PCM   0xC0044D04
+#define SOUND_MIXER_READ_STEREODEVS 0x80044DFB
+#define SOUND_MIXER_READ_CAPS   0x80044DFC
+#define SOUND_MIXER_READ_RECMASK 0x80044DFD
+#define SOUND_MIXER_READ_DEVMASK 0x80044DFE
+#define SOUND_MIXER_READ_RECSRC 0x80044DFF
+#define MIXER_READ(dev)         (0x80044D00 | (dev))
+#define MIXER_WRITE(dev)        (0xC0044D00 | (dev))
