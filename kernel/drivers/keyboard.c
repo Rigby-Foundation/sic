@@ -60,6 +60,28 @@ static void push_char(char c)
 
 #include "drivers/fb.h"
 
+/* Cooked input is line-edited here: typed characters collect in a line
+ * (echoed), backspace takes the last one back, and only a finished line
+ * reaches readers, as with a Unix terminal in canonical mode. A program
+ * that took the display for graphics gets each key at once instead. */
+static char line[512];
+static int line_len;
+
+static void cooked_char(char c, int echo)
+{
+    if (fb_is_graphics_mode()) { push_char(c); return; }
+    if (c == '\b') {
+        if (line_len) { line_len--; kputc('\b'); }
+        return;
+    }
+    if (echo) kputc(c);
+    if (line_len < (int)sizeof line) line[line_len++] = c;
+    if (c == '\n' || line_len == (int)sizeof line) {
+        for (int i = 0; i < line_len; i++) push_char(line[i]);
+        line_len = 0;
+    }
+}
+
 void keyboard_push_char(char c)
 {
     if (kbd_mode == K_RAW)                              /* serial input has no scancodes to offer */
@@ -71,9 +93,7 @@ void keyboard_push_char(char c)
             task_send_signal(t, SIGINT);
         return;
     }
-    if (!fb_is_graphics_mode())
-        kputc(c);                                       /* echo */
-    push_char(c);
+    cooked_char(c, 1);
 }
 
 /* Drains the serial port. Called from the receive interrupt and from readers
@@ -156,6 +176,7 @@ int keyboard_set_mode(struct file *f, int mode)
     kbd_mode = mode;
     kbd_owner = mode == K_RAW ? f : NULL;
     shift = ctrl = 0;
+    line_len = 0;
     rhead = rtail = 0;                      /* don't mix cooked and raw bytes */
     spin_unlock_irqrestore(&kbd_lock, fl);
     waitqueue_wake_all(&readers);           /* cooked readers may proceed again */
@@ -193,10 +214,10 @@ void keyboard_scancode(uint8_t raw)
         e0 = 0;
         if (!released) {
             switch (sc) {
-            case 0x48: push_char('\033'); push_char('['); push_char('A'); return; /* Up */
-            case 0x50: push_char('\033'); push_char('['); push_char('B'); return; /* Down */
-            case 0x4D: push_char('\033'); push_char('['); push_char('C'); return; /* Right */
-            case 0x4B: push_char('\033'); push_char('['); push_char('D'); return; /* Left */
+            case 0x48: cooked_char('\033', 0); cooked_char('[', 0); cooked_char('A', 0); return; /* Up */
+            case 0x50: cooked_char('\033', 0); cooked_char('[', 0); cooked_char('B', 0); return; /* Down */
+            case 0x4D: cooked_char('\033', 0); cooked_char('[', 0); cooked_char('C', 0); return; /* Right */
+            case 0x4B: cooked_char('\033', 0); cooked_char('[', 0); cooked_char('D', 0); return; /* Left */
             }
         }
         return;
@@ -215,6 +236,7 @@ void keyboard_scancode(uint8_t raw)
         return;
     if (ctrl && c == 'c') {                             /* ^C -> SIGINT to the foreground process */
         kputs("^C\n");
+        line_len = 0;
         struct task *t = fg_pid ? task_find(fg_pid) : NULL;
         if (t)
             task_send_signal(t, SIGINT);
@@ -225,9 +247,7 @@ void keyboard_scancode(uint8_t raw)
         upper = !upper;
     if (upper)
         c = map_upper[sc];
-    if (!fb_is_graphics_mode())
-        kputc(c);                   /* echo */
-    push_char(c);
+    cooked_char(c, 1);
 }
 
 #ifdef __x86_64__
