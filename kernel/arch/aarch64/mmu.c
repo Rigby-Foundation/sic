@@ -29,7 +29,8 @@
 #define D_SW_DEV    (1UL << 55)     /* software: a device page, never freed */
 #define D_ADDR      0x0000fffffffff000UL
 
-extern uint64_t boot_l0[];          /* head.S: the kernel's level-0 table (TTBR1) */
+extern uint64_t boot_l0[];          /* head.S: the rough first kernel table (TTBR1) */
+extern uint64_t kernel_ttbr1;       /* boot.c: the precise one that replaced it */
 
 static uint64_t kernel_l0;          /* physical */
 static uint64_t empty_l0;           /* TTBR0 while a kernel task runs: nothing in the user half */
@@ -53,7 +54,8 @@ static uint64_t alloc_table(void)
 static uint64_t page_desc(uint64_t phys, uint64_t flags)
 {
     uint64_t d = (phys & D_ADDR) | D_VALID | D_PAGE | D_AF;
-    if (flags & (PTE_PCD | PTE_PWT)) d |= D_ATTR(1);                    /* device nGnRnE */
+    if (flags & PTE_PCD) d |= D_ATTR(1);                                 /* device nGnRnE */
+    else if (flags & PTE_PWT) d |= D_ATTR(3) | D_SH_INNER;               /* normal non-cacheable: frame buffers */
     else d |= D_ATTR(0) | D_SH_INNER;                                    /* normal write-back */
     if (!(flags & PTE_WRITE)) d |= D_AP_RO;
     if (flags & PTE_USER) d |= D_AP_USER | D_NG | D_PXN;                 /* the kernel never executes user pages */
@@ -72,6 +74,7 @@ static uint64_t desc_flags(uint64_t d)
     if (d & D_UXN) f |= PTE_NX;
     if (d & D_SW_DEV) f |= PTE_DEV;
     if ((d & D_ATTR(7)) == D_ATTR(1)) f |= PTE_PCD;
+    if ((d & D_ATTR(7)) == D_ATTR(3)) f |= PTE_PWT;
     return f;
 }
 
@@ -89,7 +92,7 @@ static uint64_t *next_level(uint64_t *table, size_t idx, int create)
 
 void vmm_init(void)
 {
-    kernel_l0 = V2P(boot_l0);
+    kernel_l0 = kernel_ttbr1 ? kernel_ttbr1 : V2P(boot_l0);
     pmm_relocate_to_hhdm();
     empty_l0 = alloc_table();
     write_sysreg(ttbr0_el1, empty_l0);
@@ -197,6 +200,18 @@ void *vmm_map_mmio(uint64_t phys, size_t size)
     uint64_t virt = __atomic_fetch_add(&mmio_next, end - start, __ATOMIC_SEQ_CST);
     for (uint64_t p = start, v = virt; p < end; p += PAGE_SIZE, v += PAGE_SIZE)
         if (vmm_map_page(v, p, PTE_WRITE | PTE_NX | PTE_PCD) != 0)
+            return NULL;
+    return (void *)(virt + (phys - start));
+}
+
+/* Normal non-cacheable (PTE_WC), always a new mapping: memory a device reads
+ * and writes without snooping the CPU's caches (a GPU's ring, say). */
+void *vmm_map_wc(uint64_t phys, size_t size)
+{
+    uint64_t start = PAGE_ALIGN_DOWN(phys), end = PAGE_ALIGN_UP(phys + size);
+    uint64_t virt = __atomic_fetch_add(&mmio_next, end - start, __ATOMIC_SEQ_CST);
+    for (uint64_t p = start, v = virt; p < end; p += PAGE_SIZE, v += PAGE_SIZE)
+        if (vmm_map_page(v, p, PTE_WRITE | PTE_NX | PTE_WC) != 0)
             return NULL;
     return (void *)(virt + (phys - start));
 }

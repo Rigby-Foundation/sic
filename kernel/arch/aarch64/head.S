@@ -1,11 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
 /* Entry: a Linux arm64 Image header, then the MMU-off start of the world.
- * The loader (QEMU) enters at _head with x0 = physical address of the
- * device tree, MMU and caches off, at EL1 (or EL2, which we drop out of).
- * We are linked in the direct map but run at our physical address until
- * the page tables below are live, so everything here is PC-relative. */
+ * The loader (QEMU, a phone's bootloader) enters at _head with x0 =
+ * physical address of the device tree, MMU and caches off, at EL1 (or EL2,
+ * which we drop out of). We are linked in the direct map at KERNEL_PHYS_LOAD
+ * and run at our physical address until the page tables below are live,
+ * so everything here is PC-relative; a loader that put us elsewhere gets
+ * the image copied to where it was linked first. */
 #define TEXT_OFFSET 0x200000
+#define KERNEL_PHYS_LOAD 0x40200000
 
     .section .text.head, "ax"
     .globl _head
@@ -14,13 +17,47 @@ _head:
     .long   0                           /* code1 */
     .quad   TEXT_OFFSET                 /* text_offset: where in RAM to put us */
     .quad   _image_size                 /* image_size */
-    .quad   0x0a                        /* flags: little-endian, 4 KiB pages, place anywhere */
+    .quad   0x02                        /* flags: little-endian, 4 KiB pages, at RAM base + text_offset */
     .quad   0, 0, 0                     /* reserved */
     .ascii  "ARM\x64"                   /* magic */
     .long   0                           /* PE header offset (none) */
 
 _start:
     mov     x20, x0                     /* the device tree, physical */
+
+    /* Not where we were linked to run: move there (overlap-safe), then
+     * continue in the copy. Caches are off; the I-cache may not be. */
+    adr     x1, _head
+    movz    x2, #(KERNEL_PHYS_LOAD >> 16), lsl #16
+    cmp     x1, x2
+    b.eq    0f
+    adrp    x3, __bss_start
+    add     x3, x3, :lo12:__bss_start
+    sub     x3, x3, x1                  /* bytes of the image (the bss is cleared below) */
+    cmp     x2, x1
+    b.hi    7f
+6:  ldr     x4, [x1], #8                /* down: forwards */
+    str     x4, [x2], #8
+    subs    x3, x3, #8
+    b.gt    6b
+    b       8f
+7:  add     x1, x1, x3                  /* up: backwards */
+    add     x2, x2, x3
+9:  ldr     x4, [x1, #-8]!
+    str     x4, [x2, #-8]!
+    subs    x3, x3, #8
+    b.gt    9b
+8:  ic      iallu
+    dsb     sy
+    isb
+    movz    x2, #(KERNEL_PHYS_LOAD >> 16), lsl #16
+    adr     x1, _head
+    adr     x3, _start
+    sub     x3, x3, x1                  /* _start's offset in the image */
+    add     x2, x2, x3
+    mov     x0, x20
+    br      x2
+0:
 
     /* EL2 (virtualization=on): set EL1 to AArch64 and drop down. */
     mrs     x1, CurrentEL
@@ -142,11 +179,12 @@ mmu_on:
     ret
 
 /* A secondary CPU, from PSCI CPU_ON: MMU off, x0 = the context the boot
- * CPU passed (unused: it left our stack and per-CPU block in
- * secondary_stack/secondary_cpu, written to memory with the caches
- * cleaned). */
+ * CPU passed: this CPU's struct cpu (a direct-map address, used once the
+ * MMU is on), whose boot_stack is where it starts. Each CPU has its own,
+ * so one that comes up late cannot take another's. */
     .globl secondary_entry
 secondary_entry:
+    mov     x19, x0
     mrs     x1, CurrentEL
     lsr     x1, x1, #2
     cmp     x1, #2
@@ -168,16 +206,19 @@ secondary_entry:
     ldr     x1, =2f
     br      x1
 2:  msr     ttbr0_el1, xzr
+    ldr     x1, =kernel_ttbr1           /* the boot CPU's precise direct map (boot.c), if it built one */
+    ldr     x1, [x1]
+    cbz     x1, 4f
+    msr     ttbr1_el1, x1
+4:  isb
     tlbi    vmalle1
     dsb     nsh
     isb
-    ldr     x1, =secondary_stack
-    ldr     x1, [x1]
+    ldr     x1, [x19, #56]              /* struct cpu.boot_stack */
     mov     sp, x1
     ldr     x1, =vectors
     msr     vbar_el1, x1
-    ldr     x0, =secondary_cpu
-    ldr     x0, [x0]
+    mov     x0, x19
     msr     tpidr_el1, x0
     bl      aarch64_secondary_main
 3:  wfi

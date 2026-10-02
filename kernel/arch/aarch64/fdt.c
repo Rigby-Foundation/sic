@@ -196,3 +196,55 @@ int fdt_walk_next(int node)
         else return -1;
     }
 }
+
+/* The node that contains `node` (-1 for the root): a walk from the top
+ * keeping the path. */
+int fdt_parent(int node)
+{
+    if (!structs || node <= 0) return -1;
+    int stack[64], depth = 0;
+    for (int i = 0; ; ) {
+        uint32_t t = word(i);
+        if (t == FDT_BEGIN_NODE) {
+            if (i == node) return depth ? stack[depth - 1] : -1;
+            if (depth < 64) stack[depth] = i;
+            depth++;
+            i = after_name(i);
+        } else if (t == FDT_END_NODE) { depth--; i++; }
+        else if (t == FDT_PROP) i = skip_prop(i);
+        else if (t == FDT_NOP) i++;
+        else return -1;
+    }
+}
+
+/* Entry `index` of a node's "reg", in the cell sizes its parent declares. */
+int fdt_reg(int node, int index, uint64_t *base, uint64_t *size)
+{
+    int parent = fdt_parent(node);
+    uint32_t ac = fdt_prop_u32(parent >= 0 ? parent : 0, "#address-cells", 0, 2);
+    uint32_t sc = fdt_prop_u32(parent >= 0 ? parent : 0, "#size-cells", 0, 1);
+    int len;
+    const uint8_t *p = fdt_prop(node, "reg", &len);
+    int per = (int)(ac + sc) * 4;
+    if (!p || per == 0 || (index + 1) * per > len) return -1;
+    p += index * per;
+    uint64_t b = 0, s = 0;
+    for (uint32_t k = 0; k < ac; k++) b = b << 32 | be32(p + k * 4);
+    for (uint32_t k = 0; k < sc; k++) s = s << 32 | be32(p + (ac + k) * 4);
+    if (base) *base = b;
+    if (size) *size = s;
+    return 0;
+}
+
+int fdt_is_compatible(int node, const char *compat) { return node >= 0 && compatible(node, compat); }
+
+/* The header's memory reservation block: entry i, 0 at its end. */
+int fdt_memreserve(int i, uint64_t *base, uint64_t *size)
+{
+    if (!blob) return 0;
+    const uint8_t *r = blob + be32(blob + 16) + i * 16;
+    uint64_t b = (uint64_t)be32(r) << 32 | be32(r + 4), s = (uint64_t)be32(r + 8) << 32 | be32(r + 12);
+    if (!b && !s) return 0;
+    *base = b; *size = s;
+    return 1;
+}

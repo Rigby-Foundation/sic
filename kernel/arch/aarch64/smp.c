@@ -19,8 +19,6 @@
 
 extern void secondary_entry(void);
 extern void gic_init_cpu(void);
-uint64_t secondary_stack;           /* what the next CPU to come up finds (head.S) */
-struct cpu *secondary_cpu;
 
 static volatile uint32_t online_cpus = 1;
 static int use_hvc;
@@ -38,8 +36,12 @@ static long psci_call(uint32_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
     return (long)x0;
 }
 
+_Static_assert(__builtin_offsetof(struct cpu, boot_stack) == 56, "head.S reads boot_stack at 56");
+
 void aarch64_secondary_main(struct cpu *c)
 {
+    if (c->abandoned)                   /* too late: its place is gone */
+        for (;;) __asm__ volatile("msr daifset, #0xf; wfi");
     gic_init_cpu();
     timer_init_cpu();
     sched_init_ap(c);               /* creates this CPU's idle task, sets current */
@@ -61,20 +63,22 @@ static int start_cpu(struct cpu *c)
 {
     void *stack = heap_alloc_pages(AP_STACK_PAGES);
     if (!stack) return -1;
-    secondary_stack = (uint64_t)(uintptr_t)stack + AP_STACK_PAGES * 4096;
-    secondary_cpu = c;
-    clean_to_memory(&secondary_stack, sizeof secondary_stack);
-    clean_to_memory(&secondary_cpu, sizeof secondary_cpu);
-    long rc = psci_call(PSCI_CPU_ON_64, c->mpidr, V2P(secondary_entry), 0);
+    c->boot_stack = (uint64_t)(uintptr_t)stack + AP_STACK_PAGES * 4096;
+    clean_to_memory(c, sizeof *c);
+    uint64_t t0 = timer_ms();
+    long rc = psci_call(PSCI_CPU_ON_64, c->mpidr, V2P(secondary_entry), (uint64_t)(uintptr_t)c);
     if (rc != 0) { kprintf("smp: cpu %u: PSCI CPU_ON failed (%ld)\n", c->index, rc); return -1; }
-    for (int i = 0; i < 500 && !c->online; i++) task_sleep_ms(1);
-    return c->online ? 0 : -1;
+    for (int i = 0; i < 2000 && !c->online; i++) task_sleep_ms(1);
+    if (!c->online) { c->abandoned = 1; clean_to_memory(c, sizeof *c); return -1; }
+    kprintf("smp: cpu %u (mpidr %llx) up in %llu ms\n", c->index, c->mpidr, timer_ms() - t0);
+    return 0;
 }
 
 void smp_init(void)
 {
     int psci = fdt_path("/psci");
     if (psci < 0) { kprintf("smp: no PSCI in the device tree: single CPU\n"); return; }
+    if (platform.nosmp) { kprintf("smp: nosmp: single CPU\n"); return; }
     const char *method = fdt_prop(psci, "method", NULL);
     use_hvc = method && strcmp(method, "hvc") == 0;
 

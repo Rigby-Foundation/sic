@@ -22,7 +22,8 @@ static volatile uint8_t *uart;
 
 void serial_init(void)
 {
-    uart = P2V(platform.uart_base ? platform.uart_base : 0x09000000);
+    if (!platform.uart_base) return;            /* no PL011 in the tree (a phone): no serial console */
+    uart = P2V(platform.uart_base);
     mmio_write32(uart + CR, 0);
     mmio_write32(uart + ICR, 0x7ff);
     mmio_write32(uart + LCRH, 0x70);            /* 8 bits, FIFOs on */
