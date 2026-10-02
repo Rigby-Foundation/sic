@@ -44,12 +44,14 @@ CONFIG_KEYBOARD   := $(call cfg,CONFIG_KEYBOARD)
 CONFIG_MOUSE      := $(call cfg,CONFIG_MOUSE)
 CONFIG_VIRTIO_GPU := $(call cfg,CONFIG_VIRTIO_GPU)
 CONFIG_VIRTIO_INPUT := $(call cfg,CONFIG_VIRTIO_INPUT)
+CONFIG_RADEON     := $(call cfg,CONFIG_RADEON)
 CONFIG_PCI        := $(call cfg,CONFIG_PCI)
 CONFIG_NVME       := $(call cfg,CONFIG_NVME)
 CONFIG_AHCI       := $(call cfg,CONFIG_AHCI)
 CONFIG_IDE        := $(call cfg,CONFIG_IDE)
 CONFIG_NET        := $(call cfg,CONFIG_NET)
 CONFIG_E1000      := $(call cfg,CONFIG_E1000)
+CONFIG_B44        := $(call cfg,CONFIG_B44)
 CONFIG_HDA        := $(call cfg,CONFIG_HDA)
 CONFIG_ZAEFS      := $(call cfg,CONFIG_ZAEFS)
 CONFIG_FAT        := $(call cfg,CONFIG_FAT)
@@ -64,7 +66,7 @@ SYSROOT ?= $(if $(SIC_SYSROOT),$(SIC_SYSROOT),$(HOME)/.sic/sysroot)
 CFLAGS  := $(ARCH_CFLAGS) -std=c11 -ffreestanding -fno-stack-protector \
            -fno-asynchronous-unwind-tables -fno-builtin -nostdlib -fno-omit-frame-pointer \
            -O2 -g -Wall -Wextra -Iinclude -Iinclude/arch/$(ARCH) -DSIC_KERNEL -include generated/config.h $(CFLAGS_EXTRA)
-ASFLAGS := $(ARCH_ASFLAGS) -g -Iinclude -Iinclude/arch/$(ARCH)
+ASFLAGS := $(ARCH_ASFLAGS) -g -Iinclude -Iinclude/arch/$(ARCH) $(if $(EMBED_INITRD),-DEMBED_INITRD='"$(abspath $(EMBED_INITRD))"')
 LINKER_SCRIPT := kernel/arch/$(ARCH)/linker.ld
 LDFLAGS := $(ARCH_LDFLAGS) -T $(LINKER_SCRIPT) -nostdlib -static -z max-page-size=0x1000
 
@@ -74,10 +76,10 @@ OPTIONAL := kernel/arch/x86_64/smp.c kernel/arch/x86_64/ap_trampoline.S kernel/a
             kernel/arch/x86_64/module.c kernel/arch/powerpc/module.c kernel/arch/aarch64/module.c \
             kernel/drivers/fb.c kernel/drivers/font.c kernel/drivers/serial.c kernel/drivers/keyboard.c kernel/drivers/mouse.c \
             kernel/drivers/pci.c kernel/drivers/nvme.c kernel/drivers/ahci.c kernel/drivers/ide.c \
-            kernel/drivers/virtio.c kernel/drivers/virtio_gpu.c kernel/drivers/virtio_input.c \
+            kernel/drivers/virtio.c kernel/drivers/virtio_gpu.c kernel/drivers/virtio_input.c kernel/drivers/radeon.c \
             kernel/fs/zaefs.c kernel/fs/fat.c \
             kernel/net/core.c kernel/net/arp.c kernel/net/ip.c kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c kernel/net/unix.c \
-            kernel/drivers/e1000.c kernel/drivers/hda.c kernel/drivers/dsp.c \
+            kernel/drivers/e1000.c kernel/drivers/b44.c kernel/drivers/radeon_cp.c kernel/drivers/hda.c kernel/drivers/dsp.c \
             kernel/core/module.c kernel/core/ksyms.c kernel/proc/signal.c kernel/fs/pipe.c \
             kernel/core/selftest.c
 SRC-y :=
@@ -88,6 +90,7 @@ SRC-$(CONFIG_KEYBOARD)   += kernel/drivers/keyboard.c
 SRC-$(CONFIG_MOUSE)      += kernel/drivers/mouse.c
 SRC-$(CONFIG_VIRTIO_GPU) += kernel/drivers/virtio_gpu.c
 SRC-$(CONFIG_VIRTIO_INPUT) += kernel/drivers/virtio_input.c
+SRC-$(CONFIG_RADEON)     += kernel/drivers/radeon.c kernel/drivers/radeon_cp.c
 SRC-y += $(if $(CONFIG_VIRTIO_GPU)$(CONFIG_VIRTIO_INPUT),kernel/drivers/virtio.c,)
 SRC-$(CONFIG_PCI)        += kernel/drivers/pci.c
 SRC-$(CONFIG_NVME)       += kernel/drivers/nvme.c
@@ -95,6 +98,7 @@ SRC-$(CONFIG_AHCI)       += kernel/drivers/ahci.c
 SRC-$(CONFIG_IDE)        += kernel/drivers/ide.c
 SRC-$(CONFIG_NET)        += kernel/net/core.c kernel/net/arp.c kernel/net/ip.c kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c kernel/net/unix.c
 SRC-$(CONFIG_E1000)      += kernel/drivers/e1000.c
+SRC-$(CONFIG_B44)        += kernel/drivers/b44.c
 SRC-$(CONFIG_HDA)        += kernel/drivers/hda.c kernel/drivers/dsp.c
 SRC-$(CONFIG_ZAEFS)      += kernel/fs/zaefs.c
 SRC-$(CONFIG_FAT)        += kernel/fs/fat.c
@@ -154,6 +158,8 @@ install: all
 	cp include/abi/*.h $(SYSROOT)/usr/include/abi/
 	cp abi/syscall.tbl abi/gen.py $(SYSROOT)/usr/share/sic/abi/
 	@rm -f $(SYSROOT)/lib/modules/*.ko; [ -z "$(MOD_KOS)" ] || cp $(MOD_KOS) $(SYSROOT)/lib/modules/
+	@# device firmware, into the root file system (ZAE overlays $(SYSROOT)/rootfs)
+	@mkdir -p $(SYSROOT)/rootfs/lib/firmware && cp -R firmware/. $(SYSROOT)/rootfs/lib/firmware/
 	@echo "installed into $(SYSROOT)"
 
 define MODULE_RULE

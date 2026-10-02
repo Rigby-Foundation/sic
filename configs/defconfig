@@ -16,6 +16,7 @@ CONFIG_KEYBOARD=y       # PS/2 keyboard -> /dev/console input
 CONFIG_MOUSE=y          # PS/2 mouse -> /dev/mouse
 CONFIG_VIRTIO_GPU=y        # virtio-gpu display (QEMU -vga virtio); needs PCI and FB_CONSOLE
 CONFIG_VIRTIO_INPUT=n      # virtio-keyboard-pci / virtio-mouse-pci (input comes from PS/2 / serial here)
+CONFIG_RADEON=y         # ATI Radeon Xpress 200M/1100/1150 laptop panels (RS480/RS482); needs PCI and FB_CONSOLE
 
 # --- buses & storage --------------------------------------------------------
 CONFIG_PCI=y            # PCI enumeration (needed by every PCI driver below)
@@ -27,6 +28,7 @@ CONFIG_HDA=y            # Intel HD Audio -> /dev/dsp (OSS-style playback; needs 
 # --- networking -------------------------------------------------------------
 CONFIG_NET=y            # IPv4 stack, sockets, loopback
 CONFIG_E1000=y          # Intel 8254x (e1000) Ethernet (needs PCI, NET)
+CONFIG_B44=y            # Broadcom 440x 10/100 Ethernet (Dell Vostro 1000 and co.; needs PCI, NET)
 
 # --- filesystems (tmpfs is always built: it is the root) --------------------
 CONFIG_ZAEFS=y          # sic's own on-disk filesystem

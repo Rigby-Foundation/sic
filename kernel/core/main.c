@@ -17,6 +17,7 @@
 #include "drivers/sound.h"
 #include "net/net.h"
 #include "drivers/e1000.h"
+#include "drivers/b44.h"
 #include "module.h"
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
@@ -58,6 +59,21 @@ static long initrd_read(struct file *f, void *buf, size_t len)
 
 static const struct dev_ops initrd_ops = { .read = initrd_read };
 
+static long kmsg_read(struct file *f, void *buf, size_t len)
+{
+    char tmp[512];                  /* not straight into user memory: klog_read holds the console lock */
+    size_t done = 0;
+    while (done < len) {
+        size_t n = klog_read(f->pos, tmp, len - done < sizeof tmp ? len - done : sizeof tmp);
+        if (!n) break;
+        memcpy((char *)buf + done, tmp, n);
+        done += n;
+        f->pos += n;
+    }
+    return (long)done;
+}
+static const struct dev_ops kmsg_ops = { .read = kmsg_read };
+
 static void initrd_expose(const void *data, size_t len)
 {
     initrd_data = data;
@@ -66,6 +82,9 @@ static void initrd_expose(const void *data, size_t len)
     struct vnode *n = vfs_lookup(vfs_root(), "/dev/initrd");
     if (n) { n->size = len; n->seekable = 1; }
 }
+
+/* "noselftest" on a command line the architecture knows about. */
+__attribute__((weak)) int arch_skip_selftest(void) { return 0; }
 
 void kernel_main(struct zaeboot_info *info)
 {
@@ -82,7 +101,11 @@ void kernel_main(struct zaeboot_info *info)
     if (info->fb.base == 0 && info->size >= sizeof(*info) && info->firmware == ZAEBOOT_FW_BIOS)
         fb_init_text();             /* the loader left the BIOS text screen: keep using it */
     else
+#ifdef __aarch64__
+        fb_init(&info->fb, P2V(info->fb.base), 0);                /* a phone's splash buffer: the direct map has it uncached */
+#else
         fb_init(&info->fb, (void *)(uintptr_t)info->fb.base, 0);  /* identity / BAT mapped */
+#endif
     fb_set_color(0xE0E0E0, 0x101018);
     fb_clear();
 #endif
@@ -109,10 +132,14 @@ void kernel_main(struct zaeboot_info *info)
         pmm_keep(info->initrd_addr, info->initrd_size);
     pmm_reclaim_boot_memory();
     heap_init();
+#if defined(CONFIG_FB_CONSOLE) && defined(__aarch64__)
+    if (info->fb.base) fb_use_shadow_copy();   /* a phone's splash buffer is uncached: scrolling must not read it */
+#endif
 
     vfs_init();
     vfs_create(vfs_root(), "/dev", VNODE_DIR);
     vfs_create(vfs_root(), "/proc", VNODE_DIR);
+    vfs_mkdev("/proc/kmsg", &kmsg_ops, NULL);   /* the kernel log, for dmesg over a remote shell */
     vfs_create(vfs_root(), "/tmp", VNODE_DIR);
     vfs_create(vfs_root(), "/mnt", VNODE_DIR);
     vfs_create(vfs_root(), "/disk", VNODE_DIR);     /* where init mounts the zaefs root partition */
@@ -157,6 +184,9 @@ void kernel_main(struct zaeboot_info *info)
     virtio_gpu_init();              /* needs the scheduler (present thread) and the timer */
     fb_dev_init();                  /* /dev/fb0, if the display only appeared now (aarch64: no firmware framebuffer) */
 #endif
+#if defined(CONFIG_RADEON) && defined(CONFIG_FB_CONSOLE)
+    radeon_init();                  /* ATI IGP laptops: report, and /proc/radeon to switch the panel to graphics */
+#endif
     interrupts_enable();
     arch_init_smp();
 #ifdef CONFIG_NVME
@@ -176,10 +206,14 @@ void kernel_main(struct zaeboot_info *info)
 #ifdef CONFIG_E1000
     e1000_init();
 #endif
+#ifdef CONFIG_B44
+    b44_init();
+#endif
 #endif
 
 #ifdef CONFIG_SELFTEST
-    selftest_run();
+    if (!arch_skip_selftest())
+        selftest_run();
 #endif
 
     kprintf("\nstarting /bin/init\n");

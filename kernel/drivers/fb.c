@@ -8,6 +8,7 @@
 #include "abi/fb.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "mm/heap.h"
 #include "proc/sched.h"
 #include "proc/syscall.h"
 #include "proc/wait.h"
@@ -15,6 +16,9 @@
 static struct zaeboot_framebuffer raw_fb;
 static int kd_mode = KD_TEXT;
 static struct file *kd_owner;       /* the fd that set KD_GRAPHICS */
+
+int fb_have_framebuffer(void) { return raw_fb.base != 0; }
+
 
 int fb_is_graphics_mode(void)
 {
@@ -32,12 +36,15 @@ extern const uint8_t font8x8[95][8];
 static struct {
     uint8_t *base;
     uint32_t width, height, pitch;
+    uint32_t bypp;          /* bytes per pixel: 4, or 3 */
     uint8_t rs, gs, bs;
+    uint32_t top;           /* rows of pixels left alone at the top (a phone's camera cutout) */
     uint32_t cols, rows;
     uint32_t cx, cy;
     uint32_t fg, bg;        /* native pixel values */
     int ready;
     int text;               /* VGA text mode at 0xB8000 (BIOS boot without a VBE mode) */
+    uint8_t *shadow;        /* a copy in RAM, if reading the frame buffer back is slow */
 } con;
 
 /* ---- VGA text fallback ------------------------------------------------------- */
@@ -87,6 +94,21 @@ void fb_init_text(void)
     con.rows = VGA_ROWS;
     con.text = 1;
     con.ready = 1;
+    raw_fb.base = 0;                    /* no framebuffer (any more): /dev/fb0 says so */
+}
+
+void fb_use_shadow(void)
+{
+    if (!con.ready || con.text || con.shadow) return;
+    con.shadow = kzalloc((size_t)con.pitch * con.height);   /* callers have just cleared the screen */
+}
+
+/* The same, for a screen that already shows something: read it in once. */
+void fb_use_shadow_copy(void)
+{
+    if (!con.ready || con.text || con.shadow) return;
+    con.shadow = kmalloc((size_t)con.pitch * con.height);
+    if (con.shadow) memcpy(con.shadow, con.base, (size_t)con.pitch * con.height);
 }
 
 static uint32_t to_native(uint32_t rgb)
@@ -97,7 +119,14 @@ static uint32_t to_native(uint32_t rgb)
 
 static inline void put_pixel(uint32_t x, uint32_t y, uint32_t px)
 {
+    if (con.bypp == 3) {                /* packed 24-bit (a phone bootloader's splash) */
+        uint8_t *p = con.base + y * con.pitch + x * 3;
+        p[0] = (uint8_t)px; p[1] = (uint8_t)(px >> 8); p[2] = (uint8_t)(px >> 16);
+        if (con.shadow) { p = con.shadow + y * con.pitch + x * 3; p[0] = (uint8_t)px; p[1] = (uint8_t)(px >> 8); p[2] = (uint8_t)(px >> 16); }
+        return;
+    }
     *(uint32_t *)(con.base + y * con.pitch + x * 4) = px;
+    if (con.shadow) *(uint32_t *)(con.shadow + y * con.pitch + x * 4) = px;
 }
 
 static void fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t px)
@@ -107,6 +136,7 @@ static void fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t p
             put_pixel(x + i, y + j, px);
 }
 
+uint32_t fb_safe_top;                    /* set by the platform before fb_init */
 static uint8_t *fb_virt;                 /* where the kernel writes the pixels */
 static int fb_in_ram;                    /* backing is ordinary memory (a virtio-gpu resource): map it cached */
 static int (*present_hook)(void);        /* a display that shows the buffer only when told to */
@@ -119,7 +149,7 @@ static struct waitqueue fb_wq = WAITQUEUE_INIT;
 
 void fb_init(const struct zaeboot_framebuffer *fb, void *virt, int in_ram)
 {
-    if (fb->base == 0 || fb->bpp != 32)
+    if (fb->base == 0 || (fb->bpp != 32 && fb->bpp != 24))
         return;
     raw_fb = *fb;
     fb_virt = virt;
@@ -127,14 +157,17 @@ void fb_init(const struct zaeboot_framebuffer *fb, void *virt, int in_ram)
     fb_map_len = (uint64_t)fb->pitch * fb->height;
     con.text = 0;
     con.base   = virt;
+    if (con.shadow) { kfree(con.shadow); con.shadow = NULL; }
     con.width  = fb->width;
     con.height = fb->height;
     con.pitch  = fb->pitch;
+    con.bypp   = fb->bpp / 8;
     con.rs = fb->red_shift;
     con.gs = fb->green_shift;
     con.bs = fb->blue_shift;
+    con.top = fb_safe_top < con.height / 4 ? fb_safe_top : 0;
     con.cols = con.width / CELL_W;
-    con.rows = con.height / CELL_H;
+    con.rows = (con.height - con.top) / CELL_H;
     con.cx = con.cy = 0;
     con.fg = to_native(0xFFFFFF);
     con.bg = to_native(0x000000);
@@ -161,7 +194,7 @@ void fb_clear(void)
 static void draw_glyph(uint32_t col, uint32_t row, char c)
 {
     const uint8_t *glyph = (c >= 0x20 && c <= 0x7E) ? font8x8[c - 0x20] : font8x8['?' - 0x20];
-    uint32_t x0 = col * CELL_W, y0 = row * CELL_H;
+    uint32_t x0 = col * CELL_W, y0 = con.top + row * CELL_H;
 
     for (uint32_t gy = 0; gy < GLYPH_H; gy++) {
         uint8_t bits = glyph[gy];
@@ -173,21 +206,31 @@ static void draw_glyph(uint32_t col, uint32_t row, char c)
     DAMAGE(x0, y0, CELL_W, CELL_H);
 }
 
-static void scroll(void)
+/* Up by `n` text rows. */
+static void scroll(uint32_t n)
 {
-    uint32_t line_bytes = CELL_H * con.pitch;
-    uint32_t used_rows = con.rows * CELL_H;
-    memcpy(con.base, con.base + line_bytes, (used_rows - CELL_H) * con.pitch);
-    fill_rect(0, used_rows - CELL_H, con.width, CELL_H, con.bg);
-    DAMAGE(0, 0, con.width, used_rows);
+    uint32_t line_bytes = n * CELL_H * con.pitch, at = con.top * con.pitch;
+    uint32_t used_rows = con.rows * CELL_H, keep = used_rows - n * CELL_H;
+    if (con.shadow) {       /* move the copy, then only write the frame buffer */
+        memmove(con.shadow + at, con.shadow + at + line_bytes, keep * con.pitch);
+        memcpy(con.base + at, con.shadow + at, keep * con.pitch);
+    } else {
+        memcpy(con.base + at, con.base + at + line_bytes, keep * con.pitch);
+    }
+    fill_rect(0, con.top + keep, con.width, n * CELL_H, con.bg);
+    DAMAGE(0, con.top, con.width, used_rows);
 }
 
+/* A tall screen (a phone's: 150 rows) scrolls a quarter at a time: each
+ * scroll rewrites the whole frame buffer, and one row at a time made a
+ * screenful of boot messages crawl. */
 static void newline(void)
 {
     con.cx = 0;
     if (++con.cy >= con.rows) {
-        scroll();
-        con.cy = con.rows - 1;
+        uint32_t n = con.rows > 60 ? con.rows / 4 : 1;
+        scroll(n);
+        con.cy = con.rows - n;
     }
 }
 
@@ -235,6 +278,7 @@ void fb_puts(const char *s)
 
 static long fb_dev_read(struct file *f, void *buf, size_t len)
 {
+    if (!raw_fb.base) return -ENODEV;
     uint64_t size = (uint64_t)raw_fb.pitch * raw_fb.height;
     if (f->pos >= size)
         return 0;
@@ -247,6 +291,7 @@ static long fb_dev_read(struct file *f, void *buf, size_t len)
 
 static long fb_dev_write(struct file *f, const void *buf, size_t len)
 {
+    if (!raw_fb.base) return -ENODEV;
     uint64_t size = (uint64_t)raw_fb.pitch * raw_fb.height;
     if (f->pos >= size)
         return 0;
@@ -262,7 +307,7 @@ void fb_mode_change(uint32_t width, uint32_t height, uint32_t pitch, uint64_t ma
     raw_fb.width = width; raw_fb.height = height; raw_fb.pitch = pitch;
     fb_map_len = map_len;
     con.width = width; con.height = height; con.pitch = pitch;
-    con.cols = width / CELL_W; con.rows = height / CELL_H;
+    con.cols = width / CELL_W; con.rows = (height - con.top) / CELL_H;
     if (con.cx >= con.cols) con.cx = 0;
     if (con.cy >= con.rows) con.cy = con.rows ? con.rows - 1 : 0;
     fb_mode_gen++;
@@ -277,6 +322,7 @@ static int fb_dev_poll(struct file *f, struct waitqueue **wq)
 
 static long fb_dev_ioctl(struct file *f, long req, uint64_t arg)
 {
+    if (!raw_fb.base) return -ENODEV;
     uint64_t size = fb_map_len ? fb_map_len : (uint64_t)raw_fb.pitch * raw_fb.height;
     switch (req) {
     case FBIOGET_FSCREENINFO: {
@@ -309,6 +355,7 @@ static long fb_dev_ioctl(struct file *f, long req, uint64_t arg)
         vinfo.blue.length = 8;
         vinfo.transp.offset = 24;
         vinfo.transp.length = 8;
+        vinfo.reserved[0] = fb_safe_top;
         memcpy((void *)arg, &vinfo, sizeof(vinfo));
         f->fb_gen = fb_mode_gen;        /* seen: no POLLPRI until the next change */
         return 0;
@@ -348,9 +395,16 @@ static long fb_dev_ioctl(struct file *f, long req, uint64_t arg)
     }
 }
 
+#ifdef PTE_WC
+#define FB_USER_CACHE PTE_WC
+#else
+#define FB_USER_CACHE (PTE_PCD | PTE_PWT)
+#endif
+
 static int fb_dev_mmap(struct file *f, uint64_t virt, size_t pages, uint64_t off, int prot)
 {
     (void)f; (void)prot;
+    if (!raw_fb.base) return -ENODEV;
     uint64_t size = PAGE_ALIGN_UP(fb_map_len ? fb_map_len : (uint64_t)raw_fb.pitch * raw_fb.height);
     if (off >= size || off + pages * PAGE_SIZE > size)
         return -EINVAL;
@@ -358,7 +412,7 @@ static int fb_dev_mmap(struct file *f, uint64_t virt, size_t pages, uint64_t off
     for (size_t i = 0; i < pages; i++) {
         uint64_t paddr = raw_fb.base + off + i * PAGE_SIZE;
         uint64_t vaddr = virt + i * PAGE_SIZE;
-        if (vmm_map_user_page(t->mm->pgd, vaddr, paddr, PTE_WRITE | PTE_DEV | (fb_in_ram ? 0 : PTE_PCD | PTE_PWT)) != 0)
+        if (vmm_map_user_page(t->mm->pgd, vaddr, paddr, PTE_WRITE | PTE_DEV | (fb_in_ram ? 0 : FB_USER_CACHE)) != 0)
             return -ENOMEM;
     }
     return 0;
