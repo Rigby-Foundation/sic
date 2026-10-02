@@ -21,6 +21,7 @@ int      vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags);   /* 4 KiB 
 uint64_t vmm_unmap_page(uint64_t virt);                                /* returns phys, 0 if unmapped */
 uint64_t vmm_translate(uint64_t virt);                                 /* phys or 0 */
 void    *vmm_map_mmio(uint64_t phys, size_t size);                     /* uncached, returns virt */
+void    *vmm_map_wc(uint64_t phys, size_t size);                       /* x86: write-combining (frame buffers) */
 void     vmm_flush_range(uint64_t virt, size_t pages);                 /* TLB shootdown on all CPUs */
 
 /* Per-process address spaces: a PML4 sharing the kernel's mappings plus

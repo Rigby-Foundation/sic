@@ -69,6 +69,10 @@ void cpu_init(struct cpu *c, uint32_t lapic_id)
     /* Kernel mode uses GS_BASE; user mode sees KERNEL_GS_BASE swapped in by swapgs. */
     wrmsr(MSR_GS_BASE, (uint64_t)c);
     wrmsr(MSR_KERNEL_GS_BASE, 0);
+
+    /* PAT: the power-on table with entry 1 (PWT alone) as write-combining
+     * instead of write-through, for frame buffers (PTE_WC). Every CPU the same. */
+    wrmsr(0x277, 0x0007040600070106ull);
 }
 
 struct cpu *cpu_current(void) { return this_cpu(); }

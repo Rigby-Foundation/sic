@@ -207,6 +207,20 @@ void *vmm_map_mmio(uint64_t phys, size_t size)
     return (void *)(virt + (phys - start));
 }
 
+/* Like vmm_map_mmio, but write-combining: frame buffers, where uncached
+ * writes one at a time are painfully slow. */
+void *vmm_map_wc(uint64_t phys, size_t size)
+{
+    uint64_t start = PAGE_ALIGN_DOWN(phys);
+    uint64_t end   = PAGE_ALIGN_UP(phys + size);
+    uint64_t virt  = __atomic_fetch_add(&mmio_next, end - start, __ATOMIC_SEQ_CST);
+
+    for (uint64_t p = start, v = virt; p < end; p += PAGE_SIZE, v += PAGE_SIZE)
+        if (vmm_map_page(v, p, PTE_WRITE | PTE_NX | PTE_WC | PTE_GLOBAL) != 0)
+            return NULL;
+    return (void *)(virt + (phys - start));
+}
+
 /* ---- TLB shootdown --------------------------------------------------------- */
 
 static spinlock_t shootdown_lock = SPINLOCK_INIT;

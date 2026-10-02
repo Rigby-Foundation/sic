@@ -34,6 +34,7 @@
 #define PTE_WRITE   (1UL << 1)
 #define PTE_USER    (1UL << 2)
 #define PTE_PWT     (1UL << 3)
+#define PTE_WC      PTE_PWT     /* PAT entry 1, reprogrammed to write-combining (cpu_init) */
 #define PTE_PCD     (1UL << 4)
 #define PTE_HUGE    (1UL << 7)
 #define PTE_GLOBAL  (1UL << 8)
