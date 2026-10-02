@@ -81,7 +81,11 @@ struct fat {
     uint32_t next_free;
     uint8_t *fat_cache;                  /* one sector */
     uint32_t fat_cache_sector;           /* absolute sector, 0 = none */
+    int fat_dirty;                       /* fat_cache changed, not yet on disk (only inside a batch) */
+    int batch;                           /* in a file write: FAT updates wait for its end */
+    int no_zero;                         /* the cluster being allocated is about to be written whole */
     uint8_t *sec;                        /* scratch sector */
+    uint8_t *zero;                       /* a cluster of zeroes */
 };
 
 /* Per-vnode: where the directory entry lives and the first cluster. */
@@ -90,7 +94,8 @@ struct fnode {
     uint32_t dirent_sector;              /* absolute sector holding the entry */
     uint32_t dirent_off;
     int fixed_root;                      /* FAT12/16 root: not a cluster chain */
-};
+    uint32_t hint_idx, hint_cluster;     /* the last place looked up in the chain (0 = none): */
+};                                       /* sequential access walks on from there, not from the start */
 
 static struct fat *fs_of(struct vnode *n) { return n->mnt->priv; }
 static struct fnode *fn_of(struct vnode *n) { return n->priv; }
@@ -112,10 +117,14 @@ static uint32_t cluster_sector(struct fat *fs, uint32_t cluster)
     return fs->data_start + (cluster - 2) * fs->sectors_per_cluster;
 }
 
+static int fat_sector_store(struct fat *fs);
+
 static int fat_sector_load(struct fat *fs, uint32_t sector)
 {
     if (fs->fat_cache_sector == sector)
         return 0;
+    if (fs->fat_dirty && fat_sector_store(fs) != 0)
+        return -1;
     if (read_sector(fs, sector, fs->fat_cache) != 0)
         return -1;
     fs->fat_cache_sector = sector;
@@ -124,10 +133,21 @@ static int fat_sector_load(struct fat *fs, uint32_t sector)
 
 static int fat_sector_store(struct fat *fs)
 {
+    fs->fat_dirty = 0;
     for (uint32_t i = 0; i < fs->fats; i++)
         if (write_sector(fs, fs->fat_cache_sector + i * fs->fat_sectors, fs->fat_cache) != 0)
             return -1;
     return 0;
+}
+
+/* A file write updates the FAT once at its end (and when it moves on to
+ * another FAT sector), not once per cluster: every update is a seek to the
+ * FAT and back on a spinning disk. */
+static void batch_begin(struct fat *fs) { fs->batch = 1; }
+static int batch_end(struct fat *fs)
+{
+    fs->batch = 0;
+    return fs->fat_dirty ? fat_sector_store(fs) : 0;
 }
 
 /* Read a FAT entry; returns 0xFFFFFFFF on error. Values >= eoc are chain ends. */
@@ -182,6 +202,7 @@ static int fat_set(struct fat *fs, uint32_t cluster, uint32_t value)
         uint32_t old = get_le32(fs->fat_cache + in);
         put_le32(fs->fat_cache + in, (old & 0xF0000000) | (value & 0x0FFFFFFF));
     }
+    if (fs->batch) { fs->fat_dirty = 1; return 0; }
     return fat_sector_store(fs);
 }
 
@@ -195,10 +216,8 @@ static uint32_t alloc_cluster(struct fat *fs)
             if (fat_set(fs, c, fs->eoc) != 0)
                 return 0;
             fs->next_free = c + 1;
-            uint8_t *zero = fs->sec;
-            memset(zero, 0, fs->sector_size);
-            for (uint32_t s = 0; s < fs->sectors_per_cluster; s++)
-                write_sector(fs, cluster_sector(fs, c) + s, zero);
+            if (!fs->no_zero)
+                fs->dev->write(fs->dev, cluster_sector(fs, c), fs->sectors_per_cluster, fs->zero);
             return c;
         }
     }
@@ -238,6 +257,20 @@ static uint32_t chain_walk(struct fat *fs, uint32_t first, uint32_t idx, int all
     return c;
 }
 
+/* chain_walk for a file or directory, resuming from where the last lookup
+ * ended when that is not past `idx`. */
+static uint32_t chain_at(struct fat *fs, struct fnode *fn, uint32_t idx, int alloc)
+{
+    uint32_t c;
+    if (fn->hint_cluster && fn->cluster && fn->hint_idx <= idx) {
+        c = chain_walk(fs, fn->hint_cluster, idx - fn->hint_idx, alloc, NULL);
+    } else {
+        c = chain_walk(fs, fn->cluster, idx, alloc, &fn->cluster);
+    }
+    if (c) { fn->hint_idx = idx; fn->hint_cluster = c; }
+    return c;
+}
+
 /* ---- directory entries ----------------------------------------------------------- */
 
 /* Iterate the sectors of a directory (fixed root or cluster chain). Returns
@@ -246,7 +279,7 @@ static uint32_t dir_sector(struct fat *fs, struct fnode *d, uint32_t i, int allo
 {
     if (d->fixed_root)
         return i < fs->root_sectors ? fs->root_start + i : 0;
-    uint32_t c = chain_walk(fs, d->cluster, i / fs->sectors_per_cluster, alloc, &d->cluster);
+    uint32_t c = chain_at(fs, d, i / fs->sectors_per_cluster, alloc);
     return c ? cluster_sector(fs, c) + i % fs->sectors_per_cluster : 0;
 }
 
@@ -504,6 +537,15 @@ static int fat_unlink(struct vnode *dir, struct vnode *n)
 
 /* ---- file data --------------------------------------------------------------------- */
 
+/* How many whole sectors from `in_cluster` (sector-aligned) to the end of
+ * the cluster fit in `left` bytes. */
+static uint32_t whole_sectors(struct fat *fs, uint32_t in_cluster, size_t left)
+{
+    uint32_t k = (fs->cluster_size - in_cluster) / fs->sector_size;
+    if (left / fs->sector_size < k) k = (uint32_t)(left / fs->sector_size);
+    return k;
+}
+
 static long fat_read(struct vnode *n, uint64_t pos, void *buf, size_t len)
 {
     struct fat *fs = fs_of(n);
@@ -514,13 +556,19 @@ static long fat_read(struct vnode *n, uint64_t pos, void *buf, size_t len)
     size_t done = 0;
     while (done < len) {
         uint64_t p = pos + done;
-        uint32_t c = chain_walk(fs, fn->cluster, (uint32_t)(p / fs->cluster_size), 0, NULL);
+        uint32_t c = chain_at(fs, fn, (uint32_t)(p / fs->cluster_size), 0);
         if (!c) break;
         uint32_t in_cluster = (uint32_t)(p % fs->cluster_size);
         uint32_t s = cluster_sector(fs, c) + in_cluster / fs->sector_size;
         uint32_t in_sec = in_cluster % fs->sector_size;
         size_t chunk = fs->sector_size - in_sec;
         if (chunk > len - done) chunk = len - done;
+        uint32_t whole = in_sec ? 0 : whole_sectors(fs, in_cluster, len - done);
+        if (whole) {                                    /* straight into the caller's buffer */
+            if (fs->dev->read(fs->dev, s, whole, (uint8_t *)buf + done) != 0) break;
+            done += (size_t)whole * fs->sector_size;
+            continue;
+        }
         if (read_sector(fs, s, sec) != 0) break;
         memcpy((uint8_t *)buf + done, sec + in_sec, chunk);
         done += chunk;
@@ -534,20 +582,30 @@ static long fat_write(struct vnode *n, uint64_t pos, const void *buf, size_t len
     struct fnode *fn = fn_of(n);
     uint8_t *sec = fs->sec;
     size_t done = 0;
+    batch_begin(fs);
     while (done < len) {
         uint64_t p = pos + done;
-        uint32_t c = chain_walk(fs, fn->cluster, (uint32_t)(p / fs->cluster_size), 1, &fn->cluster);
-        if (!c) break;
         uint32_t in_cluster = (uint32_t)(p % fs->cluster_size);
+        fs->no_zero = in_cluster == 0 && len - done >= fs->cluster_size;   /* all of a new cluster gets written */
+        uint32_t c = chain_at(fs, fn, (uint32_t)(p / fs->cluster_size), 1);
+        fs->no_zero = 0;
+        if (!c) break;
         uint32_t s = cluster_sector(fs, c) + in_cluster / fs->sector_size;
         uint32_t in_sec = in_cluster % fs->sector_size;
         size_t chunk = fs->sector_size - in_sec;
         if (chunk > len - done) chunk = len - done;
+        uint32_t whole = in_sec ? 0 : whole_sectors(fs, in_cluster, len - done);
+        if (whole) {                                    /* straight from the caller's buffer */
+            if (fs->dev->write(fs->dev, s, whole, (const uint8_t *)buf + done) != 0) break;
+            done += (size_t)whole * fs->sector_size;
+            continue;
+        }
         if (chunk != fs->sector_size && read_sector(fs, s, sec) != 0) break;
         memcpy(sec + in_sec, (const uint8_t *)buf + done, chunk);
         if (write_sector(fs, s, sec) != 0) break;
         done += chunk;
     }
+    if (batch_end(fs) != 0) done = 0;
     if (pos + done > n->size)
         n->size = pos + done;
     write_dirent(n);
@@ -560,6 +618,7 @@ static int fat_truncate(struct vnode *n, uint64_t size)
     struct fnode *fn = fn_of(n);
     free_chain(fs_of(n), fn->cluster);
     fn->cluster = 0;
+    fn->hint_cluster = 0;
     n->size = 0;
     return write_dirent(n);
 }
@@ -638,6 +697,8 @@ static struct vnode *fat_mount(struct vfs_mount *mnt, struct vnode *devnode, con
     fs->eoc = fs->type == 12 ? 0xFFF : fs->type == 16 ? 0xFFFF : 0x0FFFFFFF;
     fs->root_cluster = fs->type == 32 ? le32toh(b->root_cluster) : 0;
     fs->next_free = 2;
+    fs->zero = kzalloc(fs->cluster_size);
+    if (!fs->zero) goto bad;
     char label[12] = "";
     memcpy(label, fs->type == 32 ? b->label : (const char *)(fs->sec + 43), 11);
     for (int i = 10; i >= 0 && label[i] == ' '; i--) label[i] = '\0';
@@ -658,6 +719,7 @@ static struct vnode *fat_mount(struct vfs_mount *mnt, struct vnode *devnode, con
 bad:
     kfree(fs->sec);
     kfree(fs->fat_cache);
+    kfree(fs->zero);
     kfree(fs);
     return NULL;
 }
@@ -678,6 +740,7 @@ static int fat_unmount(struct vfs_mount *mnt)
     drop_tree(mnt->root);
     kfree(fs->sec);
     kfree(fs->fat_cache);
+    kfree(fs->zero);
     kfree(fs);
     return 0;
 }
