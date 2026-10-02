@@ -15,6 +15,9 @@
 #include "spinlock.h"
 #include "proc/futex.h"
 #include "asm/arch.h"
+#ifdef CONFIG_B44
+#include "drivers/b44.h"
+#endif
 
 #define STACK_PAGES 16      /* 64 KiB: filesystem code keeps 4 KiB blocks on the stack */
 #define TIME_SLICE  (TIMER_HZ / 100)     /* 10 ms */
@@ -183,6 +186,9 @@ static void idle_main(void *arg)
             heap_dump();
 #ifdef CONFIG_NET
             tcp_dump();
+#endif
+#ifdef CONFIG_B44
+            b44_dump();
 #endif
         }
         if (rq_head) {                      /* work came in meanwhile: no need to wait for a tick */

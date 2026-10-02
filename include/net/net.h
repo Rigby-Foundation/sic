@@ -61,6 +61,7 @@ struct netdev {
     int (*xmit)(struct netdev *d, struct pkt *p);   /* takes ownership of p */
     void (*poll)(struct netdev *d);                 /* drain received frames: net_rx() each */
     volatile int rx_pending;        /* set by the driver's IRQ handler */
+    int      poll_always;           /* poll on every netrx pass (20 ms), interrupt or not */
     void    *priv;
     uint64_t rx_packets, tx_packets, rx_bytes, tx_bytes, rx_dropped, tx_errors;
     struct netdev *next;

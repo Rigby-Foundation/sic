@@ -193,7 +193,7 @@ static void netrx_thread(void *arg)
         netrx_pending = 0;
         spin_lock(&net_lock);
         for (struct netdev *d = devs; d; d = d->next)
-            if (d->rx_pending && d->poll) {
+            if ((d->rx_pending || d->poll_always) && d->poll) {
                 d->rx_pending = 0;
                 d->poll(d);
             }
