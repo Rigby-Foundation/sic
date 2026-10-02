@@ -89,5 +89,8 @@ struct fb_var_screeninfo {
     uint32_t vmode;
     uint32_t rotate;
     uint32_t colorspace;
-    uint32_t reserved[4];
+    uint32_t reserved[4];   /* sic: reserved[0] = FB_SAFE_TOP */
 };
+/* sic: the rows at the top that something covers (a phone's camera
+ * cutout): what is drawn there may not be seen. */
+#define FB_SAFE_TOP(v) ((v)->reserved[0])
