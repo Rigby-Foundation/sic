@@ -1,7 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
 /* tmpfs: files live in kmalloc'd buffers, the directory tree is the vnode
- * cache itself. Also home of the USTAR initrd unpacker. */
+ * cache itself. Also home of the USTAR initrd unpacker: the files it makes
+ * read their bytes where they lie in the initrd (which stays in memory as
+ * /dev/initrd) until something writes to them, so a big initrd (a game
+ * bundled in) costs its size once, not twice. */
 #include "fs/vfs.h"
 #include "mm/heap.h"
 #include "string.h"
@@ -10,6 +13,7 @@
 struct tmpfs_file {
     uint8_t *data;
     size_t   cap;
+    int      borrowed;          /* data is the initrd's: copy before writing, never free */
 };
 
 static uint64_t next_ino = 1;
@@ -35,7 +39,7 @@ static int tmpfs_unlink(struct vnode *dir, struct vnode *n)
     (void)dir;
     if (n->type == VNODE_FILE && n->priv) {
         struct tmpfs_file *tf = n->priv;
-        kfree(tf->data);
+        if (!tf->borrowed) kfree(tf->data);
         kfree(tf);
     }
     return 0;
@@ -55,6 +59,16 @@ static long tmpfs_write(struct vnode *n, uint64_t pos, const void *buf, size_t l
 {
     struct tmpfs_file *tf = n->priv;
     size_t end = pos + len;
+    if (tf->borrowed) {                 /* the first write: a copy of our own */
+        size_t cap = n->size > end ? n->size : end;
+        uint8_t *d = kmalloc(cap ? cap : 64);
+        if (!d)
+            return -1;
+        memcpy(d, tf->data, n->size);
+        tf->data = d;
+        tf->cap = cap ? cap : 64;
+        tf->borrowed = 0;
+    }
     if (end > tf->cap) {
         size_t cap = tf->cap ? tf->cap : 64;
         while (cap < end)
@@ -196,8 +210,14 @@ void vfs_load_tar(const void *tar, size_t size)
             dirs++;
         } else if (h->typeflag == '0' || h->typeflag == '\0') {
             struct vnode *n = vfs_create(vfs_root(), tmp, VNODE_FILE);
-            if (n && fsize)
-                tmpfs_write(n, 0, data, fsize);
+            if (n && fsize && n->priv) {
+                struct tmpfs_file *tf = n->priv;
+                if (!tf->borrowed) kfree(tf->data);
+                tf->data = (uint8_t *)data;
+                tf->cap = 0;
+                tf->borrowed = 1;
+                n->size = fsize;
+            }
             files++;
         }
     }
