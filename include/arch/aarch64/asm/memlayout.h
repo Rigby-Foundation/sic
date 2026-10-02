@@ -39,8 +39,9 @@
 #define PTE_PRESENT (1UL << 0)
 #define PTE_WRITE   (1UL << 1)
 #define PTE_USER    (1UL << 2)
-#define PTE_PWT     (1UL << 3)      /* write-through: treated as device */
+#define PTE_PWT     (1UL << 3)      /* alone: normal non-cacheable (a frame buffer); with PTE_PCD: device */
 #define PTE_PCD     (1UL << 4)      /* cache disabled: device memory */
+#define PTE_WC      PTE_PWT         /* write-combining: normal non-cacheable (unaligned stores allowed) */
 #define PTE_HUGE    (1UL << 7)      /* a block descriptor (2 MiB / 1 GiB) */
 #define PTE_GLOBAL  (1UL << 8)      /* unused: the kernel half is global by construction */
 #define PTE_DEV     (1UL << 9)      /* device page: never freed, never copied */

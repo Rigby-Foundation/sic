@@ -18,9 +18,8 @@ static struct mouse_event ring[RING];
 static volatile uint32_t rhead, rtail;
 static spinlock_t lock = SPINLOCK_INIT;
 static struct waitqueue readers = WAITQUEUE_INIT;
-void mouse_push(int dx, int dy, unsigned buttons)
+static void push(struct mouse_event e)
 {
-    struct mouse_event e = { (int16_t)dx, (int16_t)dy, (uint8_t)buttons, 0 };
     uint64_t fl = spin_lock_irqsave(&lock);
     if (rhead - rtail < RING) {
         ring[rhead % RING] = e;
@@ -28,6 +27,16 @@ void mouse_push(int dx, int dy, unsigned buttons)
     }
     spin_unlock_irqrestore(&lock, fl);
     waitqueue_wake_all(&readers);
+}
+
+void mouse_push(int dx, int dy, unsigned buttons)
+{
+    push((struct mouse_event){ (int16_t)dx, (int16_t)dy, (uint16_t)buttons, 0 });
+}
+
+void mouse_push_abs(int x, int y, unsigned buttons)
+{
+    push((struct mouse_event){ (int16_t)x, (int16_t)y, (uint16_t)buttons, MOUSE_ABSOLUTE });
 }
 
 #ifdef __x86_64__

@@ -11,10 +11,11 @@
 #endif
 
 struct mouse_event {
-    int16_t  dx, dy;            /* relative motion; y grows downwards */
+    int16_t  dx, dy;            /* relative motion; y grows downwards (MOUSE_ABSOLUTE: a screen position) */
     uint16_t buttons;           /* MOUSE_BTN_* held after this report */
-    uint16_t pad;
+    uint16_t flags;
 };
+#define MOUSE_ABSOLUTE   1      /* dx, dy are where the pointer is, in pixels (a touchscreen) */
 #define MOUSE_BTN_LEFT   1
 #define MOUSE_BTN_RIGHT  2
 #define MOUSE_BTN_MIDDLE 4
