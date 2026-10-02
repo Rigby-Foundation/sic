@@ -16,6 +16,7 @@
 #include "mm/pmm.h"
 #include "proc/wait.h"
 #include "proc/signal.h"
+#include "proc/syscall.h"
 
 EXPORT_SYMBOL(kprintf);
 EXPORT_SYMBOL(kputc);
@@ -53,6 +54,8 @@ EXPORT_SYMBOL(irq_mask);
 EXPORT_SYMBOL(irq_unmask);
 #ifdef CONFIG_PCI
 EXPORT_SYMBOL(pci_find_class);
+EXPORT_SYMBOL(pci_count);
+EXPORT_SYMBOL(pci_get);
 EXPORT_SYMBOL(pci_read32);
 EXPORT_SYMBOL(pci_write32);
 EXPORT_SYMBOL(pci_enable_busmaster);
@@ -66,6 +69,12 @@ EXPORT_SYMBOL(__wait_remove);
 EXPORT_SYMBOL(task_block);
 EXPORT_SYMBOL(task_wake);
 EXPORT_SYMBOL(vmm_map_mmio);
+EXPORT_SYMBOL(vmm_map_user_page);
+#ifdef __x86_64__
+EXPORT_SYMBOL(vmm_map_wc);
+#endif
+EXPORT_SYMBOL(user_ok);
+EXPORT_SYMBOL(vfs_read_all);
 EXPORT_SYMBOL(pmm_alloc_page);
 EXPORT_SYMBOL(pmm_free_page);
 EXPORT_SYMBOL(module_load);
