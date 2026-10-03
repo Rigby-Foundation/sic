@@ -187,8 +187,11 @@ static void scan_partitions(struct blkdev *disk)
         return;
     uint8_t *sec = kmalloc(ss);
     if (!sec) return;
-    if (disk->read(disk, 0, 1, sec) != 0 || sec[510] != 0x55 || sec[511] != 0xAA)
+    if (disk->read(disk, 0, 1, sec) != 0) { kprintf("blk: %s: sector 0 does not read\n", disk->name); goto out; }
+    if (sec[510] != 0x55 || sec[511] != 0xAA) {
+        kprintf("blk: %s: no partition table (sector 0 ends %02x%02x, starts %02x%02x%02x%02x)\n", disk->name, sec[510], sec[511], sec[0], sec[1], sec[2], sec[3]);
         goto out;
+    }
 
     /* GPT: a protective MBR (type 0xEE) and a valid header at LBA 1. */
     int gpt = 0;
@@ -196,15 +199,21 @@ static void scan_partitions(struct blkdev *disk)
         if (sec[446 + i * 16 + 4] == 0xEE) gpt = 1;
     if (gpt) {
         struct gpt_header h;
-        if (disk->read(disk, 1, 1, sec) != 0) goto out;
+        if (disk->read(disk, 1, 1, sec) != 0) { kprintf("blk: %s: the GPT header does not read\n", disk->name); goto out; }
         memcpy(&h, sec, sizeof(h));
         uint32_t entry_size = le32toh(h.entry_size), entry_count = le32toh(h.entry_count);
         uint64_t entries_lba = le64toh(h.entries_lba);
-        if (memcmp(h.sig, "EFI PART", 8) != 0 || entry_size < sizeof(struct gpt_entry)) goto out;
+        if (memcmp(h.sig, "EFI PART", 8) != 0 || entry_size < sizeof(struct gpt_entry)) {
+            kprintf("blk: %s: protective MBR, but no GPT header at sector 1 (entry size %u)\n", disk->name, entry_size);
+            goto out;
+        }
         uint32_t per_sector = ss / entry_size;
         int index = 1;
         for (uint32_t i = 0; i < entry_count && i < 128; i++) {
-            if (i % per_sector == 0 && disk->read(disk, entries_lba + i / per_sector, 1, sec) != 0) break;
+            if (i % per_sector == 0 && disk->read(disk, entries_lba + i / per_sector, 1, sec) != 0) {
+                kprintf("blk: %s: GPT entries at sector %llu do not read\n", disk->name, entries_lba + i / per_sector);
+                break;
+            }
             struct gpt_entry *e = (void *)(sec + (i % per_sector) * entry_size);
             int empty = 1;
             for (int k = 0; k < 16; k++) if (e->type[k]) empty = 0;

@@ -176,8 +176,11 @@ static int lu_rw(struct blkdev *d, uint64_t lba, uint32_t count, void *buf, int 
         uint8_t cdb[16] = { write ? 0x8a : 0x88 };                 /* READ(16) / WRITE(16) */
         for (int i = 0; i < 8; i++) cdb[2 + i] = (uint8_t)(lba >> (56 - 8 * i));
         cdb[10] = (uint8_t)(n >> 24); cdb[11] = (uint8_t)(n >> 16); cdb[12] = (uint8_t)(n >> 8); cdb[13] = (uint8_t)n;
-        if (write) memcpy(u->buf, buf, bytes);
-        int st = scsi(u, lun, cdb, 16, bytes, write ? 1 : 2);
+        int st = -1;
+        for (int t = 0; t < 3 && st != 0; t++) {                   /* a unit attention (check condition) first, maybe */
+            if (write) memcpy(u->buf, buf, bytes);
+            st = scsi(u, lun, cdb, 16, bytes, write ? 1 : 2);
+        }
         if (st != 0) { kprintf("ufs: %s of %u blocks at %llu on LUN %u failed (%d)\n", write ? "write" : "read", n, lba, lun, st); rc = -1; break; }
         if (!write) memcpy(buf, u->buf, bytes);
         buf = (uint8_t *)buf + bytes; lba += n; count -= n;
