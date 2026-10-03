@@ -33,7 +33,7 @@ static uint16_t rd16(uint64_t off) { uint32_t v = rd32(off & ~3ull); return (uin
 #define HDR_VERSION(i)  (0x40 + 4 * (i))
 #define HDR_TOC(i)      (0xd0 + 16 * (i))
 #define PTABLE          (smem_size - 4096)
-#define PT_ENTRY(i)     (PTABLE + 32 + 40 * (i))  /* offset, size, flags, host0:16 host1:16, cacheline, reserved[7] */
+#define PT_ENTRY(i)     (PTABLE + 32 + 48 * (i))  /* offset, size, flags, host0:16 host1:16, cacheline, reserved[7]: 48 bytes */
 
 static int ptable_entries(void)
 {
