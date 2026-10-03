@@ -160,6 +160,12 @@ void vfs_init(void)
 #ifdef CONFIG_FAT
     vfs_register_fs(&fat_type);
 #endif
+#ifdef CONFIG_EXT4
+    extern struct fs_type ext4_type, ext3_type, ext2_type;
+    vfs_register_fs(&ext4_type);
+    vfs_register_fs(&ext3_type);
+    vfs_register_fs(&ext2_type);
+#endif
     root_mount.type = &tmpfs_type;
     root = tmpfs_type.mount(&root_mount, NULL, NULL);
     root_mount.root = root;

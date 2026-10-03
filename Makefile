@@ -56,6 +56,7 @@ CONFIG_B44        := $(call cfg,CONFIG_B44)
 CONFIG_HDA        := $(call cfg,CONFIG_HDA)
 CONFIG_ZAEFS      := $(call cfg,CONFIG_ZAEFS)
 CONFIG_FAT        := $(call cfg,CONFIG_FAT)
+CONFIG_EXT4       := $(call cfg,CONFIG_EXT4)
 CONFIG_MODULES    := $(call cfg,CONFIG_MODULES)
 CONFIG_SIGNALS    := $(call cfg,CONFIG_SIGNALS)
 CONFIG_PIPES      := $(call cfg,CONFIG_PIPES)
@@ -78,7 +79,7 @@ OPTIONAL := kernel/arch/x86_64/smp.c kernel/arch/x86_64/ap_trampoline.S kernel/a
             kernel/drivers/fb.c kernel/drivers/font.c kernel/drivers/serial.c kernel/drivers/keyboard.c kernel/drivers/mouse.c \
             kernel/drivers/pci.c kernel/drivers/nvme.c kernel/drivers/ufs.c kernel/arch/aarch64/qcom_ufs.c kernel/drivers/ahci.c kernel/drivers/ide.c \
             kernel/drivers/virtio.c kernel/drivers/virtio_gpu.c kernel/drivers/virtio_input.c kernel/drivers/radeon.c \
-            kernel/fs/zaefs.c kernel/fs/fat.c \
+            kernel/fs/zaefs.c kernel/fs/fat.c kernel/fs/ext4.c \
             kernel/net/core.c kernel/net/arp.c kernel/net/ip.c kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c kernel/net/unix.c \
             kernel/drivers/e1000.c kernel/drivers/b44.c kernel/drivers/radeon_cp.c kernel/drivers/hda.c kernel/drivers/dsp.c \
             kernel/core/module.c kernel/core/ksyms.c kernel/proc/signal.c kernel/fs/pipe.c \
@@ -104,6 +105,7 @@ SRC-$(CONFIG_B44)        += kernel/drivers/b44.c
 SRC-$(CONFIG_HDA)        += kernel/drivers/hda.c kernel/drivers/dsp.c
 SRC-$(CONFIG_ZAEFS)      += kernel/fs/zaefs.c
 SRC-$(CONFIG_FAT)        += kernel/fs/fat.c
+SRC-$(CONFIG_EXT4)       += kernel/fs/ext4.c
 SRC-$(CONFIG_MODULES)    += kernel/core/module.c kernel/core/ksyms.c kernel/arch/$(ARCH)/module.c
 SRC-$(CONFIG_SIGNALS)    += kernel/proc/signal.c
 SRC-$(CONFIG_PIPES)      += kernel/fs/pipe.c

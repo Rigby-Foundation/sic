@@ -19,6 +19,7 @@ CONFIG_NET=y
 CONFIG_E1000=y
 CONFIG_ZAEFS=y
 CONFIG_FAT=y
+CONFIG_EXT4=y             # ext4: what a phone recovery formats Data and SD cards with
 CONFIG_MODULES=y
 CONFIG_SIGNALS=y
 CONFIG_PIPES=y

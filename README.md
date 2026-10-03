@@ -4,8 +4,8 @@ sic is a monolithic kernel written in C for x86_64 and 32-bit big-endian
 PowerPC (G4 PowerMacs): SMP, preemptive scheduling of
 processes and threads, POSIX signals and pipes, sound (Intel HD Audio,
 `/dev/dsp`), a VFS with tmpfs, its own
-on-disk filesystem (zaefs) and FAT, NVMe/AHCI/IDE disks with GPT and MBR
-partitions (`scripts/mkzaefs.py` builds a zaefs image on the host), an IPv4
+on-disk filesystem (zaefs), FAT and ext2/3/4, NVMe/AHCI/IDE/UFS disks with GPT and MBR
+partitions (GPT ones also as `/dev/by-name/<label>`; `scripts/mkzaefs.py` builds a zaefs image on the host), an IPv4
 network stack (Ethernet, ARP, ICMP, UDP, TCP, BSD sockets, AF_UNIX stream sockets,
 Intel e1000 driver), loadable modules, and a framebuffer/serial console. On
 x86_64 it runs on real hardware, booted by zaeboot from UEFI or legacy BIOS;
@@ -92,9 +92,9 @@ submission to the host GPU for [zgl](../zgl)), Radeon Xpress IGPs (the
 panel's mode, and `/dev/radeongpu`: their 3D engine for zgl, with
 checked command streams; AMD's microcode in `firmware/`), Intel HD Audio (`/dev/dsp`:
 OSS-style playback, 48 kHz 16-bit stereo, `beep` to try it; `/dev/mixer` the volume;
-`/proc/hda` the codec's widgets and raw verbs), the NVMe/AHCI (SATA)/IDE (legacy and PCI native)
-disk drivers, the network stack and the e1000 and Broadcom 440x NIC drivers, the zaefs and FAT
-filesystems, loadable modules, signals, pipes, and the boot-time self tests.
+`/proc/hda` the codec's widgets and raw verbs), the NVMe/AHCI (SATA)/IDE (legacy and PCI native)/UFS
+disk drivers, the network stack and the e1000 and Broadcom 440x NIC drivers, the zaefs, FAT and ext4
+(read/write: extents, htree, metadata checksums; no journal replay) filesystems, loadable modules, signals, pipes, and the boot-time self tests.
 
 ```bash
 make defconfig            # copy it to .config, then edit .config

@@ -34,6 +34,7 @@ CONFIG_B44=y            # Broadcom 440x 10/100 Ethernet (Dell Vostro 1000 and co
 # --- filesystems (tmpfs is always built: it is the root) --------------------
 CONFIG_ZAEFS=y          # sic's own on-disk filesystem
 CONFIG_FAT=y            # FAT12/16/32 (read/write, 8.3 + long names read-only)
+CONFIG_EXT4=y           # ext2/3/4 read/write (extents, htree, metadata_csum; no journal replay)
 
 # --- kernel features --------------------------------------------------------
 CONFIG_MODULES=y        # loadable kernel modules (init_module & co.)
