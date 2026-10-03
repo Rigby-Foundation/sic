@@ -10,6 +10,7 @@
  * volume keys are the up and down arrows. */
 #include "asm/fdt.h"
 #include "asm/memlayout.h"
+#include "asm/timer.h"
 #include "drivers/keyboard.h"
 #include "abi/fb.h"
 #include "proc/sched.h"
@@ -102,6 +103,21 @@ static void press(int key, int down)
     }
 }
 
+/* Both volume keys held: the screen back to the console, and on it (and
+ * the USB console) every task with where it waits, the heap and the GPU.
+ * The task dump comes from an idle loop: if it never shows, the CPUs are
+ * stuck themselves. */
+static void hang_report(void)
+{
+    extern void fb_force_text(void);
+    extern void sched_dump_request(void);
+    extern void qcom_gpu_dump(void);
+    fb_force_text();
+    kprintf("=== volume up + down: hang report at %llu ms ===\n", timer_ms());
+    qcom_gpu_dump();
+    sched_dump_request();
+}
+
 static int sample(int key)
 {
     uint8_t v;
@@ -125,6 +141,9 @@ static void keys_thread(void *arg)
             }
             last[k] = now;
         }
+        static int combo;                                       /* both volume keys: what is everyone doing? */
+        if (state[1] && state[2] && !combo) { combo = 1; hang_report(); }
+        if (!state[1] && !state[2]) combo = 0;
     }
 }
 

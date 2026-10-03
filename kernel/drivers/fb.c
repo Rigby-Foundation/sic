@@ -20,6 +20,14 @@ static struct file *kd_owner;       /* the fd that set KD_GRAPHICS */
 int fb_have_framebuffer(void) { return raw_fb.base != 0; }
 
 
+/* A hang report: the console draws again, whoever had the screen. */
+void fb_force_text(void)
+{
+    kd_mode = KD_TEXT;
+    kd_owner = NULL;
+    fb_clear();
+}
+
 int fb_is_graphics_mode(void)
 {
     return kd_mode == KD_GRAPHICS;

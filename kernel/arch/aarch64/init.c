@@ -21,6 +21,8 @@ void cpu_set_kernel_stack(uint64_t sp)
     this_cpu()->kernel_sp = sp;
 }
 
+int aarch64_idle_poll;
+
 void arch_cpu_init_boot(void)
 {
     /* The vectors, the per-CPU block and the MMU were set up in head.S. */
@@ -47,6 +49,11 @@ void arch_cpu_init_boot(void)
 
 void arch_init_interrupts(const struct zaeboot_info *info)
 {
+    {
+        int chosen = fdt_path("/chosen");
+        const char *args = chosen >= 0 ? fdt_prop(chosen, "bootargs", NULL) : NULL;
+        if (args && strstr(args, "idle=poll")) { aarch64_idle_poll = 1; kprintf("idle: polling, no wfi (idle=poll)\n"); }
+    }
     (void)info;
     gic_init();
     timer_init();

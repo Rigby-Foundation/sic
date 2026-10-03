@@ -18,6 +18,7 @@ void fb_mode_change(uint32_t width, uint32_t height, uint32_t pitch, uint64_t ma
 void fb_init_text(void);        /* 80x25 VGA text at 0xB8000 instead (BIOS boot, no VBE mode) */
 void fb_set_color(uint32_t fg, uint32_t bg);   /* 0xRRGGBB */
 void fb_clear(void);
+void fb_force_text(void);       /* out of graphics mode, for a hang report */
 void fb_putc(char c);
 void fb_puts(const char *s);
 

@@ -918,6 +918,13 @@ static size_t make_report(void)
     return n;
 }
 
+void qcom_gpu_dump(void)
+{
+    if (!gpu) return;
+    make_report();
+    kputs(report);
+}
+
 static long adreno_dev_read(struct file *f, void *buf, size_t len)
 {
     size_t n = make_report();
