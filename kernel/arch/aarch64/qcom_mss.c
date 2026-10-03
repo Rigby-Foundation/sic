@@ -328,6 +328,20 @@ static long mss_read(struct file *f, void *buf, size_t len)
     return (long)len;
 }
 
+/* Start the modem (in a thread: it takes a few seconds); -EBUSY if it
+ * runs or is starting. */
+int qcom_mss_start(void)
+{
+    if (strcmp(state, "running") == 0) return -EBUSY;
+    if (!present) { ksnprintf(state, sizeof state, "no modem here"); return -ENODEV; }
+    if (__atomic_exchange_n(&busy, 1, __ATOMIC_SEQ_CST)) return -EBUSY;
+    ksnprintf(state, sizeof state, "starting");
+    task_create("mss-start", start_thread, NULL);
+    return 0;
+}
+
+const char *qcom_mss_state(void) { return state; }
+
 static long mss_write(struct file *f, const void *buf, size_t len)
 {
     (void)f;
@@ -340,14 +354,8 @@ static long mss_write(struct file *f, const void *buf, size_t len)
         busy = 0;
         return (long)len;
     }
-    if (strcmp(cmd, "start") == 0) {
-        if (strcmp(state, "running") == 0) { busy = 0; return -EBUSY; }
-        if (!present) { ksnprintf(state, sizeof state, "no modem here"); busy = 0; return -ENODEV; }
-        ksnprintf(state, sizeof state, "starting");
-        task_create("mss-start", start_thread, NULL);
-        return (long)len;
-    }
     busy = 0;
+    if (strcmp(cmd, "start") == 0) { int rc = qcom_mss_start(); return rc ? rc : (long)len; }
     return -EINVAL;
 }
 
@@ -378,5 +386,6 @@ void qcom_mss_init(void)
     present = region && region_size && meta_phys && !(meta_phys & (PAGE_SIZE - 1));
     vfs_mkdev("/dev/mss", &mss_ops, NULL);
     qcom_ipc_init();
+    if (n >= 0) qcom_wlan_init();                           /* a phone's: zde's Wi-Fi */
     kprintf("mss: modem_region %lx+%lx%s\n", (unsigned long)region, (unsigned long)region_size, present ? "" : " (incomplete: it cannot start)");
 }

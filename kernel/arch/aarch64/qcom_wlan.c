@@ -250,3 +250,73 @@ size_t qcom_wlan_report(char *buf, size_t len)
         n += (size_t)ksnprintf(buf + n, len - n, "  MSA region %lx+%x%s\n", (unsigned long)regions[i].addr, regions[i].size, regions[i].secure ? " (secure)" : "");
     return n;
 }
+
+/* ---- /dev/wlan: what zwifi (zde) reads and writes ------------------------------------------- */
+/* Read: "state off|starting|ready|failed", "detail <text>", then a
+ * "net <dBm> <secure> <ssid>" line per network once scanning exists.
+ * Write: "on" (start the modem and the WLAN firmware), "scan",
+ * "connect\t<ssid>\t<passphrase>", "disconnect": the last three answer
+ * EOPNOTSUPP until the radio can be turned on (the copy engines). */
+#include "abi/abi.h"
+
+static char note[96];                       /* the answer to the last command that did not happen */
+static char wreport[1024];
+
+static size_t wlan_status(void)
+{
+    const char *ms = qcom_mss_state(), *word, *detail;
+    char d[160];
+    int64_t bits = qcom_smp2p_in("slave-kernel");
+    if (bits >= 0 && (bits & 1)) { word = "failed"; detail = "the modem crashed (cat /dev/mss for why)"; }
+    else if (!strcmp(ms, "stopped") || !memcmp(ms, "image ok", 8) || !strcmp(ms, "no modem here")) {
+        word = "off"; detail = strcmp(ms, "no modem here") ? "the Wi-Fi is off" : "no modem on this machine";
+    } else if (!strcmp(ms, "starting") || !memcmp(ms, "loading", 7) || !strcmp(ms, "authenticating")) {
+        word = "starting"; ksnprintf(d, sizeof d, "the modem: %s", ms); detail = d;
+    } else if (!strcmp(ms, "running")) {
+        if (st == S_FW_READY) { word = "ready"; detail = "the WLAN firmware is ready; scanning is not written yet"; }
+        else if (st == S_FAILED) { word = "failed"; ksnprintf(d, sizeof d, "the WLAN firmware: %s", why); detail = d; }
+        else { word = "starting"; ksnprintf(d, sizeof d, "the WLAN firmware: %s", names[st]); detail = d; }
+    } else { word = "failed"; ksnprintf(d, sizeof d, "the modem: %s", ms); detail = d; }
+    size_t n = (size_t)ksnprintf(wreport, sizeof wreport, "state %s\ndetail %s\n", word, detail);
+    if (note[0] && n < sizeof wreport) n += (size_t)ksnprintf(wreport + n, sizeof wreport - n, "note %s\n", note);
+    if (chip_id != 0xff && n < sizeof wreport)
+        n += (size_t)ksnprintf(wreport + n, sizeof wreport - n, "chip %x board %x firmware %x %s\n", chip_id, board_id, fw_version, build);
+    return n;
+}
+
+static long wlan_read(struct file *f, void *buf, size_t len)
+{
+    if (f->pos == 0) wlan_status();
+    size_t n = strlen(wreport);
+    if (f->pos >= n) return 0;
+    if (len > n - f->pos) len = n - f->pos;
+    memcpy(buf, wreport + f->pos, len);
+    f->pos += len;
+    return (long)len;
+}
+
+static long wlan_write(struct file *f, const void *buf, size_t len)
+{
+    (void)f;
+    char cmd[16] = { 0 };
+    size_t i = 0;
+    for (; i < len && i < sizeof cmd - 1; i++) {
+        char ch = ((const char *)buf)[i];
+        if (ch == '\n' || ch == '\t' || ch == ' ') break;
+        cmd[i] = ch;
+    }
+    if (!strcmp(cmd, "on")) {
+        note[0] = 0;
+        int rc = qcom_mss_start();
+        return rc && rc != -EBUSY ? rc : (long)len;
+    }
+    if (!strcmp(cmd, "scan") || !strcmp(cmd, "connect") || !strcmp(cmd, "disconnect") || !strcmp(cmd, "off")) {
+        ksnprintf(note, sizeof note, "'%s' is not written yet: the radio cannot be turned on yet", cmd);
+        return -EOPNOTSUPP;
+    }
+    return -EINVAL;
+}
+
+static const struct dev_ops wlan_ops = { .read = wlan_read, .write = wlan_write };
+
+void qcom_wlan_init(void) { vfs_mkdev("/dev/wlan", &wlan_ops, NULL); }
