@@ -106,7 +106,7 @@ static int link_version;                    /* 1 once the modem acknowledged our
 
 #define MAX_INTENTS 16
 struct intent { uint32_t id, size, used; uint8_t *buf; };
-struct pending { struct pending *next; size_t len; uint8_t data[]; };
+struct pending { struct pending *next; size_t len, off; uint32_t iid; int has_intent; uint8_t data[]; };
 
 struct chan {
     char name[32];
@@ -264,25 +264,29 @@ static void open_local(struct chan *c)
     for (int i = 0; i < 200 && tx(m, 8 + ((n + 7) & ~(size_t)7), NULL, 0); i++) task_sleep_ms(1);
 }
 
-/* Data for a channel: into one of its intents (the smallest that fits);
- * queued until the modem offers one, asked for if none would do. */
-static int chan_try_send(struct chan *c, const uint8_t *data, size_t len)
+/* Data for a channel: into one of its intents (the smallest that fits;
+ * asked for if none would do), in pieces of at most 8 KiB as the FIFO
+ * has room (TX_DATA, then TX_DATA_CONT), as Linux's __qcom_glink_send. A
+ * message picks up where it stopped the next time round. */
+static int chan_try_send(struct chan *c, struct pending *p)
 {
-    struct intent *best = NULL;
-    for (int i = 0; i < c->ntheirs; i++)
-        if (!c->theirs[i].used && c->theirs[i].size >= len && (!best || c->theirs[i].size < best->size)) best = &c->theirs[i];
-    if (!best) {
-        if (!c->intent_asked) { tx_cmd(CMD_RX_INTENT_REQ, c->lcid, (uint32_t)len); c->intent_asked = 1; }
-        return -1;
+    if (!p->has_intent) {
+        struct intent *best = NULL;
+        for (int i = 0; i < c->ntheirs; i++)
+            if (!c->theirs[i].used && c->theirs[i].size >= p->len && (!best || c->theirs[i].size < best->size)) best = &c->theirs[i];
+        if (!best) {
+            if (!c->intent_asked) { tx_cmd(CMD_RX_INTENT_REQ, c->lcid, (uint32_t)p->len); c->intent_asked = 1; }
+            return -1;
+        }
+        best->used = 1;
+        p->iid = best->id;
+        p->has_intent = 1;
     }
-    size_t chunks = (len + 8191) / 8192;
-    if (tx_avail() < len + 24 * chunks + 8) return -1;
-    best->used = 1;
-    for (size_t off = 0; off < len; ) {
-        size_t n = len - off > 8192 ? 8192 : len - off;
-        uint32_t h[4] = { (off ? CMD_TX_DATA_CONT : CMD_TX_DATA) | (uint32_t)c->lcid << 16, best->id, (uint32_t)n, (uint32_t)(len - off - n) };
-        while (tx(h, 16, data + off, n)) task_sleep_ms(1);
-        off += n;
+    while (p->off < p->len) {
+        size_t n = p->len - p->off > 8192 ? 8192 : p->len - p->off;
+        uint32_t h[4] = { (p->off ? CMD_TX_DATA_CONT : CMD_TX_DATA) | (uint32_t)c->lcid << 16, p->iid, (uint32_t)n, (uint32_t)(p->len - p->off - n) };
+        if (tx(h, 16, p->data + p->off, n)) return -1;          /* no room yet */
+        p->off += n;
     }
     c->tx_count++;
     return 0;
@@ -291,14 +295,19 @@ static int chan_try_send(struct chan *c, const uint8_t *data, size_t len)
 int glink_send(struct chan *c, const void *data, size_t len)
 {
     if (!c->up) return -1;
-    if (!c->queue && chan_try_send(c, data, len) == 0) return 0;
     struct pending *p = kmalloc(sizeof *p + len);
     if (!p) return -1;
-    p->next = NULL; p->len = len;
+    memset(p, 0, sizeof *p);
+    p->len = len;
     memcpy(p->data, data, len);
     struct pending **pp = &c->queue;
     while (*pp) pp = &(*pp)->next;
     *pp = p;
+    while (c->queue && chan_try_send(c, c->queue) == 0) {   /* now, if it can go now */
+        struct pending *q = c->queue;
+        c->queue = q->next;
+        kfree(q);
+    }
     return 0;
 }
 
@@ -306,7 +315,7 @@ static void flush_queues(void)
 {
     for (int i = 0; i < nchans; i++) {
         struct chan *c = &chans[i];
-        while (c->up && c->queue && chan_try_send(c, c->queue->data, c->queue->len) == 0) {
+        while (c->up && c->queue && chan_try_send(c, c->queue) == 0) {
             struct pending *p = c->queue;
             c->queue = p->next;
             kfree(p);

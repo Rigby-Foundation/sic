@@ -15,7 +15,7 @@
 #define TFTP_SERVICE    4096
 #define TFTP_PORT       0x400
 #define FW_DIR          "/mnt/modem/image/"
-#define MAX_BLKSIZE     8192                    /* what fits the GLINK FIFO easily; RFC 2348 lets us cut it */
+#define MAX_BLKSIZE     65464                   /* RFC 2348's; GLINK sends it in pieces */
 
 enum { OP_RRQ = 1, OP_WRQ, OP_DATA, OP_ACK, OP_ERROR, OP_OACK };
 enum { ERR_UNDEF = 0, ERR_ENOENT = 1, ERR_EBADOP = 4, ERR_EOPTNEG = 8, ERR_END_OF_TRANSFER = 9 };
@@ -30,7 +30,7 @@ struct xfer {
     char path[96];
     struct file *f;                             /* a read from the partition */
     int rwi;                                    /* or a /readwrite file */
-    size_t blksize, wsize, rsize, seek, size;
+    size_t blksize, wsize, rsize, seek, size, timeoutms, sent;
     int done;
 };
 #define MAX_XFERS 8
@@ -110,6 +110,7 @@ static void send_blocks(struct xfer *x, unsigned last)
         }
         put16(b, OP_DATA); put16(b + 2, k & 0xffff);
         qrtr_sendto(x->port, x->node, x->rport, b, 4 + n);
+        x->sent += n;
         if (n < x->blksize) x->done = 1;
     }
     kfree(b);
@@ -152,6 +153,7 @@ static void request(uint32_t node, uint32_t port, const uint8_t *d, size_t len, 
         else if (!strcmp(o, "rsize")) x->rsize = n;
         else if (!strcmp(o, "seek")) x->seek = n;
         else if (!strcmp(o, "tsize")) want_tsize = 1;
+        else if (!strcmp(o, "timeoutms")) x->timeoutms = n;
         o = v + str_nlen(v, (size_t)(end - v)) + 1;
     }
 
@@ -175,6 +177,8 @@ static void request(uint32_t node, uint32_t port, const uint8_t *d, size_t len, 
         return;
     }
     if (write) n_writes++; else n_reads++;
+    kprintf("tftp: %s %s (%lu bytes): blksize %lu wsize %lu rsize %lu seek %lu%s\n", write ? "write" : "read", path, (unsigned long)x->size,
+            (unsigned long)x->blksize, (unsigned long)x->wsize, (unsigned long)x->rsize, (unsigned long)x->seek, has_opts ? "" : " (no options)");
     ksnprintf(last_files[last_n++ % 4], sizeof last_files[0], "%s %s", write ? "W" : "R", path);
     qrtr_bind_port(x->port, xfer_rx);
 
@@ -184,6 +188,10 @@ static void request(uint32_t node, uint32_t port, const uint8_t *d, size_t len, 
         put16(b, OP_OACK);
         n += (size_t)ksnprintf((char *)b + n, sizeof b - n, "blksize") + 1;
         n += (size_t)ksnprintf((char *)b + n, sizeof b - n, "%lu", (unsigned long)x->blksize) + 1;
+        if (x->timeoutms) {
+            n += (size_t)ksnprintf((char *)b + n, sizeof b - n, "timeoutms") + 1;
+            n += (size_t)ksnprintf((char *)b + n, sizeof b - n, "%lu", (unsigned long)x->timeoutms) + 1;
+        }
         if (want_tsize) {
             n += (size_t)ksnprintf((char *)b + n, sizeof b - n, "tsize") + 1;
             n += (size_t)ksnprintf((char *)b + n, sizeof b - n, "%lu", (unsigned long)x->size) + 1;
@@ -213,9 +221,16 @@ static void xfer_rx(uint32_t node, uint32_t port, const uint8_t *d, size_t len)
     struct xfer *x = xfer_by_port(qrtr_rx_port());
     if (!x || x->node != node || x->rport != port || len < 4) return;
     unsigned op = (unsigned)d[0] << 8 | d[1], block = (unsigned)d[2] << 8 | d[3];
-    if (op == OP_ERROR) { xfer_close(x); return; }             /* "end of transfer", or it gave up */
+    if (op == OP_ERROR) {                                       /* "end of transfer", or it gave up */
+        char m[48] = { 0 };
+        for (size_t i = 4; i < len && i < 4 + sizeof m - 1 && d[i]; i++) m[i - 4] = (char)d[i];
+        kprintf("tftp: %s: the modem ends it after %lu bytes (%u%s%s)\n", x->path, (unsigned long)x->sent, block,
+                block == ERR_END_OF_TRANSFER ? ", end of transfer" : ": ", block == ERR_END_OF_TRANSFER ? "" : m);
+        xfer_close(x);
+        return;
+    }
     if (!x->write && op == OP_ACK) {
-        if (x->done) { xfer_close(x); return; }
+        if (x->done) { kprintf("tftp: %s: %lu bytes sent\n", x->path, (unsigned long)x->sent); xfer_close(x); return; }
         send_blocks(x, block);
         return;
     }
