@@ -79,13 +79,31 @@ struct image {
     int relocatable;
 };
 
+/* The firmware is on the modem partition (FAT), which init mounts on
+ * /mnt/modem; if nothing has, this does (an older init, a shell). */
+static void mount_firmware(void)
+{
+    static const char *const parts[] = { "/dev/by-name/modem_a", "/dev/by-name/modem", "/dev/by-name/modem_b" };
+    if (vfs_lookup(vfs_root(), FW_DIR "modem.mdt")) return;
+    for (size_t i = 0; i < sizeof parts / sizeof parts[0]; i++) {
+        struct vnode *dev = vfs_lookup(vfs_root(), parts[i]);
+        if (!dev) continue;
+        struct vnode *dir = vfs_lookup(vfs_root(), "/mnt/modem");
+        if (!vfs_lookup(vfs_root(), "/mnt")) vfs_create(vfs_root(), "/mnt", VNODE_DIR);
+        if (!dir) dir = vfs_create(vfs_root(), "/mnt/modem", VNODE_DIR);
+        if (dir && vfs_mount("fat", dev, dir, "ro") == 0) kprintf("mss: mounted %s on /mnt/modem\n", parts[i] + 13);
+        return;
+    }
+}
+
 /* The headers, and the metadata TrustZone wants: the ELF header and
  * program headers (the first segment), then the hash segment. A split
  * image's .mdt is exactly those two. */
 static int parse(struct image *im)
 {
+    mount_firmware();
     im->mdt = read_file("modem.mdt", &im->mdt_len);
-    if (!im->mdt) { ksnprintf(state, sizeof state, "no " FW_DIR "modem.mdt (is the modem partition mounted?)"); return -1; }
+    if (!im->mdt) { ksnprintf(state, sizeof state, "no " FW_DIR "modem.mdt (no modem partition in /dev/by-name, or not FAT)"); return -1; }
     const uint8_t *e = im->mdt;
     if (im->mdt_len < 52 || memcmp(e, "\177ELF", 4) || e[4] != 1) { ksnprintf(state, sizeof state, "modem.mdt is not a 32-bit ELF"); return -1; }
     uint32_t phoff; uint16_t phentsize, phnum;
