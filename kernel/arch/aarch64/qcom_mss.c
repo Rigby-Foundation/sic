@@ -187,7 +187,7 @@ static int load_segment(volatile uint8_t *mem, const struct image *im, int i, ui
             if (n <= 0) { file_close(f); return -1; }
             put_words((volatile uint32_t *)(dst + done), buf, (size_t)n);
             done += (size_t)n;
-            if (n & 3) { file_close(f); return -1; }        /* only the last read may end off a word */
+            if ((n & 3) && done < p->filesz) { file_close(f); return -1; }   /* only the last read may end off a word */
         }
         file_close(f);
     }
