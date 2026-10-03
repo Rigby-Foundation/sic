@@ -40,7 +40,7 @@ struct phdr { uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align; 
 static uint64_t region, region_size;    /* modem_region */
 static uint64_t meta_phys;              /* a no-map page run for the metadata */
 static int present;
-static char state[96] = "stopped";
+static char state[192] = "stopped";
 static int busy;
 
 static const char *pas_state(void) { return state; }
@@ -81,19 +81,41 @@ struct image {
 
 /* The firmware is on the modem partition (FAT), which init mounts on
  * /mnt/modem; if nothing has, this does (an older init, a shell). */
+static char fw_note[160];               /* why there is no image, for the report */
+
+static int name_is(const char *n, const char *want)
+{
+    for (; *n && *want; n++, want++) {
+        char c = *n >= 'A' && *n <= 'Z' ? (char)(*n + 32) : *n;
+        if (c != *want) return 0;
+    }
+    return !*n && !*want;
+}
+
 static void mount_firmware(void)
 {
-    static const char *const parts[] = { "/dev/by-name/modem_a", "/dev/by-name/modem", "/dev/by-name/modem_b" };
+    static const char *const prefer[] = { "modem_a", "modem", "modem_b" };
+    fw_note[0] = 0;
     if (vfs_lookup(vfs_root(), FW_DIR "modem.mdt")) return;
-    for (size_t i = 0; i < sizeof parts / sizeof parts[0]; i++) {
-        struct vnode *dev = vfs_lookup(vfs_root(), parts[i]);
-        if (!dev) continue;
-        struct vnode *dir = vfs_lookup(vfs_root(), "/mnt/modem");
-        if (!vfs_lookup(vfs_root(), "/mnt")) vfs_create(vfs_root(), "/mnt", VNODE_DIR);
-        if (!dir) dir = vfs_create(vfs_root(), "/mnt/modem", VNODE_DIR);
-        if (dir && vfs_mount("fat", dev, dir, "ro") == 0) kprintf("mss: mounted %s on /mnt/modem\n", parts[i] + 13);
+    struct vnode *byname = vfs_lookup(vfs_root(), "/dev/by-name");
+    if (!byname) { ksnprintf(fw_note, sizeof fw_note, "no /dev/by-name: the flash's partitions were not found"); return; }
+    struct vnode *dev = NULL;
+    for (size_t i = 0; i < sizeof prefer / sizeof prefer[0] && !dev; i++)
+        for (struct vnode *c = byname->children; c; c = c->sibling)
+            if (name_is(c->name, prefer[i])) { dev = c; break; }
+    if (!dev) {
+        size_t n = (size_t)ksnprintf(fw_note, sizeof fw_note, "no modem partition; /dev/by-name has:");
+        for (struct vnode *c = byname->children; c && n < sizeof fw_note - 20; c = c->sibling)
+            n += (size_t)ksnprintf(fw_note + n, sizeof fw_note - n, " %s", c->name);
         return;
     }
+    if (!vfs_lookup(vfs_root(), "/mnt")) vfs_create(vfs_root(), "/mnt", VNODE_DIR);
+    struct vnode *dir = vfs_lookup(vfs_root(), "/mnt/modem");
+    if (!dir) dir = vfs_create(vfs_root(), "/mnt/modem", VNODE_DIR);
+    int rc = dir ? vfs_mount("fat", dev, dir, "ro") : -100;
+    if (rc == 0) kprintf("mss: mounted %s on /mnt/modem\n", dev->name);
+    else ksnprintf(fw_note, sizeof fw_note, "%s would not mount as FAT on /mnt/modem (%d)", dev->name, rc);
+    if (rc == 0 && !vfs_lookup(vfs_root(), FW_DIR "modem.mdt")) ksnprintf(fw_note, sizeof fw_note, "%s is mounted, but has no image/modem.mdt", dev->name);
 }
 
 /* The headers, and the metadata TrustZone wants: the ELF header and
@@ -103,7 +125,7 @@ static int parse(struct image *im)
 {
     mount_firmware();
     im->mdt = read_file("modem.mdt", &im->mdt_len);
-    if (!im->mdt) { ksnprintf(state, sizeof state, "no " FW_DIR "modem.mdt (no modem partition in /dev/by-name, or not FAT)"); return -1; }
+    if (!im->mdt) { ksnprintf(state, sizeof state, "%s", fw_note[0] ? fw_note : "no " FW_DIR "modem.mdt"); return -1; }
     const uint8_t *e = im->mdt;
     if (im->mdt_len < 52 || memcmp(e, "\177ELF", 4) || e[4] != 1) { ksnprintf(state, sizeof state, "modem.mdt is not a 32-bit ELF"); return -1; }
     uint32_t phoff; uint16_t phentsize, phnum;
