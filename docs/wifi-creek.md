@@ -8,9 +8,9 @@ the bottom up, and where sic stands on each:
 
 | layer | what it is | status |
 |---|---|---|
-| SMEM | shared heap at `smem_region` (0x46000000, 2 MB) | **read-only parser, `/dev/smem`** |
-| modem PAS boot | `qcom,bengal-modem-pas` @ 0x6080000: load `modem.mdt` + `.bNN` (from the modem partition) into `modem_region` 0x4ab00000, then TrustZone `PAS_INIT_IMAGE/AUTH_AND_RESET` SCM calls | todo (the zap shader loader in `qcom_gpu.c` already does a PAS for the GPU) |
-| SMP2P | modem ↔ apps state bits (items 0x1b3/0x1ac, IRQ SPI 0x46, mailbox bit 14): fatal/ready/handover/stop-ack | todo |
+| SMEM | shared heap at `smem_region` (0x46000000, 2 MB) | **read-only parser, `/dev/smem`** (works on the phone) |
+| modem PAS boot | `qcom,bengal-modem-pas` @ 0x6080000: load `modem.mdt` + `.bNN` (from the modem partition) into `modem_region` 0x4ab00000, then TrustZone `PAS_INIT_IMAGE/AUTH_AND_RESET` SCM calls | **`/dev/mss`: `echo check`, `echo start`** (init mounts the modem partition on /mnt/modem) |
+| SMP2P | modem ↔ apps state bits (items 0x1b3/0x1ac, IRQ SPI 0x46, mailbox bit 14): fatal/ready/handover/stop-ack | the modem's bits read in `cat /dev/mss`; ours not yet |
 | GLINK over SMEM | FIFOs in SMEM, IRQ SPI 0x44, mailbox bit 12 on `apcs_glb` 0x0f111000; channel `IPCRTR` | todo |
 | QRTR + name service | the modem's services are found by name | todo |
 | QMI services the modem needs | rmtfs (modemst1/2, fsg partitions), the tftp server it fetches its configs from | todo |

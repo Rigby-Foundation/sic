@@ -14,8 +14,8 @@
 #include "printf.h"
 #include "string.h"
 #include "abi/abi.h"
+#include "asm/qcom_smem.h"
 
-#define SMEM_GLOBAL_HOST        0xfffe
 #define SMEM_ITEM_COUNT         512
 #define SMEM_HW_SW_BUILD_ID     137         /* socinfo */
 #define PRIVATE_CANARY          0xa5a5

@@ -30,6 +30,7 @@
 #include "proc/syscall.h"
 #include "asm/timer.h"
 #include "abi/adreno.h"
+#include "asm/qcom_scm.h"
 
 #define GCC         0x1400000
 #define GPUCC       0x5990000
@@ -457,36 +458,6 @@ static void hw_init(void)
 
 /* ---- the zap shader, through TrustZone ------------------------------------------------- */
 
-struct scm_res { uint64_t a0, a1, a2, a3; };
-
-/* A Qualcomm SCM call: SMCCC standard call, SMC64, owner SIP (2). A long
- * one comes back "interrupted" (1) so the normal world can take its
- * interrupts; it is resumed with function id 1 and the context TrustZone
- * left in x6 (Linux: ARM_SMCCC_QUIRK_QCOM_A6), for as long as it says so. */
-static struct scm_res scm_call(uint32_t svc, uint32_t cmd, uint32_t arginfo, uint64_t a, uint64_t b, uint64_t c)
-{
-    uint64_t fn = 0x42000000u | svc << 8 | cmd, a6 = 0;
-    register uint64_t x0 __asm__("x0"), x1 __asm__("x1"), x2 __asm__("x2"), x3 __asm__("x3");
-    register uint64_t x4 __asm__("x4"), x5 __asm__("x5"), x6 __asm__("x6");
-    uint32_t resumes = 0, busy = 0;
-    for (;;) {
-        x0 = fn; x1 = arginfo; x2 = a; x3 = b; x4 = c; x5 = 0; x6 = a6;
-        __asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6) : : "x7", "x8", "x9",
-                         "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
-        a6 = x6;
-        if (x0 == 1) {                                                      /* interrupted: resume */
-            fn = 1;
-            if (++resumes % 10000 == 0) kprintf("adreno: scm %x/%x: %u resumes\n", svc, cmd, resumes);
-            continue;
-        }
-        if ((int64_t)x0 == -12 && ++busy < 100) { task_sleep_ms(30); continue; }   /* busy: again */
-        break;
-    }
-    if (resumes) kprintf("adreno: scm %x/%x: done after %u resumes\n", svc, cmd, resumes);
-    return (struct scm_res){ x0, x1, x2, x3 };
-}
-
-#define PIL 2
 
 static const uint8_t *zap_file(const char *path, size_t *len)
 {
@@ -540,13 +511,13 @@ static int zap_load(void)
     copy_words(region, seg, slen);
 
     kprintf("adreno: zap: init image (metadata at %lx)\n", (unsigned long)meta);
-    struct scm_res r = scm_call(PIL, 1, 2 | 2u << 6, GPU_PAS_ID, meta, 0);       /* INIT_IMAGE (val, rw) */
+    struct scm_res r = qcom_scm_call(SCM_PIL, 1, 2 | 2u << 6, GPU_PAS_ID, meta, 0);       /* INIT_IMAGE (val, rw) */
     kprintf("adreno: zap: init image: status %ld %lu\n", (long)r.a0, (unsigned long)r.a1);
     if (r.a0 || r.a1) return -1;
-    r = scm_call(PIL, 2, 3, GPU_PAS_ID, mem, PAGE_ALIGN_UP(slen));              /* MEM_SETUP: whole pages, as Linux's mdt loader */
+    r = qcom_scm_call(SCM_PIL, 2, 3, GPU_PAS_ID, mem, PAGE_ALIGN_UP(slen));              /* MEM_SETUP: whole pages, as Linux's mdt loader */
     kprintf("adreno: zap: mem setup %lx+%lx: status %ld %lu\n", (unsigned long)mem, (unsigned long)PAGE_ALIGN_UP(slen), (long)r.a0, (unsigned long)r.a1);
     if (r.a0 || r.a1) return -1;
-    r = scm_call(PIL, 5, 1, GPU_PAS_ID, 0, 0);                                  /* AUTH_AND_RESET */
+    r = qcom_scm_call(SCM_PIL, 5, 1, GPU_PAS_ID, 0, 0);                                  /* AUTH_AND_RESET */
     kprintf("adreno: zap: auth and reset: status %ld %lu\n", (long)r.a0, (unsigned long)r.a1);
     return r.a0 || r.a1 ? -1 : 0;
 }
