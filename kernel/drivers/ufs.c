@@ -158,7 +158,12 @@ static int scsi(struct ufs *u, uint8_t lun, const uint8_t *cdb, int cdb_len, uin
     memcpy(p + 16, cdb, (size_t)cdb_len);
     if (request(u, len, dir)) return -1;
     uint8_t *r = u->ucd + UCD_RSP_OFF;
-    if (r[6]) return -1;                    /* the target failed */
+    if (r[6] || r[7]) {                     /* the target failed, or a SCSI status: say what, and the sense data */
+        if (!u->probing)
+            kprintf("ufs: LUN %u cmd %02x: response %02x status %02x, sense key %x asc %02x/%02x\n", lun, cdb[0], r[6], r[7],
+                    r[32 + 2 + 2] & 0xf, r[32 + 2 + 12], r[32 + 2 + 13]);
+        if (r[6]) return -1;
+    }
     return r[7];
 }
 
@@ -173,13 +178,22 @@ static int lu_rw(struct blkdev *d, uint64_t lba, uint32_t count, void *buf, int 
     int rc = 0;
     while (count && !rc) {
         uint32_t n = count < per ? count : per, bytes = n * d->sector_size;
-        uint8_t cdb[16] = { write ? 0x8a : 0x88 };                 /* READ(16) / WRITE(16) */
-        for (int i = 0; i < 8; i++) cdb[2 + i] = (uint8_t)(lba >> (56 - 8 * i));
-        cdb[10] = (uint8_t)(n >> 24); cdb[11] = (uint8_t)(n >> 16); cdb[12] = (uint8_t)(n >> 8); cdb[13] = (uint8_t)n;
+        /* READ(10) / WRITE(10), as Linux sends a UFS device (READ(16) is
+         * optional for it; a phone's answers it with a target failure) */
+        uint8_t cdb[16] = { write ? 0x2a : 0x28 };
+        int cdb_len = 10;
+        if (lba + n > 0xffffffffULL) {                              /* past 2^32 blocks: the 16-byte form */
+            cdb[0] = write ? 0x8a : 0x88; cdb_len = 16;
+            for (int i = 0; i < 8; i++) cdb[2 + i] = (uint8_t)(lba >> (56 - 8 * i));
+            cdb[10] = (uint8_t)(n >> 24); cdb[11] = (uint8_t)(n >> 16); cdb[12] = (uint8_t)(n >> 8); cdb[13] = (uint8_t)n;
+        } else {
+            for (int i = 0; i < 4; i++) cdb[2 + i] = (uint8_t)(lba >> (24 - 8 * i));
+            cdb[7] = (uint8_t)(n >> 8); cdb[8] = (uint8_t)n;
+        }
         int st = -1;
         for (int t = 0; t < 3 && st != 0; t++) {                   /* a unit attention (check condition) first, maybe */
             if (write) memcpy(u->buf, buf, bytes);
-            st = scsi(u, lun, cdb, 16, bytes, write ? 1 : 2);
+            st = scsi(u, lun, cdb, cdb_len, bytes, write ? 1 : 2);
         }
         if (st != 0) { kprintf("ufs: %s of %u blocks at %llu on LUN %u failed (%d)\n", write ? "write" : "read", n, lba, lun, st); rc = -1; break; }
         if (!write) memcpy(buf, u->buf, bytes);
