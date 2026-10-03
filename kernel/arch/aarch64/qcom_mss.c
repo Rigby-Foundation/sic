@@ -221,7 +221,9 @@ static void start_thread(void *arg)
     if (parse(&im) != 0) goto out;
     kprintf("mss: %s\n", "loading the modem's image");
     struct scm_res r = qcom_scm_call(SCM_PIL, 7, 1, MSS_PAS_ID, 0, 0);          /* IS_SUPPORTED */
-    if (r.a0 || !r.a1) { ksnprintf(state, sizeof state, "TrustZone does not take PAS %d (%ld/%lu)", MSS_PAS_ID, (long)r.a0, (unsigned long)r.a1); goto out; }
+    /* Only a hint: this phone's TrustZone answers "no" (0/0) for the modem
+     * and still loads it; INIT_IMAGE's status is the real answer. */
+    kprintf("mss: TrustZone says PAS %d is %ssupported (%ld/%lu); going on\n", MSS_PAS_ID, r.a1 ? "" : "not ", (long)r.a0, (unsigned long)r.a1);
 
     /* The metadata into no-map memory, mapped as device memory: TrustZone
      * locks it while it reads it, and a CPU access then (a speculative one
@@ -232,7 +234,7 @@ static void start_thread(void *arg)
     put_words(meta, im.mdt, im.meta_len);
     __asm__ volatile("dsb sy" ::: "memory");
     r = qcom_scm_call(SCM_PIL, 1, SCM_ARGS(2, 0, SCM_ARG_RW, 0), MSS_PAS_ID, meta_phys, 0);   /* INIT_IMAGE */
-    if (r.a0 || r.a1) { ksnprintf(state, sizeof state, "init image: %ld/%lu", (long)r.a0, (unsigned long)r.a1); goto out; }
+    if (r.a0 || r.a1) { ksnprintf(state, sizeof state, "TrustZone refused the image (init image: %ld/%lu)", (long)r.a0, (unsigned long)r.a1); goto out; }
     if (im.relocatable) {
         r = qcom_scm_call(SCM_PIL, 2, 3, MSS_PAS_ID, region, im.max - im.min);          /* MEM_SETUP */
         if (r.a0 || r.a1) { ksnprintf(state, sizeof state, "mem setup: %ld/%lu", (long)r.a0, (unsigned long)r.a1); goto shutdown; }
@@ -257,8 +259,8 @@ static void start_thread(void *arg)
     goto out;
 shutdown:
     qcom_scm_call(SCM_PIL, 6, 1, MSS_PAS_ID, 0, 0);                                 /* SHUTDOWN: TrustZone lets go of the memory */
-    kprintf("mss: %s\n", state);
 out:
+    if (strcmp(state, "running")) kprintf("mss: %s\n", state);
     if (im.mdt) kfree(im.mdt);
     if (buf) kfree(buf);
     __atomic_store_n(&busy, 0, __ATOMIC_SEQ_CST);
