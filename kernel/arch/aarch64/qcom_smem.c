@@ -44,8 +44,19 @@ static int ptable_entries(void)
 
 /* Partition i's item `item` in its uncached list (from the front) or its
  * cached one (from the back, going down). */
+/* Only the partitions the apps processor (host 0) is part of, and the
+ * global one, are readable: the others (modem/DSP, say) sit behind the
+ * memory firewall, and a read of them hangs the bus. */
+static int partition_ours(int i)
+{
+    uint32_t hosts = rd32(PT_ENTRY(i) + 12);
+    unsigned a = hosts & 0xffff, b = hosts >> 16;
+    return a == 0 || b == 0 || (a == SMEM_GLOBAL_HOST && b == SMEM_GLOBAL_HOST);
+}
+
 static void *partition_item(int i, unsigned item, size_t *size)
 {
+    if (!partition_ours(i)) return NULL;
     uint64_t off = rd32(PT_ENTRY(i)), psz = rd32(PT_ENTRY(i) + 4);
     uint32_t cl = rd32(PT_ENTRY(i) + 16);
     if (!off || off + psz > smem_size || rd32(off) != 0x54525024 /* "$PRT" */) return NULL;
@@ -130,7 +141,9 @@ static size_t make_report(void)
     int pt = ptable_entries();
     for (int i = 0; i < pt; i++) {
         uint32_t hosts = rd32(PT_ENTRY(i) + 12);
-        P("partition %d: hosts %x/%x, %u bytes at %x:", i, hosts & 0xffff, hosts >> 16, rd32(PT_ENTRY(i) + 4), rd32(PT_ENTRY(i)));
+        P("partition %d: hosts %x/%x, %u bytes at %x", i, hosts & 0xffff, hosts >> 16, rd32(PT_ENTRY(i) + 4), rd32(PT_ENTRY(i)));
+        if (!partition_ours(i)) { P(" (not the apps CPU's)\n"); continue; }
+        P(":");
         for (unsigned item = 0; item < SMEM_ITEM_COUNT; item++) {
             size_t isz;
             if (partition_item(i, item, &isz)) P(" %u(%lu)", item, (unsigned long)isz);
