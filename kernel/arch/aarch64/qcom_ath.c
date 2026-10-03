@@ -216,7 +216,7 @@ static int ce_init(void)
             p->txbuf = kzalloc(sizeof(uint8_t *) * p->src_n);
             p->txbuf_phys = kzalloc(sizeof(uint64_t) * p->src_n);
             if (!p->src || !p->txbuf || !p->txbuf_phys) return -1;
-            if (i == 0 || i == 3 || i == 7)
+            if (i == 0 || i == 3 || i == 4 || i == 7)
                 for (uint32_t k = 0; k < p->src_n; k++)
                     if (!(p->txbuf[k] = dma_alloc(p->src_max, &p->txbuf_phys[k]))) return -1;
             p->src_wr = rd(b + SR_WR_INDEX) & (p->src_n - 1);
@@ -327,14 +327,15 @@ static void svc_pipes(uint16_t svc, int *ul, int *dl)
 /* ---- WMI ------------------------------------------------------------------------------------------ */
 
 enum {
-    WMI_INIT = 0x1, WMI_START_SCAN = 0x3001, WMI_SCAN_CHAN_LIST = 0x3003, WMI_VDEV_CREATE = 0x5001,
+    WMI_INIT = 0x1, WMI_START_SCAN = 0x3001, WMI_SCAN_CHAN_LIST = 0x3003, WMI_PDEV_SET_REGDOMAIN = 0x4001,
+    WMI_PDEV_SET_PARAM = 0x4003, WMI_VDEV_CREATE = 0x5001,
     EV_SERVICE_READY = 0x1, EV_READY = 0x2, EV_SCAN = 0x3001, EV_CHAN_INFO = 0x4002, EV_MGMT_RX = 0x7001,
 };
 enum {
     TAG_ARRAY_UINT32 = 0x10, TAG_ARRAY_BYTE = 0x11, TAG_ARRAY_STRUCT = 0x12, TAG_ARRAY_FIXED_STRUCT = 0x13,
-    TAG_SERVICE_READY = 0x20, TAG_HOST_MEM_REQ = 0x22, TAG_READY = 0x23, TAG_SCAN_EVENT = 0x24, TAG_CHAN_INFO = 0x26, TAG_MGMT_RX_HDR = 0x2c,
+    TAG_SERVICE_READY = 0x20, TAG_HAL_REG_CAPS = 0x21, TAG_HOST_MEM_REQ = 0x22, TAG_READY = 0x23, TAG_SCAN_EVENT = 0x24, TAG_CHAN_INFO = 0x26, TAG_MGMT_RX_HDR = 0x2c,
     TAG_INIT_CMD = 0x4a, TAG_RESOURCE_CONFIG = 0x4b, TAG_HOST_MEMORY_CHUNK = 0x4c, TAG_START_SCAN = 0x4d,
-    TAG_SCAN_CHAN_LIST = 0x4f, TAG_CHANNEL = 0x50, TAG_VDEV_CREATE = 0x56,
+    TAG_SCAN_CHAN_LIST = 0x4f, TAG_CHANNEL = 0x50, TAG_PDEV_SET_REGDOMAIN = 0x51, TAG_PDEV_SET_PARAM = 0x52, TAG_VDEV_CREATE = 0x56,
 };
 
 /* Commands wait here for WMI's credits. */
@@ -408,6 +409,120 @@ static void send_init(void)
         put32(arr + 20 * i + 4, 3, (uint32_t)(chunks[i].phys >> 32));
     }
     wmi_send(WMI_INIT, t.b, t.n);
+}
+
+static uint32_t eeprom_rd;
+
+static void send_pdev_param(uint32_t param, uint32_t value)
+{
+    static struct tb t;
+    t.n = 0;
+    uint32_t *c = tlv_put(&t, TAG_PDEV_SET_PARAM, 3 * 4);
+    put32(c, 1, param); put32(c, 2, value);
+    wmi_send(WMI_PDEV_SET_PARAM, t.b, t.n);
+}
+
+/* What ath10k_start sends before mac80211 may scan: its pdev parameters
+ * (WMI-TLV's numbering), then the regulatory domain the board data names
+ * (conformance limits: FCC's tables). */
+static void send_pdev_setup(void)
+{
+    send_pdev_param(34, 1);                                 /* pmf_qos */
+    send_pdev_param(10, 1);                                 /* dynamic_bw */
+    send_pdev_param(44, 1);                                 /* idle_ps_config */
+    send_pdev_param(35, 0);                                 /* arp_ac_override */
+    send_pdev_param(37, 1);                                 /* ani_enable */
+    static struct tb t;
+    t.n = 0;
+    uint32_t *c = tlv_put(&t, TAG_PDEV_SET_REGDOMAIN, 6 * 4);
+    put32(c, 1, eeprom_rd); put32(c, 2, eeprom_rd); put32(c, 3, eeprom_rd);
+    put32(c, 4, 0x10); put32(c, 5, 0x10);
+    wmi_send(WMI_PDEV_SET_REGDOMAIN, t.b, t.n);
+}
+
+/* ---- HTT setup: what ath10k_htt_setup sends once WMI is ready ------------------------------- */
+
+enum { HTT_H2T_VERSION_REQ = 0, HTT_H2T_RX_RING_CFG = 2, HTT_H2T_AGGR_CFG = 5, HTT_H2T_FRAG_DESC_BANK_CFG = 6 };
+enum { HTT_T2H_VERSION_CONF = 0 };
+#define HTT_TX_DESCS    1056        /* TARGET_TLV_NUM_MSDU_DESC */
+#define HTT_FRAG_DESC   72          /* htt_msdu_ext_desc_64 */
+#define HTT_RX_RING     256
+#define HTT_RX_BUF      2048
+
+static int htt_stage;               /* 0 none, 1 version asked, 2 configured */
+static uint8_t htt_major, htt_minor;
+static uint32_t htt_rx_msgs, htt_types;
+static uint64_t frag_phys, rxring_phys, rxidx_phys, rxbufs_phys;
+
+static void put16le(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+static void put64le(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> 8 * i); }
+
+static uint64_t htt_alloc(size_t size)
+{
+    size_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t ph = pmm_alloc_pages_below(pages, 0x100000000ULL);
+    if (!ph) return 0;
+    memset(P2V(ph), 0, pages * PAGE_SIZE);
+    qcom_dma_clean(P2V(ph), pages * PAGE_SIZE);
+    return ph;
+}
+
+static void htt_version_req(void)
+{
+    uint8_t m[4] = { HTT_H2T_VERSION_REQ };
+    if (htt_ep < 0 || htc_send(htt_ep, m, sizeof m)) { kprintf("ath: HTT version request not sent\n"); return; }
+    htt_stage = 1;
+}
+
+/* The target's answer came: the transmit descriptors' memory, the receive
+ * ring (buffers the target fills with frames for the host), aggregation. */
+static void htt_configure(void)
+{
+    if (!frag_phys) frag_phys = htt_alloc(HTT_TX_DESCS * HTT_FRAG_DESC);
+    if (!rxring_phys) rxring_phys = htt_alloc(HTT_RX_RING * 8);
+    if (!rxidx_phys) rxidx_phys = htt_alloc(4);
+    if (!rxbufs_phys) rxbufs_phys = htt_alloc((size_t)(HTT_RX_RING - 1) * HTT_RX_BUF);
+    if (!frag_phys || !rxring_phys || !rxidx_phys || !rxbufs_phys) { kprintf("ath: no memory for HTT\n"); return; }
+
+    uint8_t f[64] = { HTT_H2T_FRAG_DESC_BANK_CFG, 0, 1, HTT_FRAG_DESC };
+    put64le(f + 4, frag_phys);
+    put16le(f + 36, 0); put16le(f + 38, HTT_TX_DESCS - 1);
+    htc_send(htt_ep, f, sizeof f);
+
+    /* the ring: the buffers' addresses; how many are filled, where the target reads it */
+    uint64_t *ring = P2V(rxring_phys);
+    for (int i = 0; i < HTT_RX_RING - 1; i++) ring[i] = rxbufs_phys + (uint64_t)i * HTT_RX_BUF;
+    qcom_dma_clean(ring, HTT_RX_RING * 8);
+    volatile uint32_t *idx = P2V(rxidx_phys);
+    *idx = HTT_RX_RING - 1;
+    qcom_dma_clean((void *)idx, 4);
+
+    uint8_t r[48] = { HTT_H2T_RX_RING_CFG, 1 };
+    put64le(r + 4, rxidx_phys);
+    put64le(r + 12, rxring_phys);
+    put16le(r + 20, HTT_RX_RING);
+    put16le(r + 22, HTT_RX_BUF);
+    put16le(r + 24, 0xffff);                                /* every part of the descriptor */
+    put16le(r + 26, 0);
+    static const uint16_t offs[10] = { 74, 90, 27, 37, 4, 26, 7, 12, 1, 2 };   /* wcn3990's rx descriptor, in words */
+    for (int i = 0; i < 10; i++) put16le(r + 28 + 2 * i, offs[i]);
+    htc_send(htt_ep, r, sizeof r);
+
+    uint8_t a[4] = { HTT_H2T_AGGR_CFG, 64, 3, 0 };          /* A-MPDU 64, A-MSDU 3 */
+    htc_send(htt_ep, a, sizeof a);
+    htt_stage = 2;
+    kprintf("ath: HTT %u.%u configured\n", htt_major, htt_minor);
+}
+
+static void htt_rx_msg(const uint8_t *p, size_t n)
+{
+    if (!n) return;
+    htt_rx_msgs++;
+    if (p[0] < 32) htt_types |= 1u << p[0];
+    if (p[0] == HTT_T2H_VERSION_CONF && n >= 3 && htt_stage == 1) {
+        htt_minor = p[1]; htt_major = p[2];
+        htt_configure();
+    }
 }
 
 /* ---- scanning ----------------------------------------------------------------------------------- */
@@ -537,7 +652,7 @@ static void wmi_event(const uint8_t *m, size_t n)
     wmi_events++;
     const uint8_t *t = m + 4, *end = m + n;
     /* the TLVs, by tag (first of each) */
-    const uint8_t *svc = NULL, *rdy = NULL, *scan = NULL, *rxhdr = NULL, *frame = NULL, *memreqs = NULL, *chinfo = NULL;
+    const uint8_t *svc = NULL, *regcaps = NULL, *rdy = NULL, *scan = NULL, *rxhdr = NULL, *frame = NULL, *memreqs = NULL, *chinfo = NULL;
     uint32_t frame_len = 0, memreqs_len = 0;
     while (t + 4 <= end) {
         uint32_t h; memcpy(&h, t, 4);
@@ -545,6 +660,7 @@ static void wmi_event(const uint8_t *m, size_t n)
         if (t + 4 + len > end) break;
         const uint8_t *v = t + 4;
         if (tag == TAG_SERVICE_READY && !svc) svc = v;
+        else if (tag == TAG_HAL_REG_CAPS && !regcaps && len >= 4) regcaps = v;
         else if (tag == TAG_READY && !rdy) rdy = v;
         else if (tag == TAG_SCAN_EVENT && !scan) scan = v;
         else if (tag == TAG_CHAN_INFO && !chinfo) chinfo = v;
@@ -573,7 +689,8 @@ static void wmi_event(const uint8_t *m, size_t n)
             }
             q += 4 + (h & 0xffff);
         }
-        kprintf("ath: service ready (%u memory requests, %d given)\n", nreq, nchunks);
+        if (regcaps) memcpy(&eeprom_rd, regcaps, 4);
+        kprintf("ath: service ready (%u memory requests, %d given, regdomain %x)\n", nreq, nchunks, eeprom_rd);
         send_init();
         stage = A_WMI_READY;
         break;
@@ -595,6 +712,8 @@ static void wmi_event(const uint8_t *m, size_t n)
         }
         kprintf("ath: WMI ready, MAC %02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         stage = A_UP;
+        htt_version_req();
+        send_pdev_setup();
         break;
     case EV_SCAN:
         if (scan) {
@@ -681,7 +800,7 @@ static void htc_rx_msg(const uint8_t *m, size_t n)
         return;
     }
     if (eid == wmi_ep) wmi_event(p, len);
-    /* HTT messages (and anything else) are not looked at yet */
+    else if ((int)eid == htt_ep) htt_rx_msg(p, len);
     else htc_unknown++;
 }
 
@@ -803,6 +922,9 @@ size_t qcom_ath_report(char *buf, size_t len)
     if (stage == A_UP && n < len)
         n += (size_t)ksnprintf(buf + n, len - n, "  MAC %02x:%02x:%02x:%02x:%02x:%02x%s, %d scans%s, %u frames, %d networks\n",
                                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], mac_made ? " (made here)" : "", scans, scanning ? " (scanning)" : "", mgmt_rx, nbss);
+    if (htt_stage && n < len)
+        n += (size_t)ksnprintf(buf + n, len - n, "  htt: %s %u.%u, %u messages (types %x), %u sent\n",
+                               htt_stage == 2 ? "configured" : "version asked", htt_major, htt_minor, htt_rx_msgs, htt_types, pipes[4].tx_count);
     if (chinfo_n && n < len)
         n += (size_t)ksnprintf(buf + n, len - n, "  channels: %u reports, noise floor %d..%d dBm, busy count up to %u, last %u MHz (%u cycles)\n",
                                chinfo_n, nf_min == 1000 ? 0 : nf_min, nf_max == -1000 ? 0 : nf_max, clear_max, last_freq, last_cycles);
