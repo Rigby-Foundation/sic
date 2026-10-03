@@ -5,10 +5,13 @@
  * block's KPDPWR and RESIN lines, volume up is one of the PMIC's GPIOs
  * (where the device tree's gpio-keys node says). Read-only, through the
  * arbiter's observer channels, polled every 20 ms. They become keyboard
- * scancodes: power is Enter, the volume keys are the up and down arrows. */
+ * scancodes: power is Enter (the Power key, E0 5E, while a program has the
+ * keyboard raw: the window server turns the screen off with it), the
+ * volume keys are the up and down arrows. */
 #include "asm/fdt.h"
 #include "asm/memlayout.h"
 #include "drivers/keyboard.h"
+#include "abi/fb.h"
 #include "proc/sched.h"
 #include "endian.h"
 #include "string.h"
@@ -86,11 +89,14 @@ static int pon_apid = -1, volup_apid = -1;
 static uint16_t pon_base, volup_base;
 static uint8_t sid;
 
-/* Scancode set 1: Enter, and the extended up/down arrows. */
+/* Scancode set 1: Enter or Power, and the extended up/down arrows. */
 static void press(int key, int down)
 {
     switch (key) {
-    case 0: keyboard_scancode(down ? 0x1c : 0x9c); break;                                  /* power: Enter */
+    case 0:                                                                                 /* power */
+        if (keyboard_get_mode() == K_RAW) { keyboard_scancode(0xe0); keyboard_scancode(down ? 0x5e : 0xde); }
+        else keyboard_scancode(down ? 0x1c : 0x9c);                                         /* Enter, for text menus */
+        break;
     case 1: keyboard_scancode(0xe0); keyboard_scancode(down ? 0x48 : 0xc8); break;          /* volume up: Up */
     case 2: keyboard_scancode(0xe0); keyboard_scancode(down ? 0x50 : 0xd0); break;          /* volume down: Down */
     }

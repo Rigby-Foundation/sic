@@ -115,6 +115,8 @@ void arch_init_smp(void)
     qcom_touch_init();              /* a "creek" phone's touch controller, if this is one */
     extern void qcom_gpu_init(void);
     qcom_gpu_init();                /* its Adreno 610: /dev/adreno */
+    extern void qcom_panel_init(void);
+    qcom_panel_init();              /* its panel through the running DSI controller: /dev/panel */
 }
 
 void arch_halt_forever(void)
