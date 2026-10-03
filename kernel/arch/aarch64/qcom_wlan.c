@@ -41,7 +41,7 @@ static char why[96];
 static uint32_t chip_id = 0xff, chip_family, board_id = 0xff, soc_id, fw_version;
 static char build[64], bdf_name[32];
 static struct { uint64_t addr; uint32_t size; uint8_t secure; } regions[4];
-static int nregions;
+static int nregions, msa_fixed;
 static uint8_t *bdf;
 static size_t bdf_len, bdf_off;
 static uint32_t bdf_seg;
@@ -181,9 +181,12 @@ static void wlfw_rx(uint32_t from_node, uint32_t from_port, const uint8_t *p, si
             if (regions[i].addr < MSA_BASE || regions[i].addr + regions[i].size > MSA_BASE + MSA_SIZE) { fail("region %u outside the MSA (%x)", (unsigned)i, (unsigned)regions[i].addr); return; }
             uint32_t vm[3] = { SCM_VMID_MSS_MSA, SCM_VMID_WLAN, SCM_VMID_WLAN_CE };
             uint32_t pr[3] = { SCM_PERM_RW, SCM_PERM_RW, SCM_PERM_RW };
-            if (qcom_scm_assign_mem(regions[i].addr, regions[i].size, vm, pr, regions[i].secure ? 2 : 3)) { fail("TrustZone would not give region %u to the WLAN (%u)", (unsigned)i, 0); return; }
+            /* On some phones TrustZone gave the MSA to the WLAN already
+             * (Linux's qcom,msa-fixed-perm): it refuses, and that is fine. */
+            if (qcom_scm_assign_mem(regions[i].addr, regions[i].size, vm, pr, regions[i].secure ? 2 : 3)) msa_fixed++;
         }
-        kprintf("wlan: %d MSA regions given to the WLAN\n", nregions);
+        if (msa_fixed) kprintf("wlan: TrustZone kept %d of %d MSA regions as they are (fixed permissions); going on\n", msa_fixed, nregions);
+        else kprintf("wlan: %d MSA regions given to the WLAN\n", nregions);
         m_start(&m, MSA_READY);
         m_send(&m, S_MSA_READY);
         break;
