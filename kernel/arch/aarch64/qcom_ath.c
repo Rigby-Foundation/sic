@@ -20,6 +20,7 @@
 #include "asm/memlayout.h"
 #include "asm/qcom_ipc.h"
 #include "asm/qcom_scm.h"
+#include "asm/qcom_smem.h"
 #include "asm/timer.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
@@ -42,6 +43,7 @@ static const char *const stage_names[] = { "off", "copy engines up, waiting for 
     "waiting for WMI service ready", "waiting for WMI ready", "radio on", "failed" };
 enum { A_OFF, A_HTC_READY, A_CONN_HTT, A_CONN_WMI, A_SVC_READY, A_WMI_READY, A_UP, A_FAILED };
 static uint8_t mac[6];
+static int mac_made;
 static char smmu_note[96];
 
 static uint32_t rd(uint32_t off) { return mmio_read32(ce_mmio + off); }
@@ -283,7 +285,7 @@ enum { HTC_READY = 1, HTC_CONNECT = 2, HTC_CONNECT_RESP = 3, HTC_SETUP_COMPLETE_
 static struct ep { uint16_t svc; int ul, dl, credit_flow; int credits; uint8_t seq; } eps[EP_COUNT];
 static int wmi_ep = -1, htt_ep = -1;
 static uint32_t credit_size = 2048;
-static uint32_t htc_rx, htc_unknown;
+static uint32_t htc_rx, htc_unknown, credits_back;
 
 static int htc_send(int eid, const void *payload, size_t len)
 {
@@ -576,6 +578,18 @@ static void wmi_event(const uint8_t *m, size_t n)
     case EV_READY:
         if (!rdy) break;
         memcpy(mac, rdy + 24, 6);                           /* after the ABI version (6 words) */
+        if (!(mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5])) {
+            /* this firmware leaves it to the host (Linux takes the DT's,
+             * or a random one): a locally administered one, the same at
+             * every boot, from the SoC's serial data in SMEM */
+            size_t sz = 0;
+            const volatile uint8_t *si = smem_get(SMEM_GLOBAL_HOST, 137, &sz);
+            uint32_t hsh = 2166136261u;
+            for (size_t i = 0; si && i < sz && i < 256; i++) hsh = (hsh ^ si[i]) * 16777619u;
+            mac[0] = 0x02; mac[1] = 0x51; mac[2] = 0x1c;            /* "sic" */
+            mac[3] = (uint8_t)(hsh >> 16); mac[4] = (uint8_t)(hsh >> 8); mac[5] = (uint8_t)hsh;
+            mac_made = 1;
+        }
         kprintf("ath: WMI ready, MAC %02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         stage = A_UP;
         break;
@@ -612,15 +626,15 @@ static void htc_rx_msg(const uint8_t *m, size_t n)
         uint32_t tl = m[4];
         if (tl <= len) {
             const uint8_t *tr = m + 8 + len - tl;
-            for (uint32_t o = 0; o + 2 <= tl; ) {
+            for (uint32_t o = 0; o + 4 <= tl; ) {             /* records: id, len, 2 pad, then len bytes */
                 uint8_t rid = tr[o], rl = tr[o + 1];
-                if (o + 2 + rl > tl) break;
-                if (rid == 1)
+                if (o + 4 + rl > tl) break;
+                if (rid == 1)                                   /* credits: eid, credits, 2 pad each */
                     for (uint32_t k = 0; k + 4 <= rl; k += 4) {
-                        uint8_t e = tr[o + 2 + k], cr = tr[o + 3 + k];
-                        if (e < EP_COUNT) eps[e].credits += cr;
+                        uint8_t e = tr[o + 4 + k], cr = tr[o + 5 + k];
+                        if (e < EP_COUNT) { eps[e].credits += cr; credits_back += cr; }
                     }
-                o += 2u + rl;
+                o += 4u + rl;
             }
             len -= tl;
         }
@@ -768,12 +782,12 @@ size_t qcom_ath_report(char *buf, size_t len)
     if (stage != A_OFF && n < len) {
         n += (size_t)ksnprintf(buf + n, len - n, "  ce rx:");
         for (int i = 0; i < CE_COUNT && n < len; i++) if (pipes[i].dst_n) n += (size_t)ksnprintf(buf + n, len - n, " %d:%u", i, pipes[i].rx_count);
-        if (n < len) n += (size_t)ksnprintf(buf + n, len - n, "; tx: 0:%u 3:%u; htc %u msgs; wmi %u events (%u unknown, last %x), credits %d, queued %d\n",
+        if (n < len) n += (size_t)ksnprintf(buf + n, len - n, "; tx: 0:%u 3:%u; htc %u msgs; wmi %u events (%u unknown, last %x), credits %d (%u back), queued %d\n",
                                            pipes[0].tx_count, pipes[3].tx_count, htc_rx, wmi_events, wmi_unknown, last_unknown,
-                                           wmi_ep >= 0 ? eps[wmi_ep].credits : -1, wq_len);
+                                           wmi_ep >= 0 ? eps[wmi_ep].credits : -1, credits_back, wq_len);
     }
     if (stage == A_UP && n < len)
-        n += (size_t)ksnprintf(buf + n, len - n, "  MAC %02x:%02x:%02x:%02x:%02x:%02x, %d scans%s, %u frames, %d networks\n",
-                               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], scans, scanning ? " (scanning)" : "", mgmt_rx, nbss);
+        n += (size_t)ksnprintf(buf + n, len - n, "  MAC %02x:%02x:%02x:%02x:%02x:%02x%s, %d scans%s, %u frames, %d networks\n",
+                               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], mac_made ? " (made here)" : "", scans, scanning ? " (scanning)" : "", mgmt_rx, nbss);
     return n;
 }
