@@ -42,7 +42,7 @@ static char why[96];
 static uint32_t chip_id = 0xff, chip_family, board_id = 0xff, soc_id, fw_version;
 static char build[64], bdf_name[32];
 static struct { uint64_t addr; uint32_t size; uint8_t secure; } regions[4];
-static int nregions, msa_fixed;
+static int nregions, msa_fixed, rails_voted;
 static uint8_t *bdf;
 static size_t bdf_len, bdf_off;
 static uint32_t bdf_seg;
@@ -291,7 +291,13 @@ void qcom_wlan_poll(void)
         m_send(&m, S_IND);
         return;
     }
-    if (st == S_FW_READY) { send_cfg(); return; }
+    if (st == S_FW_READY) {
+        /* the radio's regulators first, as ath10k_hw_power_on before the
+         * WLAN is enabled: the RPM owns them */
+        if (!rails_voted) { rails_voted = 1; qcom_rpm_wlan_power(); }
+        send_cfg();
+        return;
+    }
     if (st == S_ON) { qcom_ath_poll(); return; }
     if (st != S_FAILED && st != S_FW_WAIT && timer_ms() - sent_at > 10000) fail("no answer in 10 s (%u%u)", 0, 0);
 }
@@ -304,6 +310,7 @@ size_t qcom_wlan_report(char *buf, size_t len)
                                chip_id, chip_family, board_id, soc_id, fw_version, build, bdf_name[0] ? bdf_name : "-");
     for (int i = 0; i < nregions && n < len; i++)
         n += (size_t)ksnprintf(buf + n, len - n, "  MSA region %lx+%x%s\n", (unsigned long)regions[i].addr, regions[i].size, regions[i].secure ? " (secure)" : "");
+    if (rails_voted && n < len) n += qcom_rpm_report(buf + n, len - n);
     if (st == S_ON && n < len) n += qcom_ath_report(buf + n, len - n);
     return n;
 }

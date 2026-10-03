@@ -328,11 +328,11 @@ static void svc_pipes(uint16_t svc, int *ul, int *dl)
 
 enum {
     WMI_INIT = 0x1, WMI_START_SCAN = 0x3001, WMI_SCAN_CHAN_LIST = 0x3003, WMI_VDEV_CREATE = 0x5001,
-    EV_SERVICE_READY = 0x1, EV_READY = 0x2, EV_SCAN = 0x3001, EV_MGMT_RX = 0x7001,
+    EV_SERVICE_READY = 0x1, EV_READY = 0x2, EV_SCAN = 0x3001, EV_CHAN_INFO = 0x4002, EV_MGMT_RX = 0x7001,
 };
 enum {
     TAG_ARRAY_UINT32 = 0x10, TAG_ARRAY_BYTE = 0x11, TAG_ARRAY_STRUCT = 0x12, TAG_ARRAY_FIXED_STRUCT = 0x13,
-    TAG_SERVICE_READY = 0x20, TAG_HOST_MEM_REQ = 0x22, TAG_READY = 0x23, TAG_SCAN_EVENT = 0x24, TAG_MGMT_RX_HDR = 0x2c,
+    TAG_SERVICE_READY = 0x20, TAG_HOST_MEM_REQ = 0x22, TAG_READY = 0x23, TAG_SCAN_EVENT = 0x24, TAG_CHAN_INFO = 0x26, TAG_MGMT_RX_HDR = 0x2c,
     TAG_INIT_CMD = 0x4a, TAG_RESOURCE_CONFIG = 0x4b, TAG_HOST_MEMORY_CHUNK = 0x4c, TAG_START_SCAN = 0x4d,
     TAG_SCAN_CHAN_LIST = 0x4f, TAG_CHANNEL = 0x50, TAG_VDEV_CREATE = 0x56,
 };
@@ -417,6 +417,8 @@ static struct bss { uint8_t bssid[6]; char ssid[33]; int rssi, freq, secure; uin
 static int nbss;
 static int vdev_up, scanning, scans;
 static uint32_t mgmt_rx;
+static uint32_t chinfo_n, clear_max, last_freq, last_cycles;
+static int32_t nf_min = 1000, nf_max = -1000;
 
 static const uint16_t chans_2g[] = { 2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472 };
 static const uint16_t chans_5g[] = { 5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580,
@@ -535,7 +537,7 @@ static void wmi_event(const uint8_t *m, size_t n)
     wmi_events++;
     const uint8_t *t = m + 4, *end = m + n;
     /* the TLVs, by tag (first of each) */
-    const uint8_t *svc = NULL, *rdy = NULL, *scan = NULL, *rxhdr = NULL, *frame = NULL, *memreqs = NULL;
+    const uint8_t *svc = NULL, *rdy = NULL, *scan = NULL, *rxhdr = NULL, *frame = NULL, *memreqs = NULL, *chinfo = NULL;
     uint32_t frame_len = 0, memreqs_len = 0;
     while (t + 4 <= end) {
         uint32_t h; memcpy(&h, t, 4);
@@ -545,6 +547,7 @@ static void wmi_event(const uint8_t *m, size_t n)
         if (tag == TAG_SERVICE_READY && !svc) svc = v;
         else if (tag == TAG_READY && !rdy) rdy = v;
         else if (tag == TAG_SCAN_EVENT && !scan) scan = v;
+        else if (tag == TAG_CHAN_INFO && !chinfo) chinfo = v;
         else if (tag == TAG_MGMT_RX_HDR && !rxhdr) rxhdr = v;
         else if (tag == TAG_ARRAY_BYTE && !frame) { frame = v; frame_len = len; }
         else if (tag == TAG_ARRAY_STRUCT && !memreqs) { memreqs = v; memreqs_len = len; }
@@ -605,6 +608,16 @@ static void wmi_event(const uint8_t *m, size_t n)
             memcpy(&chan, rxhdr, 4); memcpy(&snr, rxhdr + 4, 4); memcpy(&buflen, rxhdr + 16, 4); memcpy(&status, rxhdr + 20, 4);
             mgmt_rx++;
             if (!(status & 1)) saw_frame(frame, buflen < frame_len ? buflen : frame_len, (int)snr - 95, (int)chan);
+        }
+        break;
+    case EV_CHAN_INFO:
+        if (chinfo) {                                       /* err, freq, flags, noise floor, rx clear, cycles */
+            int32_t nf; uint32_t freq, clr, cyc;
+            memcpy(&freq, chinfo + 4, 4); memcpy(&nf, chinfo + 12, 4); memcpy(&clr, chinfo + 16, 4); memcpy(&cyc, chinfo + 20, 4);
+            chinfo_n++;
+            if (nf) { if (nf < nf_min) nf_min = nf; if (nf > nf_max) nf_max = nf; }
+            if (clr > clear_max) clear_max = clr;
+            last_freq = freq; last_cycles = cyc;
         }
         break;
     default:
@@ -775,6 +788,7 @@ size_t qcom_ath_report(char *buf, size_t len)
 {
     size_t n = (size_t)ksnprintf(buf, len, "radio: %s%s%s\n", stage_names[stage], stage == A_FAILED ? ": " : "", stage == A_FAILED ? why : "");
     if (smmu_note[0] && n < len) n += (size_t)ksnprintf(buf + n, len - n, "  smmu: %s\n", smmu_note);
+    if (!pmic_ok && n < len) n += (size_t)ksnprintf(buf + n, len - n, "  rails: the PMIC's LDO registers do not read from here\n");
     if (pmic_ok && n < len)
         n += (size_t)ksnprintf(buf + n, len - n, "  rails (EN_CTL/STATUS1/V): L8 %02x/%02x/%02x L16 %02x/%02x/%02x L17 %02x/%02x/%02x L23 %02x/%02x/%02x\n",
                                pmic_l[0][0], pmic_l[0][1], pmic_l[0][2], pmic_l[1][0], pmic_l[1][1], pmic_l[1][2],
@@ -789,5 +803,8 @@ size_t qcom_ath_report(char *buf, size_t len)
     if (stage == A_UP && n < len)
         n += (size_t)ksnprintf(buf + n, len - n, "  MAC %02x:%02x:%02x:%02x:%02x:%02x%s, %d scans%s, %u frames, %d networks\n",
                                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], mac_made ? " (made here)" : "", scans, scanning ? " (scanning)" : "", mgmt_rx, nbss);
+    if (chinfo_n && n < len)
+        n += (size_t)ksnprintf(buf + n, len - n, "  channels: %u reports, noise floor %d..%d dBm, busy count up to %u, last %u MHz (%u cycles)\n",
+                               chinfo_n, nf_min == 1000 ? 0 : nf_min, nf_max == -1000 ? 0 : nf_max, clear_max, last_freq, last_cycles);
     return n;
 }
