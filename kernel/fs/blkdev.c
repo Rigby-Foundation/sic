@@ -109,17 +109,37 @@ static int part_write(struct blkdev *d, uint64_t lba, uint32_t count, const void
     return d->parent->write(d->parent, d->start + lba, count, buf);
 }
 
-static void add_partition(struct blkdev *disk, int index, uint64_t start, uint64_t sectors)
+/* A GPT partition's name, as /dev/by-name/<label> (a phone's "userdata"). */
+static void name_partition(struct blkdev *p, const uint16_t *label)
+{
+    char path[64] = "/dev/by-name/";
+    size_t n = strlen(path), start = n;
+    for (int i = 0; i < 36 && label[i] && n < sizeof path - 1; i++) {
+        uint16_t c = le16toh(label[i]);
+        path[n++] = c > 32 && c < 127 && c != '/' ? (char)c : '_';
+    }
+    path[n] = 0;
+    if (n == start) return;
+    if (!vfs_lookup(vfs_root(), "/dev/by-name")) vfs_create(vfs_root(), "/dev/by-name", VNODE_DIR);
+    if (vfs_lookup(vfs_root(), path)) return;              /* two LUNs with the same label: the first keeps it */
+    vfs_mkdev(path, &blk_node_ops, p);
+    struct vnode *v = vfs_lookup(vfs_root(), path);
+    if (v) { v->size = p->sectors * p->sector_size; v->is_block = 1; }
+}
+
+static struct blkdev *add_partition(struct blkdev *disk, int index, uint64_t start, uint64_t sectors)
 {
     if (!sectors || start + sectors > disk->sectors)
-        return;
+        return NULL;
     char name[16];
     size_t n = strlen(disk->name);
     memcpy(name, disk->name, n);
-    /* nvme0n1 -> nvme0n1p1, sda -> sda1 */
+    /* nvme0n1 -> nvme0n1p1, sda -> sda1, sda12 */
     if (disk->name[n - 1] >= '0' && disk->name[n - 1] <= '9')
         name[n++] = 'p';
-    name[n++] = (char)('0' + index);
+    if (index >= 100) name[n++] = (char)('0' + index / 100);
+    if (index >= 10) name[n++] = (char)('0' + index / 10 % 10);
+    name[n++] = (char)('0' + index % 10);
     name[n] = 0;
     struct blkdev *old = blkdev_find(name);
     if (old) {                          /* rescan: update in place */
@@ -129,10 +149,10 @@ static void add_partition(struct blkdev *disk, int index, uint64_t start, uint64
         memcpy(path + 5, name, n + 1);
         struct vnode *v = vfs_lookup(vfs_root(), path);
         if (v) v->size = sectors * disk->sector_size;
-        return;
+        return old;
     }
     struct blkdev *p = kzalloc(sizeof(*p));
-    if (!p) return;
+    if (!p) return NULL;
     memcpy(p->name, name, n + 1);
     p->sector_size = disk->sector_size;
     p->sectors = sectors;
@@ -142,6 +162,7 @@ static void add_partition(struct blkdev *disk, int index, uint64_t start, uint64
     p->write = part_write;
     p->priv = disk->priv;
     blkdev_register(p);
+    return p;
 }
 
 struct gpt_header {
@@ -161,9 +182,10 @@ struct gpt_entry {
 
 static void scan_partitions(struct blkdev *disk)
 {
-    if (disk->sector_size != 512 || disk->sectors < 2)
+    uint32_t ss = disk->sector_size;                      /* 512, or 4096 on UFS */
+    if ((ss != 512 && ss != 4096) || disk->sectors < 2)
         return;
-    uint8_t *sec = kmalloc(512);
+    uint8_t *sec = kmalloc(ss);
     if (!sec) return;
     if (disk->read(disk, 0, 1, sec) != 0 || sec[510] != 0x55 || sec[511] != 0xAA)
         goto out;
@@ -179,7 +201,7 @@ static void scan_partitions(struct blkdev *disk)
         uint32_t entry_size = le32toh(h.entry_size), entry_count = le32toh(h.entry_count);
         uint64_t entries_lba = le64toh(h.entries_lba);
         if (memcmp(h.sig, "EFI PART", 8) != 0 || entry_size < sizeof(struct gpt_entry)) goto out;
-        uint32_t per_sector = 512 / entry_size;
+        uint32_t per_sector = ss / entry_size;
         int index = 1;
         for (uint32_t i = 0; i < entry_count && i < 128; i++) {
             if (i % per_sector == 0 && disk->read(disk, entries_lba + i / per_sector, 1, sec) != 0) break;
@@ -187,7 +209,10 @@ static void scan_partitions(struct blkdev *disk)
             int empty = 1;
             for (int k = 0; k < 16; k++) if (e->type[k]) empty = 0;
             if (empty) { index++; continue; }
-            add_partition(disk, index++, le64toh(e->first), le64toh(e->last) - le64toh(e->first) + 1);
+            uint16_t label[36];
+            memcpy(label, e->name, sizeof label);
+            struct blkdev *p = add_partition(disk, index++, le64toh(e->first), le64toh(e->last) - le64toh(e->first) + 1);
+            if (p) name_partition(p, label);
         }
         goto out;
     }

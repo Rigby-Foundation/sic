@@ -119,6 +119,10 @@ void arch_init_smp(void)
     qcom_panel_init();              /* its panel through the running DSI controller: /dev/panel */
     extern void qcom_i2c_init(void);
     qcom_i2c_init();                /* its I2C buses and the battery's fuel gauge: /dev/battery */
+#ifdef CONFIG_UFS
+    extern void qcom_ufs_init(void);
+    qcom_ufs_init();                /* its flash, the bootloader's UFS controller: /dev/sdX */
+#endif
 }
 
 void arch_halt_forever(void)

@@ -47,6 +47,7 @@ CONFIG_VIRTIO_INPUT := $(call cfg,CONFIG_VIRTIO_INPUT)
 CONFIG_RADEON     := $(call cfg,CONFIG_RADEON)
 CONFIG_PCI        := $(call cfg,CONFIG_PCI)
 CONFIG_NVME       := $(call cfg,CONFIG_NVME)
+CONFIG_UFS        := $(call cfg,CONFIG_UFS)
 CONFIG_AHCI       := $(call cfg,CONFIG_AHCI)
 CONFIG_IDE        := $(call cfg,CONFIG_IDE)
 CONFIG_NET        := $(call cfg,CONFIG_NET)
@@ -75,7 +76,7 @@ LDFLAGS := $(ARCH_LDFLAGS) -T $(LINKER_SCRIPT) -nostdlib -static -z max-page-siz
 OPTIONAL := kernel/arch/x86_64/smp.c kernel/arch/x86_64/ap_trampoline.S kernel/arch/aarch64/smp.c kernel/arch/powerpc/escc.c kernel/arch/aarch64/pl011.c \
             kernel/arch/x86_64/module.c kernel/arch/powerpc/module.c kernel/arch/aarch64/module.c \
             kernel/drivers/fb.c kernel/drivers/font.c kernel/drivers/serial.c kernel/drivers/keyboard.c kernel/drivers/mouse.c \
-            kernel/drivers/pci.c kernel/drivers/nvme.c kernel/drivers/ahci.c kernel/drivers/ide.c \
+            kernel/drivers/pci.c kernel/drivers/nvme.c kernel/drivers/ufs.c kernel/arch/aarch64/qcom_ufs.c kernel/drivers/ahci.c kernel/drivers/ide.c \
             kernel/drivers/virtio.c kernel/drivers/virtio_gpu.c kernel/drivers/virtio_input.c kernel/drivers/radeon.c \
             kernel/fs/zaefs.c kernel/fs/fat.c \
             kernel/net/core.c kernel/net/arp.c kernel/net/ip.c kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c kernel/net/unix.c \
@@ -94,6 +95,7 @@ SRC-$(CONFIG_RADEON)     += kernel/drivers/radeon.c kernel/drivers/radeon_cp.c
 SRC-y += $(if $(CONFIG_VIRTIO_GPU)$(CONFIG_VIRTIO_INPUT),kernel/drivers/virtio.c,)
 SRC-$(CONFIG_PCI)        += kernel/drivers/pci.c
 SRC-$(CONFIG_NVME)       += kernel/drivers/nvme.c
+SRC-$(CONFIG_UFS)        += kernel/drivers/ufs.c $(if $(filter aarch64,$(ARCH)),kernel/arch/aarch64/qcom_ufs.c)
 SRC-$(CONFIG_AHCI)       += kernel/drivers/ahci.c
 SRC-$(CONFIG_IDE)        += kernel/drivers/ide.c
 SRC-$(CONFIG_NET)        += kernel/net/core.c kernel/net/arp.c kernel/net/ip.c kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c kernel/net/unix.c

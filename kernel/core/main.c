@@ -12,6 +12,7 @@
 #include "mm/shm.h"
 #include "drivers/pci.h"
 #include "drivers/nvme.h"
+#include "drivers/ufs.h"
 #include "drivers/ahci.h"
 #include "drivers/ide.h"
 #include "drivers/sound.h"
@@ -191,6 +192,9 @@ void kernel_main(struct zaeboot_info *info)
     arch_init_smp();
 #ifdef CONFIG_NVME
     nvme_init();
+#endif
+#ifdef CONFIG_UFS
+    ufs_init();
 #endif
 #ifdef CONFIG_AHCI
     ahci_init();

@@ -21,6 +21,7 @@ CONFIG_RADEON=y         # ATI Radeon Xpress 200M/1100/1150 laptop panels (RS480/
 # --- buses & storage --------------------------------------------------------
 CONFIG_PCI=y            # PCI enumeration (needed by every PCI driver below)
 CONFIG_NVME=y           # NVMe controllers -> /dev/nvmeXnY  (needs PCI)
+CONFIG_UFS=y            # UFS host controllers (UFSHCI) -> /dev/sdX, one per logical unit (needs PCI; a phone's is on its SoC)
 CONFIG_AHCI=y           # SATA (AHCI) controllers -> /dev/sdX (needs PCI)
 CONFIG_IDE=y            # legacy IDE/ATA, PIO -> /dev/hdX (needs PCI)
 CONFIG_HDA=y            # Intel HD Audio -> /dev/dsp (OSS-style playback; needs PCI)

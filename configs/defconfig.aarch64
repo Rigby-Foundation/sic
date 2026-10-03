@@ -11,6 +11,7 @@ CONFIG_VIRTIO_GPU=y        # QEMU -device virtio-gpu-pci
 CONFIG_VIRTIO_INPUT=y      # QEMU -device virtio-keyboard-pci / virtio-mouse-pci
 CONFIG_PCI=y               # the generic ECAM host bridge
 CONFIG_NVME=y
+CONFIG_UFS=y              # UFS: QEMU -device ufs, and a Qualcomm phone's flash
 CONFIG_AHCI=n
 CONFIG_IDE=n
 CONFIG_HDA=y               # QEMU -device intel-hda (a PCI device on virt too)
