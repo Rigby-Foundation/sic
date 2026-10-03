@@ -104,7 +104,7 @@ static uint32_t tx_len, rx_len;
 static uint32_t features = FEATURE_INTENT_REUSE;
 static int link_version;                    /* 1 once the modem acknowledged ours */
 
-#define MAX_INTENTS 16
+#define MAX_INTENTS 64                     /* the modem offers 16 at once, and more when asked */
 struct intent { uint32_t id, size, used; uint8_t *buf; };
 struct pending { struct pending *next; size_t len, off; uint32_t iid; int has_intent; uint8_t data[]; };
 
@@ -331,7 +331,7 @@ struct chan *glink_channel(const char *name, void (*on_up)(struct chan *), void 
     return c;
 }
 
-static uint32_t unknown_cmds;
+static uint32_t unknown_cmds, intent_refusals, intents_dropped;
 
 /* Everything waiting in the receive FIFO. */
 static void glink_rx(void)
@@ -387,7 +387,13 @@ static void glink_rx(void)
             if (c) { kprintf("glink: the modem closes %s\n", c->name); c->remote_open = c->up = 0; c->ntheirs = 0; }
             break;
         }
-        case CMD_CLOSE_ACK: case CMD_RX_INTENT_REQ_ACK: case CMD_SIGNALS:
+        case CMD_RX_INTENT_REQ_ACK: {
+            rx_advance(8);
+            struct chan *c = chan_by_rcid(p1);
+            if (c && !p2) { c->intent_asked = 0; intent_refusals++; }  /* refused: ask again on the next round */
+            break;
+        }
+        case CMD_CLOSE_ACK: case CMD_SIGNALS:
             rx_advance(8);
             break;
         case CMD_INTENT: {
@@ -398,6 +404,7 @@ static void glink_rx(void)
                 uint32_t pr[2];
                 rx_peek(pr, 8 + 8 * i, 8);
                 if (c && c->ntheirs < MAX_INTENTS) { c->theirs[c->ntheirs++] = (struct intent){ pr[1], pr[0], 0, NULL }; c->intent_asked = 0; }
+                else if (c && intents_dropped++ < 4) kprintf("glink: %s: no room for the modem's intent %u (%u bytes)\n", c->name, pr[1], pr[0]);
             }
             rx_advance((total + 7) & ~7u);
             break;
@@ -666,7 +673,10 @@ static void ipc_thread(void *arg)
                                    bits & 2 ? " ready" : "", bits & 4 ? " handover" : "", bits & 8 ? " stop-ack" : "");
             last_bits = bits;
         }
-        task_sleep_ms(2);
+        int busy = 0;                                       /* something waiting: go round again soon */
+        for (int i = 0; i < nchans; i++) if (chans[i].queue) busy = 1;
+        if (desc && rx_avail()) busy = 1;
+        if (busy) task_yield(); else task_sleep_ms(2);
     }
 }
 
@@ -684,7 +694,7 @@ static size_t make_report(void)
     size_t n = 0;
 #define P(...) do { if (n < sizeof report) n += (size_t)ksnprintf(report + n, sizeof report - n, __VA_ARGS__); } while (0)
     P("glink: %s, features %x\n", !desc ? "not attached" : link_version ? "up" : "waiting for the modem's version ack", features);
-    if (desc) P("  fifo tx %u/%u rx %u/%u\n", desc[1], desc[0], desc[3], desc[2]);
+    if (desc) P("  fifo tx %u/%u rx %u/%u; intents refused %u, dropped %u\n", desc[1], desc[0], desc[3], desc[2], intent_refusals, intents_dropped);
     for (int i = 0; i < nchans; i++)
         P("  channel %s: %s, ours %u its %u, %d/%d intents, %u in %u out%s\n", chans[i].name, chans[i].up ? "open" : chans[i].remote_open ? "opened by the modem" : "closed",
           chans[i].lcid, chans[i].rcid, chans[i].nours, chans[i].ntheirs, chans[i].rx_count, chans[i].tx_count, chans[i].queue ? ", queued" : "");
