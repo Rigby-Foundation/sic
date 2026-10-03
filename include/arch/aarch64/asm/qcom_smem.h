@@ -11,5 +11,6 @@
  * pointer into device memory (read it with mmio_read32), or NULL. */
 void *smem_get(unsigned host, unsigned item, size_t *size);
 uint64_t smem_virt_to_phys(const void *p);
+int smem_alloc(unsigned host, unsigned item, size_t size);   /* 0: there (now or already) */
 
 #endif

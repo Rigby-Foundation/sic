@@ -13,6 +13,7 @@
 #include "asm/memlayout.h"
 #include "asm/qcom_scm.h"
 #include "asm/qcom_smem.h"
+#include "asm/qcom_ipc.h"
 #include "asm/timer.h"
 #include "fs/vfs.h"
 #include "mm/pmm.h"
@@ -27,7 +28,7 @@
 #define FW_DIR          "/mnt/modem/image/"
 #define MSS_PAS_ID      4
 #define CRASH_REASON    421             /* SMEM item: the modem's last words */
-#define SMP2P_IN_ITEM   428             /* the modem's SMP2P entries for us */
+#define SMP2P_IN_ITEM   435             /* the modem's SMP2P entries for us (428 is ours) */
 #define MAX_PHDRS       64
 
 #define PT_LOAD             1
@@ -251,11 +252,16 @@ static void start_thread(void *arg)
     }
     __asm__ volatile("dsb sy" ::: "memory");
     kprintf("mss: image loaded in %lu ms; authenticating\n", (unsigned long)(timer_ms() - t0));
+    /* What it looks for as soon as it runs: its remote file system's
+     * buffer and service, our SMP2P item. */
+    if (qcom_rmtfs_setup() != 0) kprintf("mss: no rmtfs: the modem will stall without it\n");
+    if (qcom_smp2p_init() != 0) kprintf("mss: no SMP2P item of ours\n");
     ksnprintf(state, sizeof state, "authenticating");
     r = qcom_scm_call(SCM_PIL, 5, 1, MSS_PAS_ID, 0, 0);                             /* AUTH_AND_RESET */
     if (r.a0 || r.a1) { ksnprintf(state, sizeof state, "auth and reset: %ld/%lu", (long)r.a0, (unsigned long)r.a1); goto shutdown; }
     ksnprintf(state, sizeof state, "running");
     kprintf("mss: the modem runs\n");
+    qcom_ipc_start();                                       /* GLINK, QRTR: rmtfs answers it */
     goto out;
 shutdown:
     qcom_scm_call(SCM_PIL, 6, 1, MSS_PAS_ID, 0, 0);                                 /* SHUTDOWN: TrustZone lets go of the memory */
@@ -268,7 +274,7 @@ out:
 
 /* ---- /dev/mss ------------------------------------------------------------------------------ */
 
-static char report[1024];
+static char report[2048];
 
 static void smp2p_report(size_t *n)
 {
@@ -292,6 +298,7 @@ static size_t make_report(void)
 {
     size_t n = (size_t)ksnprintf(report, sizeof report, "modem: %s\n", pas_state());
     smp2p_report(&n);
+    if (n < sizeof report) n += qcom_rmtfs_report(report + n, sizeof report - n);
     size_t sz;
     const volatile uint8_t *cr = smem_get(SMEM_GLOBAL_HOST, CRASH_REASON, &sz);
     if (cr && sz && n < sizeof report - 8) {
@@ -367,5 +374,6 @@ void qcom_mss_init(void)
         }
     present = region && region_size && meta_phys && !(meta_phys & (PAGE_SIZE - 1));
     vfs_mkdev("/dev/mss", &mss_ops, NULL);
+    qcom_ipc_init();
     kprintf("mss: modem_region %lx+%lx%s\n", (unsigned long)region, (unsigned long)region_size, present ? "" : " (incomplete: it cannot start)");
 }

@@ -118,6 +118,60 @@ void *smem_get(unsigned host, unsigned item, size_t *size)
     return (void *)(smem + off);
 }
 
+/* ---- allocation ------------------------------------------------------------------------ */
+
+/* Allocation is guarded by a TCSR hardware mutex (the DT's hwlocks, lock 3
+ * on these SoCs): a lock is taken by writing our processor id (1, apps)
+ * and reading it back. */
+#define TCSR_MUTEX_BASE     0x340000
+#define TCSR_MUTEX_STRIDE   0x1000
+#define SMEM_HWLOCK         3
+#define APPS_PROC_ID        1
+
+static int hwlock_take(void)
+{
+    volatile uint8_t *m = P2V(TCSR_MUTEX_BASE + SMEM_HWLOCK * TCSR_MUTEX_STRIDE);
+    for (int i = 0; i < 100000; i++) {
+        mmio_write32(m, APPS_PROC_ID);
+        if (mmio_read32(m) == APPS_PROC_ID) return 0;
+    }
+    return -1;
+}
+static void hwlock_give(void) { mmio_write32((volatile uint8_t *)P2V(TCSR_MUTEX_BASE + SMEM_HWLOCK * TCSR_MUTEX_STRIDE), 0); }
+
+static void wr32(uint64_t off, uint32_t v) { if (off + 4 <= smem_size) mmio_write32(smem + off, v); }
+
+/* Item `item` of `size` bytes in the partition shared with `host` (an
+ * uncached entry, as Linux's qcom_smem_alloc_private): 0, or 0 too if it
+ * is already there (the remote, or an earlier boot, made it), -1 if it
+ * cannot be. */
+int smem_alloc(unsigned host, unsigned item, size_t size)
+{
+    if (!smem || item >= SMEM_ITEM_COUNT || version != 12) return -1;
+    if (smem_get(host, item, NULL)) return 0;
+    int p = find_partition(0, host);
+    if (p < 0 || !partition_ours(p)) return -1;
+    uint64_t off = rd32(PT_ENTRY(p)), psz = rd32(PT_ENTRY(p) + 4);
+    if (hwlock_take()) return -1;
+    int rc = -1;
+    uint64_t free_unc = rd32(off + 12), free_cac = rd32(off + 16);
+    uint64_t e = off + free_unc;
+    uint32_t asize = (uint32_t)((size + 7) & ~(size_t)7);
+    if (rd32(off) == 0x54525024 && free_unc >= 32 && free_cac <= psz && free_unc + 16 + asize <= free_cac) {
+        wr32(e, PRIVATE_CANARY | (uint32_t)item << 16);             /* canary, item */
+        wr32(e + 4, asize);                                         /* size */
+        wr32(e + 8, (asize - (uint32_t)size));                      /* padding_data, padding_hdr 0 */
+        wr32(e + 12, 0);
+        for (uint32_t i = 0; i < asize; i += 4) wr32(e + 16 + i, 0);
+        __asm__ volatile("dsb sy" ::: "memory");
+        wr32(off + 12, (uint32_t)(free_unc + 16 + asize));
+        rc = 0;
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    hwlock_give();
+    return rc;
+}
+
 uint64_t smem_virt_to_phys(const void *p) { return smem_phys + (uint64_t)((const volatile uint8_t *)p - smem); }
 
 /* ---- /dev/smem --------------------------------------------------------------------- */
