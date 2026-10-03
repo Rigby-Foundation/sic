@@ -27,6 +27,14 @@ size_t qcom_pdmap_report(char *buf, size_t len);
 int qcom_mss_start(void);                       /* qcom_mss.c */
 const char *qcom_mss_state(void);
 void qcom_wlan_init(void);                      /* /dev/wlan */
+int qcom_pmic_read(unsigned sid, uint16_t addr, uint8_t *out);  /* qcom_keys.c */
+/* qcom_ath.c: the WLAN's copy engines, HTC, WMI */
+int    qcom_ath_start(void);
+void   qcom_ath_poll(void);
+int    qcom_ath_scan(void);
+int    qcom_ath_state(void);                    /* 0 not up, 1 up, 2 scanning, -1 failed */
+size_t qcom_ath_nets(char *buf, size_t len);
+size_t qcom_ath_report(char *buf, size_t len);
 
 int    qcom_rmtfs_setup(void);                  /* the modem's file system service (qcom_rmtfs.c) */
 size_t qcom_rmtfs_report(char *buf, size_t len);

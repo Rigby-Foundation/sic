@@ -72,6 +72,15 @@ static int spmi_read(int apid, uint16_t addr, uint8_t *out)
     return -1;
 }
 
+/* A byte of a PMIC register (SID, 16-bit address), for other drivers
+ * (the WLAN's regulators); -1 if no channel serves it or the read fails. */
+int qcom_pmic_read(unsigned sid, uint16_t addr, uint8_t *out)
+{
+    if (!core || !obs) return -1;
+    int apid = find_apid((uint16_t)(sid << 8 | addr >> 8));
+    return apid < 0 ? -1 : spmi_read(apid, addr, out);
+}
+
 /* A write, through the channel's owner registers: only if this EE owns it. */
 static int spmi_write(int apid, uint16_t addr, uint8_t v)
 {

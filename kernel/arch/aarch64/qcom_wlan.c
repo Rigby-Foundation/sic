@@ -25,13 +25,14 @@
 #define FW_DIR              "/mnt/modem/image/"
 
 enum {
-    IND_REGISTER = 0x20, FW_READY_IND = 0x21, CAP = 0x24, BDF_DOWNLOAD = 0x25, CAL_REPORT = 0x26,
+    IND_REGISTER = 0x20, FW_READY_IND = 0x21, WLAN_MODE = 0x22, WLAN_CFG = 0x23, CAP = 0x24, BDF_DOWNLOAD = 0x25, CAL_REPORT = 0x26,
     MSA_READY_IND = 0x2b, PIN_CONNECT_IND = 0x2c, MSA_INFO = 0x2d, MSA_READY = 0x2e, HOST_CAP = 0x34,
 };
 
-enum state { S_WAIT, S_IND, S_HOST_CAP, S_MSA_INFO, S_MSA_READY, S_CAP, S_BDF, S_CAL, S_FW_WAIT, S_FW_READY, S_FAILED };
+enum state { S_WAIT, S_IND, S_HOST_CAP, S_MSA_INFO, S_MSA_READY, S_CAP, S_BDF, S_CAL, S_FW_WAIT, S_FW_READY, S_CFG, S_MODE, S_ON, S_FAILED };
 static const char *const names[] = { "waiting for the service", "registering indications", "host capabilities", "MSA info",
-    "MSA ready", "capabilities", "board data", "calibration report", "waiting for FW_READY", "firmware ready", "failed" };
+    "MSA ready", "capabilities", "board data", "calibration report", "waiting for FW_READY", "firmware ready",
+    "copy engine configuration", "mission mode", "radio on", "failed" };
 
 static enum state st;
 static uint32_t node, port;
@@ -142,7 +143,7 @@ static void wlfw_rx(uint32_t from_node, uint32_t from_port, const uint8_t *p, si
     uint16_t id = (uint16_t)(p[3] | p[4] << 8), tl;
     if (p[0] == 4) {                                        /* an indication */
         if (id < 64) ind_seen[id]++;
-        if (id == FW_READY_IND) { kprintf("wlan: the firmware is ready\n"); st = S_FW_READY; }
+        if (id == FW_READY_IND) { kprintf("wlan: the firmware is ready\n"); if (st < S_FW_READY) st = S_FW_READY; }
         else if (id == MSA_READY_IND) kprintf("wlan: MSA ready (indication)\n");
         else kprintf("wlan: indication %x\n", id);
         return;
@@ -220,10 +221,60 @@ static void wlfw_rx(uint32_t from_node, uint32_t from_port, const uint8_t *p, si
         if (result) { fail("result %u error %u", result, error); return; }
         if (st != S_FW_READY) { st = S_FW_WAIT; sent_at = timer_ms(); }
         break;
+    case WLAN_CFG:
+        if (result) { fail("result %u error %u", result, error); return; }
+        m_start(&m, WLAN_MODE);
+        m_u32(&m, 0x01, 0);                                 /* mission mode */
+        m_u8(&m, 0x10, 0);                                  /* no hardware debug */
+        m_send(&m, S_MODE);
+        break;
+    case WLAN_MODE:
+        if (result) { fail("result %u error %u", result, error); return; }
+        kprintf("wlan: mission mode on\n");
+        st = S_ON;
+        qcom_ath_start();
+        break;
     default:
         kprintf("wlan: response %x\n", id);
         break;
     }
+}
+
+/* The copy engines as the target is to set them up, the services on them,
+ * and the shadow registers for their write indices: ath10k snoc.c's
+ * target_ce_config_wlan, target_service_to_ce_map_wlan and
+ * target_shadow_reg_cfg_map. */
+static void send_cfg(void)
+{
+    static const uint32_t tgt[12][5] = {        /* pipe, direction (1 in, 2 out, 3 both), entries, bytes, flags */
+        { 0, 2, 32, 2048, 0 }, { 1, 1, 32, 2048, 0 }, { 2, 1, 64, 2048, 0 }, { 3, 2, 32, 2048, 0 },
+        { 4, 2, 256, 256, 1 << 3 /* no interrupts */ }, { 5, 2, 1024, 64, 1 << 3 }, { 6, 3, 32, 16384, 0 },
+        { 7, 4, 0, 0, 1 << 3 }, { 8, 1, 32, 2048, 0 }, { 9, 1, 32, 2048, 0 }, { 10, 1, 32, 2048, 0 }, { 11, 1, 32, 2048, 0 },
+    };
+    static const uint32_t svc[19][3] = {        /* service, direction, pipe */
+        { 0x104, 2, 3 }, { 0x104, 1, 2 }, { 0x102, 2, 3 }, { 0x102, 1, 2 }, { 0x101, 2, 3 }, { 0x101, 1, 2 },
+        { 0x103, 2, 3 }, { 0x103, 1, 2 }, { 0x100, 2, 3 }, { 0x100, 1, 2 }, { 0x001, 2, 0 }, { 0x001, 1, 2 },
+        { 0xfe00, 2, 0 }, { 0xfe00, 1, 2 }, { 0x300, 2, 4 }, { 0x300, 1, 1 }, { 0xfe00, 2, 5 }, { 0x301, 1, 9 },
+        { 0x302, 1, 10 },
+    };
+    static const uint16_t shadow[12][2] = {     /* engine, register (source / destination write index) */
+        { 0, 0x3c }, { 3, 0x3c }, { 4, 0x3c }, { 5, 0x3c }, { 7, 0x3c },
+        { 1, 0x40 }, { 2, 0x40 }, { 7, 0x40 }, { 8, 0x40 }, { 9, 0x40 }, { 10, 0x40 }, { 11, 0x40 },
+    };
+    static const uint32_t svc_log[2][3] = { { 0x600, 1, 11 }, { 0, 0, 0 } };
+    uint8_t v[1 + 21 * 12];
+    m_start(&m, WLAN_CFG);
+    v[0] = 12;
+    for (int i = 0; i < 12; i++) memcpy(v + 1 + 20 * i, tgt[i], 20);
+    m_tlv(&m, 0x11, v, 1 + 20 * 12);
+    v[0] = 21;
+    for (int i = 0; i < 19; i++) memcpy(v + 1 + 12 * i, svc[i], 12);
+    for (int i = 0; i < 2; i++) memcpy(v + 1 + 12 * (19 + i), svc_log[i], 12);
+    m_tlv(&m, 0x12, v, 1 + 12 * 21);
+    v[0] = 12;
+    for (int i = 0; i < 12; i++) memcpy(v + 1 + 4 * i, shadow[i], 4);
+    m_tlv(&m, 0x13, v, 1 + 4 * 12);
+    m_send(&m, S_CFG);
 }
 
 void qcom_wlan_poll(void)
@@ -240,7 +291,9 @@ void qcom_wlan_poll(void)
         m_send(&m, S_IND);
         return;
     }
-    if (st != S_FAILED && st != S_FW_READY && st != S_FW_WAIT && timer_ms() - sent_at > 10000) fail("no answer in 10 s (%u%u)", 0, 0);
+    if (st == S_FW_READY) { send_cfg(); return; }
+    if (st == S_ON) { qcom_ath_poll(); return; }
+    if (st != S_FAILED && st != S_FW_WAIT && timer_ms() - sent_at > 10000) fail("no answer in 10 s (%u%u)", 0, 0);
 }
 
 size_t qcom_wlan_report(char *buf, size_t len)
@@ -251,6 +304,7 @@ size_t qcom_wlan_report(char *buf, size_t len)
                                chip_id, chip_family, board_id, soc_id, fw_version, build, bdf_name[0] ? bdf_name : "-");
     for (int i = 0; i < nregions && n < len; i++)
         n += (size_t)ksnprintf(buf + n, len - n, "  MSA region %lx+%x%s\n", (unsigned long)regions[i].addr, regions[i].size, regions[i].secure ? " (secure)" : "");
+    if (st == S_ON && n < len) n += qcom_ath_report(buf + n, len - n);
     return n;
 }
 
@@ -263,7 +317,7 @@ size_t qcom_wlan_report(char *buf, size_t len)
 #include "abi/abi.h"
 
 static char note[96];                       /* the answer to the last command that did not happen */
-static char wreport[1024];
+static char wreport[4096];
 
 static size_t wlan_status(void)
 {
@@ -276,7 +330,10 @@ static size_t wlan_status(void)
     } else if (!strcmp(ms, "starting") || !memcmp(ms, "loading", 7) || !strcmp(ms, "authenticating")) {
         word = "starting"; ksnprintf(d, sizeof d, "the modem: %s", ms); detail = d;
     } else if (!strcmp(ms, "running")) {
-        if (st == S_FW_READY) { word = "ready"; detail = "the WLAN firmware is ready; scanning is not written yet"; }
+        int a = st == S_ON ? qcom_ath_state() : 0;
+        if (st == S_ON && a > 0) { word = "ready"; detail = a == 2 ? "the radio is on; scanning" : "the radio is on"; }
+        else if (st == S_ON && a < 0) { word = "failed"; detail = "the radio did not come up (cat /dev/mss for why)"; }
+        else if (st == S_ON) { word = "starting"; detail = "the radio: copy engines, HTC, WMI"; }
         else if (st == S_FAILED) { word = "failed"; ksnprintf(d, sizeof d, "the WLAN firmware: %s", why); detail = d; }
         else { word = "starting"; ksnprintf(d, sizeof d, "the WLAN firmware: %s", names[st]); detail = d; }
     } else { word = "failed"; ksnprintf(d, sizeof d, "the modem: %s", ms); detail = d; }
@@ -284,6 +341,7 @@ static size_t wlan_status(void)
     if (note[0] && n < sizeof wreport) n += (size_t)ksnprintf(wreport + n, sizeof wreport - n, "note %s\n", note);
     if (chip_id != 0xff && n < sizeof wreport)
         n += (size_t)ksnprintf(wreport + n, sizeof wreport - n, "chip %x board %x firmware %x %s\n", chip_id, board_id, fw_version, build);
+    if (st == S_ON && n < sizeof wreport) n += qcom_ath_nets(wreport + n, sizeof wreport - n);
     return n;
 }
 
@@ -313,8 +371,14 @@ static long wlan_write(struct file *f, const void *buf, size_t len)
         int rc = qcom_mss_start();
         return rc && rc != -EBUSY ? rc : (long)len;
     }
-    if (!strcmp(cmd, "scan") || !strcmp(cmd, "connect") || !strcmp(cmd, "disconnect") || !strcmp(cmd, "off")) {
-        ksnprintf(note, sizeof note, "'%s' is not written yet: the radio cannot be turned on yet", cmd);
+    if (!strcmp(cmd, "scan")) {
+        note[0] = 0;
+        if (st == S_ON && qcom_ath_scan() == 0) return (long)len;
+        ksnprintf(note, sizeof note, "the radio is not on yet");
+        return -EBUSY;
+    }
+    if (!strcmp(cmd, "connect") || !strcmp(cmd, "disconnect") || !strcmp(cmd, "off")) {
+        ksnprintf(note, sizeof note, "'%s' is not written yet: scanning is, connecting comes next", cmd);
         return -EOPNOTSUPP;
     }
     return -EINVAL;
