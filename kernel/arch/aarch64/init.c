@@ -126,6 +126,8 @@ void arch_init_smp(void)
     qcom_panel_init();              /* its panel through the running DSI controller: /dev/panel */
     extern void qcom_i2c_init(void);
     qcom_i2c_init();                /* its I2C buses and the battery's fuel gauge: /dev/battery */
+    extern void qcom_smem_init(void);
+    qcom_smem_init();               /* its shared memory with the modem (Wi-Fi's way in): /dev/smem */
 #ifdef CONFIG_UFS
     extern void qcom_ufs_init(void);
     qcom_ufs_init();                /* its flash, the bootloader's UFS controller: /dev/sdX */
