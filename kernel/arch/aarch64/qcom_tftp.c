@@ -37,7 +37,7 @@ struct xfer {
 static struct xfer xfers[MAX_XFERS];
 static uint32_t next_port = TFTP_PORT + 1;
 static uint32_t n_reads, n_writes, n_missing;
-static char last_files[4][64];
+static char last_files[4][64], missing[2][72];
 static int last_n;
 
 static size_t str_nlen(const char *s, size_t max) { size_t n = 0; while (n < max && s[n]) n++; return n; }
@@ -169,7 +169,7 @@ static void request(uint32_t node, uint32_t port, const uint8_t *d, size_t len, 
         if (x->f) { struct stat st; vnode_stat(x->f->node, &st); x->size = st.size; }
     }
     if ((x->rwi < 0 && !x->f) || (write && x->rwi < 0)) {
-        n_missing++;
+        ksnprintf(missing[n_missing++ % 2], sizeof missing[0], "%s", path);
         send_error(TFTP_PORT, node, port, ERR_ENOENT, "file not found");
         x->used = 0;
         return;
@@ -257,5 +257,6 @@ size_t qcom_tftp_report(char *buf, size_t len)
     size_t n = (size_t)ksnprintf(buf, len, "tftp: %u reads, %u writes, %u not found; last:", n_reads, n_writes, n_missing);
     for (int i = 0; i < 4 && i < last_n && n < len; i++) n += (size_t)ksnprintf(buf + n, len - n, " %s", last_files[(last_n - 1 - i) % 4]);
     if (n < len) n += (size_t)ksnprintf(buf + n, len - n, "\n");
+    for (uint32_t i = 0; i < 2 && i < n_missing && n < len; i++) n += (size_t)ksnprintf(buf + n, len - n, "  not found: %s\n", missing[(n_missing - 1 - i) % 2]);
     return n;
 }

@@ -22,6 +22,8 @@ void qcom_tftp_setup(void);                     /* qcom_tftp.c: the modem's file
 void qcom_wlan_poll(void);                      /* qcom_wlan.c: WLFW, from the IPC thread */
 size_t qcom_wlan_report(char *buf, size_t len);
 size_t qcom_tftp_report(char *buf, size_t len);
+void qcom_pdmap_setup(void);                    /* qcom_pdmap.c: the protection domain mapper */
+size_t qcom_pdmap_report(char *buf, size_t len);
 int qcom_mss_start(void);                       /* qcom_mss.c */
 const char *qcom_mss_state(void);
 void qcom_wlan_init(void);                      /* /dev/wlan */
