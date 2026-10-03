@@ -17,6 +17,8 @@ struct scm_res { uint64_t a0, a1, a2, a3; };
 #define SCM_VMID_HLOS   3
 #define SCM_VMID_MSS_MSA 15
 #define SCM_VMID_NAV    0x2b
+#define SCM_VMID_WLAN   0x18
+#define SCM_VMID_WLAN_CE 0x19
 #define SCM_PERM_RW     6
 
 /* svc/cmd, the argument count and kinds, three arguments; a0 the status. */

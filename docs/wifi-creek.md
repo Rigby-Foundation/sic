@@ -13,8 +13,8 @@ the bottom up, and where sic stands on each:
 | SMP2P | modem ↔ apps state bits (items 0x1b3/0x1ac, IRQ SPI 0x46, mailbox bit 14): fatal/ready/handover/stop-ack | **ours (428) and the modem's (435), polled** (`qcom_ipc.c`) |
 | GLINK over SMEM | FIFOs in SMEM, IRQ SPI 0x44, mailbox bit 12 on `apcs_glb` 0x0f111000; channel `IPCRTR` | **polled; `cat /dev/qrtr`** |
 | QRTR + name service | the modem's services are found by name | **hello, our servers announced, the modem's listed** |
-| QMI services the modem needs | rmtfs (modemst1/2, fsg partitions), the tftp server it fetches its configs from | **rmtfs, read-only (writes kept in RAM)**; tftp todo |
-| WLFW (QMI) | send the board data (`bdwlan.*`), cal, mode ON | todo |
+| QMI services the modem needs | rmtfs (modemst1/2, fsg partitions), the tftp server it fetches its configs from | **rmtfs, read-only (writes kept in RAM); tftp (`/readwrite` in RAM)** |
+| WLFW (QMI) | send the board data (`bdwlan.*`), cal, mode ON | **up to FW_READY** (`qcom_wlan.c`); mode ON with the copy engines |
 | ath10k CE/HTC/WMI/HTT | copy engines behind the apps SMMU, `wlan_msa` 0x51900000 | todo |
 | 802.11 + WPA2 | scan, auth/assoc, 4-way handshake (a supplicant in user space) | todo |
 | net device | a `wlan0` for kernel/net | todo |

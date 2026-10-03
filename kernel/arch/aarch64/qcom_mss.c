@@ -255,6 +255,7 @@ static void start_thread(void *arg)
     /* What it looks for as soon as it runs: its remote file system's
      * buffer and service, our SMP2P item. */
     if (qcom_rmtfs_setup() != 0) kprintf("mss: no rmtfs: the modem will stall without it\n");
+    qcom_tftp_setup();                                      /* its WLAN firmware and configuration files */
     if (qcom_smp2p_init() != 0) kprintf("mss: no SMP2P item of ours\n");
     ksnprintf(state, sizeof state, "authenticating");
     r = qcom_scm_call(SCM_PIL, 5, 1, MSS_PAS_ID, 0, 0);                             /* AUTH_AND_RESET */
@@ -274,7 +275,7 @@ out:
 
 /* ---- /dev/mss ------------------------------------------------------------------------------ */
 
-static char report[2048];
+static char report[4096];
 
 static void smp2p_report(size_t *n)
 {
@@ -299,6 +300,8 @@ static size_t make_report(void)
     size_t n = (size_t)ksnprintf(report, sizeof report, "modem: %s\n", pas_state());
     smp2p_report(&n);
     if (n < sizeof report) n += qcom_rmtfs_report(report + n, sizeof report - n);
+    if (n < sizeof report) n += qcom_tftp_report(report + n, sizeof report - n);
+    if (n < sizeof report) n += qcom_wlan_report(report + n, sizeof report - n);
     size_t sz;
     const volatile uint8_t *cr = smem_get(SMEM_GLOBAL_HOST, CRASH_REASON, &sz);
     if (cr && sz && n < sizeof report - 8) {

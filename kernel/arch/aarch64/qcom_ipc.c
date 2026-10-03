@@ -477,11 +477,13 @@ enum { QRTR_DATA = 1, QRTR_HELLO = 2, QRTR_BYE = 3, QRTR_NEW_SERVER = 4, QRTR_DE
        QRTR_RESUME_TX = 7, QRTR_EXIT = 8, QRTR_PING = 9, QRTR_NEW_LOOKUP = 10, QRTR_DEL_LOOKUP = 11 };
 
 static struct chan *ipcrtr;
+static uint32_t rx_port;                       /* the port of the packet being handled */
+uint32_t qrtr_rx_port(void) { return rx_port; }
 static uint32_t remote_node = QRTR_NODE_BCAST;
 static int hello_sent, hello_got;
 
 struct qrtr_service { uint32_t service, instance, port; qrtr_handler_t handler; };
-#define MAX_SERVICES 8
+#define MAX_SERVICES 32
 static struct qrtr_service local[MAX_SERVICES];
 static int nlocal;
 
@@ -519,6 +521,7 @@ static void ctrl_send(uint32_t type, uint32_t node, const uint32_t *body, size_t
 static void announce(uint32_t node)
 {
     for (int i = 0; i < nlocal; i++) {
+        if (!local[i].service) continue;                    /* a plain port */
         uint32_t b[4] = { local[i].service, local[i].instance, QRTR_NODE_LOCAL, local[i].port };
         ctrl_send(QRTR_NEW_SERVER, node, b, 4);
     }
@@ -533,6 +536,21 @@ int qrtr_add_server(uint32_t service, uint32_t version, uint32_t instance, uint3
         ctrl_send(QRTR_NEW_SERVER, remote_node, b, 4);
     }
     return 0;
+}
+
+/* A port of ours that is not a server (a client's, a transfer's): packets
+ * to it go to `handler`. */
+int qrtr_bind_port(uint32_t port, qrtr_handler_t handler)
+{
+    for (int i = 0; i < nlocal; i++) if (local[i].port == port) { local[i].handler = handler; return 0; }
+    if (nlocal >= MAX_SERVICES) return -1;
+    local[nlocal++] = (struct qrtr_service){ 0, 0, port, handler };
+    return 0;
+}
+
+void qrtr_unbind_port(uint32_t port)
+{
+    for (int i = 0; i < nlocal; i++) if (local[i].port == port && !local[i].service) { local[i] = local[--nlocal]; return; }
 }
 
 static void ipcrtr_up(struct chan *c)
@@ -574,7 +592,7 @@ static void ipcrtr_rx(struct chan *c, const uint8_t *p, size_t len)
             qrtr_send(QRTR_RESUME_TX, dst_port, src_node, src_port, pkt, 20);
         }
         for (int i = 0; i < nlocal; i++)
-            if (local[i].port == dst_port) { local[i].handler(src_node, src_port, data, size); return; }
+            if (local[i].port == dst_port) { rx_port = dst_port; local[i].handler(src_node, src_port, data, size); return; }
         return;
     }
     if (size < 4) return;
@@ -632,7 +650,7 @@ static void ipc_thread(void *arg)
             if (rc == 0) attached = 1;
             else if (rc == -2 || timer_ms() - t0 > 30000) { if (rc != -2) kprintf("glink: the modem made no FIFO in 30 s\n"); attached = -1; }
         }
-        if (attached == 1) { glink_rx(); flush_queues(); }
+        if (attached == 1) { glink_rx(); flush_queues(); if (hello_got) qcom_wlan_poll(); }
         int64_t bits = qcom_smp2p_in("slave-kernel");
         if (bits != last_bits) {
             if (bits >= 0) kprintf("smp2p: the modem's bits %llx%s%s%s%s\n", (unsigned long long)bits, bits & 1 ? " FATAL" : "",
@@ -650,7 +668,7 @@ void qcom_ipc_start(void)
     task_create("qcom-ipc", ipc_thread, NULL);
 }
 
-static char report[2048];
+static char report[8192];
 
 static size_t make_report(void)
 {
@@ -662,8 +680,11 @@ static size_t make_report(void)
         P("  channel %s: %s, ours %u its %u, %d/%d intents, %u in %u out%s\n", chans[i].name, chans[i].up ? "open" : chans[i].remote_open ? "opened by the modem" : "closed",
           chans[i].lcid, chans[i].rcid, chans[i].nours, chans[i].ntheirs, chans[i].rx_count, chans[i].tx_count, chans[i].queue ? ", queued" : "");
     P("qrtr: %s, the modem is node %d\n", hello_got ? "hello exchanged" : hello_sent ? "hello sent" : "no hello yet", (int)remote_node);
-    for (int i = 0; i < nlocal; i++) P("  ours: service %u (instance %x) on port %u\n", local[i].service, local[i].instance, local[i].port);
-    for (int i = 0; i < nremote; i++) P("  the modem's: service %u instance %x at %u:%u\n", remote[i].service, remote[i].instance, remote[i].node, remote[i].port);
+    for (int i = 0; i < nlocal; i++)
+        if (local[i].service) P("  ours: service %u (instance %x) on port %u\n", local[i].service, local[i].instance, local[i].port);
+    P("  the modem's services (id/instance):");
+    for (int i = 0; i < nremote; i++) P("%s %u/%x", i % 10 ? "" : "\n   ", remote[i].service, remote[i].instance);
+    P("\n");
 #undef P
     if (n >= sizeof report) n = sizeof report - 1;
     return n;
