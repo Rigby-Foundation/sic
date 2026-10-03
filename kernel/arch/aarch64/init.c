@@ -117,6 +117,8 @@ void arch_init_smp(void)
     qcom_gpu_init();                /* its Adreno 610: /dev/adreno */
     extern void qcom_panel_init(void);
     qcom_panel_init();              /* its panel through the running DSI controller: /dev/panel */
+    extern void qcom_i2c_init(void);
+    qcom_i2c_init();                /* its I2C buses and the battery's fuel gauge: /dev/battery */
 }
 
 void arch_halt_forever(void)
