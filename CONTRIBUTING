@@ -13,6 +13,15 @@ Certificate of Origin 1.1 (DCO) detailed below.
   will be dropped immediately without review.
 - Write ANSI C (C99/C11 freestanding) and raw assembly. Keep your garbage
   abstractions, C++ bloat, and modern runtime baggage out of this tree.
+- C++ is banned from the kernel. No .cpp, .cc, .cxx, .hpp or .hh files
+  anywhere in it (kernel/, include/, modules/), no C++ in its headers. The
+  build refuses to run if one shows up. (Userland may use C++: ZAE has a
+  C++ runtime; the kernel never will.)
+- Using LLMs (Claude and the like) to write, review or debug code is
+  explicitly allowed. What you submit is still yours: you sign off on it
+  under the DCO below, you understand every line of it, and it is held to
+  exactly the same standard as anything else. "The model wrote it" is not
+  an excuse for trash.
 - Never, under any circumstances, break the userspace ABI.
 - Read CODE_OF_CONFLICT before submitting anything. If your patch is trash,
   expect to be told it is trash in plain, direct terms.
