@@ -64,5 +64,5 @@ static void console_release(struct file *f)
 #endif
 }
 
-const struct dev_ops console_ops = { .read = console_read, .write = console_write, .poll = console_poll,
+const struct dev_ops console_ops = { .tty = 1, .read = console_read, .write = console_write, .poll = console_poll,
                                      .ioctl = console_ioctl, .release = console_release };

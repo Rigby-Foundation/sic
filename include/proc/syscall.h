@@ -18,3 +18,4 @@ int          user_ok(uint64_t ptr, uint64_t len);   /* user range, fully mapped 
 void         task_print_trace(const struct task *t); /* its last system calls, for a post-mortem */
 struct file *fd_get(long fd);
 int          fd_install(struct file *f);           /* lowest free descriptor, or -EMFILE */
+long         fd_close(int fd);                     /* close(2) from inside the kernel */

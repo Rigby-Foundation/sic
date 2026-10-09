@@ -61,6 +61,37 @@ long unix_socket(int type, int flags)
     return fd;
 }
 
+/* socketpair(2): two sockets already connected to each other, nameless.
+ * The fds go to sv[0] and sv[1] (a user pointer, checked by the caller). */
+long unix_socketpair(int type, int flags, int *sv)
+{
+    if ((type & SOCK_TYPE_MASK) != SOCK_STREAM) return -EPROTONOSUPPORT;
+    struct socket *s[2] = { sock_create(SOCK_STREAM, 0), sock_create(SOCK_STREAM, 0) };
+    struct file *f[2] = { NULL, NULL };
+    int fd[2] = { -1, -1 };
+    for (int i = 0; i < 2; i++) {
+        if (!s[i] || !pcb_new(s[i]) || pcb_rx_alloc(s[i]->un)) goto fail;
+        s[i]->domain = AF_UNIX;
+        s[i]->connected = 1;
+    }
+    s[0]->un->peer = s[1];
+    s[1]->un->peer = s[0];
+    for (int i = 0; i < 2; i++) {
+        if (!(f[i] = sock_file(s[i], flags))) goto fail;
+        if ((fd[i] = fd_install(f[i])) < 0) goto fail;
+    }
+    sv[0] = fd[0];
+    sv[1] = fd[1];
+    return 0;
+fail:
+    for (int i = 0; i < 2; i++) {
+        if (fd[i] >= 0) fd_close(fd[i]);
+        else if (f[i]) file_close(f[i]);
+        else if (s[i]) { if (s[i]->un) { kfree(s[i]->un->rx); kfree(s[i]->un); } kfree(s[i]); }
+    }
+    return -ENOMEM;
+}
+
 /* net_lock held */
 static struct socket *find_bound(const char *path)
 {

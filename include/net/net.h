@@ -198,6 +198,7 @@ struct file *sock_file(struct socket *s, int flags);   /* a file over a socket (
 
 /* AF_UNIX stream sockets (unix.c); the ones marked so run with net_lock held */
 long  unix_socket(int type, int flags);                 /* an fd or -errno */
+long  unix_socketpair(int type, int flags, int *sv);    /* 0, the fds in sv[0], sv[1] */
 int   unix_bind(struct socket *s, const char *path);
 int   unix_listen(struct socket *s, int backlog);
 int   unix_connect(struct socket *s, const char *path);
