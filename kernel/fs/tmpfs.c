@@ -208,6 +208,15 @@ void vfs_load_tar(const void *tar, size_t size)
         if (h->typeflag == '5') {
             vfs_create(vfs_root(), tmp, VNODE_DIR);
             dirs++;
+        } else if (h->typeflag == '2') {           /* a symbolic link */
+            char target[101];
+            size_t tl = 0;
+            while (tl < 100 && h->linkname[tl]) tl++;
+            memcpy(target, h->linkname, tl);
+            target[tl] = 0;
+            if (vfs_symlink(vfs_root(), target, tmp) == 0) files++;
+            struct vnode *l = vfs_lookup_nofollow(vfs_root(), tmp);
+            if (l) l->mtime_ms = l->ctime_ms = (uint64_t)tar_octal(h->mtime, sizeof(h->mtime)) * 1000;
         } else if (h->typeflag == '0' || h->typeflag == '\0') {
             struct vnode *n = vfs_create(vfs_root(), tmp, VNODE_FILE);
             if (n && fsize && n->priv) {
@@ -218,6 +227,7 @@ void vfs_load_tar(const void *tar, size_t size)
                 tf->borrowed = 1;
                 n->size = fsize;
             }
+            if (n) n->mtime_ms = n->ctime_ms = (uint64_t)tar_octal(h->mtime, sizeof(h->mtime)) * 1000;   /* as packed */
             files++;
         }
     }

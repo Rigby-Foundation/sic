@@ -7,7 +7,7 @@
 #define VFS_PATH_MAX 256
 #define MAX_FDS      64
 
-enum vnode_type { VNODE_FILE = 1, VNODE_DIR = 2, VNODE_DEV = 3 };
+enum vnode_type { VNODE_FILE = 1, VNODE_DIR = 2, VNODE_DEV = 3, VNODE_LINK = 4 };   /* LINK: a symbolic link, its target in `link` */
 
 struct vnode;
 struct file;
@@ -24,6 +24,7 @@ struct dev_ops {
     int  (*mmap)(struct file *f, uint64_t virt, size_t pages, uint64_t off, int prot); /* optional */
     void (*release)(struct file *f);   /* optional: last reference to an open file dropped */
     long (*open)(struct file *f);      /* optional: a new open file; < 0 (-errno) refuses it */
+    int  tty;                          /* a terminal: answers TIOCGWINSZ and the job-control ioctls (isatty) */
 };
 
 /* Per-filesystem operations. Directory entries are cached as child vnodes
@@ -60,6 +61,8 @@ struct vnode {
     struct file *lock_owner;        /* fcntl record lock: one whole-file lock per file, held by an open file */
     uint32_t lock_pid;
     struct vnode *mountpoint;       /* for a mounted root: the directory it sits on */
+    char    *link;                  /* VNODE_LINK: the path it points to (kmalloc'd) */
+    uint64_t mtime_ms, ctime_ms;    /* last change of the contents / of anything; ms since 1970 */
 };
 
 struct vfs_mount {
@@ -128,13 +131,18 @@ struct vnode *vnode_alloc(const char *name, size_t namelen, enum vnode_type type
 void          vnode_free(struct vnode *n);
 
 /* Path operations, relative to `cwd` when the path isn't absolute. */
-struct vnode *vfs_lookup(struct vnode *cwd, const char *path);
+struct vnode *vfs_lookup(struct vnode *cwd, const char *path);            /* follows symbolic links */
+struct vnode *vfs_lookup_nofollow(struct vnode *cwd, const char *path);   /* ... but not a final one (lstat, readlink) */
+int           vfs_symlink(struct vnode *cwd, const char *target, const char *path);   /* -errno */
+int           vfs_readlink(struct vnode *n, char *buf, size_t len);   /* bytes, or -EINVAL if n is no link */
 struct vnode *vfs_create(struct vnode *cwd, const char *path, enum vnode_type type);
 int           vfs_mkdev(const char *path, const struct dev_ops *ops, void *priv);
 int           vfs_unlink(struct vnode *cwd, const char *path);
 int           vfs_rename(struct vnode *cwd, const char *oldpath, struct vnode *newcwd, const char *newpath);   /* -errno */
 int           vfs_path_of(struct vnode *n, char *buf, size_t len);
 void          vfs_load_tar(const void *tar, size_t size);
+uint64_t      vfs_now_ms(void);                 /* the date, for file times */
+void          vfs_touch(struct vnode *n);       /* contents changed: mtime and ctime = now */
 
 /* File objects (refcounted, shared across fork). */
 struct file  *vfs_open(struct vnode *cwd, const char *path, int flags);

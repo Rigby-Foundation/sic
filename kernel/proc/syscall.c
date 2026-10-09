@@ -27,6 +27,7 @@
 #include "drivers/keyboard.h"
 #endif
 #include "string.h"
+#include "random.h"
 #include "printf.h"
 
 /* ---- user memory access ------------------------------------------------------ */
@@ -117,7 +118,7 @@ static long sys_write(long fd, uint64_t buf, uint64_t len)
     if (!f) return -EBADF;
     if (!user_ok(buf, len)) return -EFAULT;
     long r = file_write(f, (const void *)buf, len);
-    return r == -EPIPE || r == -EINTR ? r : r < 0 ? -EBADF : r;
+    return r == -1 ? -EIO : r;              /* errors as they are (EAGAIN, EPIPE, ENOSPC...); a bare -1 from a filesystem is an I/O error */
 }
 
 static long sys_read(long fd, uint64_t buf, uint64_t len)
@@ -126,7 +127,7 @@ static long sys_read(long fd, uint64_t buf, uint64_t len)
     if (!f) return -EBADF;
     if (!user_ok(buf, len)) return -EFAULT;
     long r = file_read(f, (void *)buf, len);
-    return r == -EINTR ? -EINTR : r < 0 ? -EBADF : r;
+    return r == -1 ? -EIO : r;              /* EAGAIN must reach a non-blocking reader as EAGAIN */
 }
 
 static long sys_writev(long fd, uint64_t uiov, long cnt)
@@ -195,6 +196,8 @@ static long sys_close(long fd)
     return 0;
 }
 
+long fd_close(int fd) { return sys_close(fd); }
+
 static long sys_lseek(long fd, long off, long whence)
 {
     struct file *f = fd_get(fd);
@@ -208,14 +211,71 @@ static long sys_lseek(long fd, long off, long whence)
 static void fill_stat(struct vnode *n, struct abi_stat *st)
 {
     memset(st, 0, sizeof(*st));
+    st->st_dev = n->mnt ? ((uint64_t)(uintptr_t)n->mnt >> 4) & 0xffffffffu : 0;   /* one number per mounted filesystem */
     st->st_ino = n->ino;
     st->st_nlink = 1;
     st->st_mode = n->type == VNODE_DIR ? S_IFDIR | 0755
+                : n->type == VNODE_LINK ? S_IFLNK | 0777
                 : n->type == VNODE_DEV ? (n->is_block ? S_IFBLK : n->is_sock ? S_IFSOCK : S_IFCHR) | 0666
                 : S_IFREG | 0755;
     st->st_size = (int64_t)n->size;
     st->st_blksize = 4096;
     st->st_blocks = (int64_t)((n->size + 511) / 512);
+#ifdef __powerpc__
+    st->st_mtime_sec = st->st_atime_sec = (int32_t)(n->mtime_ms / 1000);
+    st->st_mtime_nsec = st->st_atime_nsec = (int32_t)(n->mtime_ms % 1000) * 1000000;
+    st->st_ctime_sec = (int32_t)(n->ctime_ms / 1000);
+    st->st_ctime_nsec = (int32_t)(n->ctime_ms % 1000) * 1000000;
+#else
+    st->st_mtim.tv_sec = st->st_atim.tv_sec = (int64_t)(n->mtime_ms / 1000);
+    st->st_mtim.tv_nsec = st->st_atim.tv_nsec = (int32_t)(n->mtime_ms % 1000) * 1000000;
+    st->st_ctim.tv_sec = (int64_t)(n->ctime_ms / 1000);
+    st->st_ctim.tv_nsec = (int32_t)(n->ctime_ms % 1000) * 1000000;
+#endif
+}
+
+/* utimensat(2): a file's times (sic keeps the modification time; the access
+ * time reads as it). NULL times: now; UTIME_NOW / UTIME_OMIT per entry. */
+#define UTIME_NOW  ((1l << 30) - 1l)
+#define UTIME_OMIT ((1l << 30) - 2l)
+static long sys_utimensat(long dirfd, uint64_t upath, uint64_t utimes, long flags)
+{
+    struct vnode *n;
+    if (!upath) {                               /* futimens */
+        struct file *f = fd_get(dirfd);
+        if (!f) return -EBADF;
+        n = f->node;
+    } else {
+        char path[VFS_PATH_MAX];
+        long rc = user_str(upath, path, sizeof(path));
+        if (rc) return rc;
+        struct vnode *dir = at_dir(dirfd);
+        if (!dir) return -EBADF;
+        n = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_lookup_nofollow(dir, path) : vfs_lookup(dir, path);
+        if (!n) return -ENOENT;
+    }
+    uint64_t now = vfs_now_ms();
+    if (!utimes) { n->mtime_ms = n->ctime_ms = now; return 0; }
+    if (!user_ok(utimes, 2 * sizeof(struct abi_timespec))) return -EFAULT;
+    const struct abi_timespec *t = (const void *)utimes;
+    long nsec = (long)t[1].tv_nsec;
+    if (nsec != UTIME_OMIT) {
+        n->mtime_ms = nsec == UTIME_NOW ? now : (uint64_t)t[1].tv_sec * 1000 + (uint64_t)nsec / 1000000;
+    }
+    n->ctime_ms = now;
+    if (n->ops && n->ops->sync) n->ops->sync(n);  /* a disk filesystem keeps them */
+    return 0;
+}
+
+/* truncate / ftruncate: a regular file to len bytes */
+static long do_truncate(struct vnode *n, long len)
+{
+    if (len < 0) return -EINVAL;
+    if (n->type == VNODE_DIR) return -EISDIR;
+    if (n->type != VNODE_FILE || !n->ops || !n->ops->truncate) return -EINVAL;
+    if (n->ops->truncate(n, (uint64_t)len) != 0) return -EIO;
+    vfs_touch(n);
+    return 0;
 }
 
 static long sys_newfstatat(long dirfd, uint64_t upath, uint64_t ust, long flags)
@@ -233,7 +293,7 @@ static long sys_newfstatat(long dirfd, uint64_t upath, uint64_t ust, long flags)
     } else {
         struct vnode *dir = at_dir(dirfd);
         if (!dir) return -EBADF;
-        n = vfs_lookup(dir, path);
+        n = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_lookup_nofollow(dir, path) : vfs_lookup(dir, path);
         if (!n) return -ENOENT;
     }
     fill_stat(n, (struct abi_stat *)ust);
@@ -268,7 +328,7 @@ static long sys_getdents64(long fd, uint64_t ubuf, uint64_t len)
         e->d_ino = d.ino;
         e->d_off = (int64_t)f->pos + 1;
         e->d_reclen = reclen;
-        e->d_type = d.type == VNODE_DIR ? DT_DIR : d.type == VNODE_DEV ? DT_CHR : DT_REG;
+        e->d_type = d.type == VNODE_DIR ? DT_DIR : d.type == VNODE_LINK ? DT_LNK : d.type == VNODE_DEV ? DT_CHR : DT_REG;
         memcpy(e->d_name, d.name, namelen + 1);
         used += reclen;
         f->pos++;
@@ -297,7 +357,7 @@ static long path_op(long dirfd, uint64_t upath, int op)
     if (rc) return rc;
     struct vnode *dir = at_dir(dirfd);
     if (!dir) return -EBADF;
-    struct vnode *n = vfs_lookup(dir, path);
+    struct vnode *n = op <= 1 ? vfs_lookup_nofollow(dir, path) : vfs_lookup(dir, path);   /* mkdir, unlink: a link is itself */
     switch (op) {
     case 0: /* mkdir */
         if (n) return -EEXIST;
@@ -332,21 +392,42 @@ static long sys_getcwd(uint64_t ubuf, uint64_t len)
     return (long)(strlen(tmp) + 1);
 }
 
-/* readlink: sic has no symbolic links; /proc/self/exe is the one link
- * there is, the running program's path. */
+/* readlink: a symbolic link's target. /proc/self/exe is the running
+ * program's path. */
 static long sys_readlinkat(long dirfd, uint64_t upath, uint64_t ubuf, uint64_t len)
 {
-    (void)dirfd;
     char path[VFS_PATH_MAX];
     long rc = user_str(upath, path, sizeof(path));
     if (rc < 0) return rc;
     if (!user_ok(ubuf, len)) return -EFAULT;
     struct task *t = task_current();
-    if (strcmp(path, "/proc/self/exe") != 0 || !t->mm) return -EINVAL;      /* not a link */
-    size_t n = strlen(t->mm->exe);
-    if (n > len) n = len;
-    memcpy((void *)ubuf, t->mm->exe, n);
-    return (long)n;
+    if (strcmp(path, "/proc/self/exe") == 0 && t->mm) {
+        size_t n = strlen(t->mm->exe);
+        if (n > len) n = len;
+        memcpy((void *)ubuf, t->mm->exe, n);
+        return (long)n;
+    }
+    struct vnode *dir = at_dir(dirfd);
+    if (!dir) return -EBADF;
+    struct vnode *n = vfs_lookup_nofollow(dir, path);
+    if (!n) return -ENOENT;
+    char buf[VFS_PATH_MAX];
+    int l = vfs_readlink(n, buf, len < sizeof buf ? len : sizeof buf);
+    if (l < 0) return l;
+    memcpy((void *)ubuf, buf, (size_t)l);
+    return l;
+}
+
+/* symlink: a new link at `upath` pointing at `utarget` (which need not exist). */
+static long sys_symlinkat(uint64_t utarget, long dirfd, uint64_t upath)
+{
+    char target[VFS_PATH_MAX], path[VFS_PATH_MAX];
+    long rc = user_str(utarget, target, sizeof(target));
+    if (!rc) rc = user_str(upath, path, sizeof(path));
+    if (rc) return rc;
+    struct vnode *dir = at_dir(dirfd);
+    if (!dir) return -EBADF;
+    return vfs_symlink(dir, target, path);
 }
 
 static long sys_dup(long fd)
@@ -413,6 +494,29 @@ static long sys_fcntl(long fd, long cmd, long arg)
     return -EINVAL;
 }
 
+/* `echo 1 > /proc/sysfail`: every failing system call goes to the kernel
+ * log (pid, number, first arguments, -errno); 0 stops it. For finding out
+ * what a ported program trips over. */
+static volatile int sysfail_log;
+
+static long sysfail_write(struct file *f, const void *buf, size_t len)
+{
+    (void)f;
+    if (len) sysfail_log = ((const char *)buf)[0] == '1';
+    return (long)len;
+}
+
+static long sysfail_read(struct file *f, void *buf, size_t len)
+{
+    if (f->pos || !len) return 0;
+    ((char *)buf)[0] = sysfail_log ? '1' : '0';
+    f->pos = 1;
+    return 1;
+}
+
+static const struct dev_ops sysfail_ops = { .read = sysfail_read, .write = sysfail_write };
+void sysfail_init(void) { vfs_mkdev("/proc/sysfail", &sysfail_ops, NULL); }
+
 static long sys_ioctl(long fd, long ureq, uint64_t arg)
 {
     struct file *f = fd_get(fd);
@@ -444,6 +548,7 @@ static long sys_ioctl(long fd, long ureq, uint64_t arg)
         }
         return -ENOTTY;
     }
+    if (!f->node->dev || !f->node->dev->tty) return -ENOTTY;   /* a pipe, /dev/null, a GPU...: not a terminal */
     if (req == TIOCGWINSZ) {
         if (!user_ok(arg, sizeof(struct winsize))) return -EFAULT;
         struct winsize *ws = (void *)arg;
@@ -743,10 +848,10 @@ static long sys_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     char path[VFS_PATH_MAX];
     static const int cap = ARG_BYTES;
     char *data = kmalloc(cap);
-    const char *argv[ARG_MAX + 1], *envp[ARG_MAX + 1];
+    const char **argv = kmalloc((ARG_MAX + 1) * sizeof *argv), **envp = kmalloc((ARG_MAX + 1) * sizeof *envp);
     size_t used = 0;
     long rc = user_str(upath, path, sizeof(path));
-    if (!data) return -ENOMEM;
+    if (!data || !argv || !envp) { kfree(data); kfree(argv); kfree(envp); return -ENOMEM; }
 
     /* Pull the vectors into a kernel buffer; process_exec copies them again
      * into its own arena, so we can free this on any path. */
@@ -765,11 +870,17 @@ static long sys_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
             lists[l][n] = data + used;
             used += strlen(data + used) + 1;
         }
+        if (rc == 0 && n == ARG_MAX) {              /* more than we take: say so rather than cut */
+            uint64_t slot = uv[l] + (uint64_t)n * sizeof(unsigned long);
+            if (user_ok(slot, sizeof(unsigned long)) && *(const unsigned long *)(uintptr_t)slot) rc = -E2BIG;
+        }
         lists[l][n] = NULL;
     }
     if (rc == 0)
         rc = process_exec(path, argv, envp);        /* only returns on failure */
     kfree(data);
+    kfree(argv);
+    kfree(envp);
     return rc;
 }
 
@@ -964,11 +1075,12 @@ static long sys_uname(uint64_t ubuf)
 static long sys_getrandom(uint64_t ubuf, uint64_t len)
 {
     if (!user_ok(ubuf, len)) return -EFAULT;
-    static uint64_t x = 0x2545F4914F6CDD1DULL;
-    uint8_t *b = (void *)ubuf;
-    for (uint64_t i = 0; i < len; i++) {
-        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-        b[i] = (uint8_t)(x ^ timer_ticks());
+    uint8_t tmp[256];                       /* the generator's lock is not held across user memory */
+    for (uint64_t done = 0; done < len; ) {
+        size_t n = len - done < sizeof tmp ? (size_t)(len - done) : sizeof tmp;
+        random_bytes(tmp, n);
+        memcpy((uint8_t *)ubuf + done, tmp, n);
+        done += n;
     }
     return (long)len;
 }
@@ -996,6 +1108,7 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_exit:          task_exit_code((int)a1 & 0xFF);          /* a thread; the leader ends the process */
     case SYS_exit_group:    task_exit_group((int)a1 & 0xFF);
     case SYS_fork:          ret = process_fork(f); break;
+    case SYS_vfork:         ret = process_fork(f); break;   /* a copy instead of a shared memory: a valid vfork */
     case SYS_clone:         ret = process_clone(f, a1, a2, a3, a4, a5); break;
     case SYS_futex:         ret = sys_futex(a1, (int)a2, (uint32_t)a3, a4, a5, (uint32_t)a6); break;
     case SYS_execve:        ret = sys_execve(a1, a2, a3); break;
@@ -1044,7 +1157,7 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_close:         ret = sys_close((long)a1); break;
     case SYS_lseek:         ret = sys_lseek((long)a1, (long)a2, (long)a3); break;
     case SYS_stat:          ret = sys_newfstatat(AT_FDCWD, a1, a2, 0); break;
-    case SYS_lstat:         ret = sys_newfstatat(AT_FDCWD, a1, a2, 0); break;
+    case SYS_lstat:         ret = sys_newfstatat(AT_FDCWD, a1, a2, AT_SYMLINK_NOFOLLOW); break;
     case SYS_fstat:         ret = sys_fstat((long)a1, a2); break;
     case SYS_newfstatat:    ret = sys_newfstatat((long)a1, a2, a3, (long)a4); break;
     case SYS_getdents64:    ret = sys_getdents64((long)a1, a2, a3); break;
@@ -1059,6 +1172,10 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_faccessat:     ret = path_op((long)a1, a2, 3); break;
     case SYS_chdir:         ret = path_op(AT_FDCWD, a1, 4); break;
     case SYS_getcwd:        ret = sys_getcwd(a1, a2); break;
+    case SYS_symlink:       ret = sys_symlinkat(a1, AT_FDCWD, a2); break;
+    case SYS_symlinkat:     ret = sys_symlinkat(a1, (long)a2, a3); break;
+    case SYS_link: case SYS_linkat:
+        ret = -EPERM; break;                /* no hard links: a name is its file here (cp falls back to copying) */
     case SYS_readlink:      ret = sys_readlinkat(AT_FDCWD, a1, a2, a3); break;
     case SYS_readlinkat:    ret = sys_readlinkat((long)a1, a2, a3, a4); break;
     case SYS_dup:           ret = sys_dup((long)a1); break;
@@ -1077,7 +1194,20 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_pipe2:         ret = sys_pipe2(a1, (long)a2); break;
 #endif
     case SYS_chmod: case SYS_fchmod: case SYS_fchmodat:
-        ret = 0; break;                     /* no permissions yet */
+    case SYS_chown: case SYS_fchown: case SYS_fchownat: case SYS_lchown:
+        ret = 0; break;                     /* no permissions or owners yet: one user */
+    case SYS_utimensat:     ret = sys_utimensat((long)a1, a2, a3, (long)a4); break;
+    case SYS_ftruncate: {
+        struct file *tf = fd_get((long)a1);
+        ret = !tf ? -EBADF : (tf->flags & 3) == O_RDONLY ? -EINVAL : do_truncate(tf->node, (long)a2);
+        break;
+    }
+    case SYS_truncate: {
+        char tp[VFS_PATH_MAX];
+        ret = user_str(a1, tp, sizeof(tp));
+        if (ret == 0) { struct vnode *tn = vfs_lookup(task_current()->cwd, tp); ret = tn ? do_truncate(tn, (long)a2) : -ENOENT; }
+        break;
+    }
     case SYS_poll:          ret = sys_poll(a1, (long)a2, (long)(int)a3); break;
     case SYS_ppoll:         ret = sys_ppoll(a1, (long)a2, a3); break;
     case SYS_pselect6:      ret = sys_pselect6((long)a1, a2, a3, a4, a5); break;
@@ -1099,7 +1229,11 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_recvfrom:    ret = sys_recvfrom((long)a1, a2, a3, (long)a4, a5, a6); break;
     case SYS_sendmsg:     ret = sys_sendmsg((long)a1, a2, (long)a3); break;
     case SYS_recvmsg:     ret = sys_recvmsg((long)a1, a2, (long)a3); break;
-    case SYS_socketpair:  ret = -EOPNOTSUPP; break;
+    case SYS_socketpair:
+        if ((long)a1 != AF_UNIX) { ret = -EAFNOSUPPORT; break; }
+        if (!user_ok(a4, 2 * sizeof(int))) { ret = -EFAULT; break; }
+        ret = unix_socketpair((int)a2, (int)a2 & ~SOCK_TYPE_MASK, (int *)a4);
+        break;
 #endif
 
     /* sic extensions */
@@ -1166,6 +1300,9 @@ int syscall_dispatch(struct syscall_frame *f)
         unsigned i = t->trace_i++ % TASK_TRACE;
         t->trace[i].nr = (uint16_t)SYSCALL_NR(f); t->trace[i].a1 = a1; t->trace[i].ret = ret;
         t->sys_nr = -1;
+        if (sysfail_log && ret < 0 && ret != -EAGAIN && ret != -EINTR)
+            kprintf("[sysfail %s (pid %d): %lu(%lx, %lx, %lx) = %ld]\n", t->name, (int)t->id, (unsigned long)SYSCALL_NR(f),
+                    (unsigned long)a1, (unsigned long)a2, (unsigned long)a3, ret);
     }
     SYSCALL_SET_RET(f, ret);
     signal_deliver_syscall(f);              /* may redirect the return into a handler */

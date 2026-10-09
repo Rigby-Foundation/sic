@@ -39,6 +39,7 @@
 #define ESPIPE      29
 #define ERANGE      34
 #define ENAMETOOLONG 36
+#define ELOOP        40
 #define ENOSYS      38
 #define ENOTEMPTY   39
 #define EXDEV       18
@@ -53,6 +54,7 @@
 
 #define AT_FDCWD      (-100)
 #define AT_EMPTY_PATH 0x1000
+#define AT_SYMLINK_NOFOLLOW 0x100
 
 /* open flags (O_RDONLY/O_WRONLY/O_RDWR/O_CREAT/O_TRUNC/O_APPEND are in vfs.h with the same values) */
 #define O_ACCMODE   03
@@ -182,6 +184,7 @@ struct abi_stat {                       /* musl arch/powerpc/kstat.h, 104 bytes 
 
 #define S_IFMT  0170000
 #define S_IFREG 0100000
+#define S_IFLNK 0120000
 #define S_IFDIR 0040000
 #define S_IFCHR 0020000
 #define S_IFBLK 0060000
@@ -198,6 +201,7 @@ struct abi_dirent64 {
 };
 #define DT_DIR 4
 #define DT_REG 8
+#define DT_LNK 10
 #define DT_CHR 2
 
 struct abi_iovec { unsigned long iov_base; unsigned long iov_len; };
