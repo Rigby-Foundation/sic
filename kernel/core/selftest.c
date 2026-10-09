@@ -15,6 +15,7 @@
 #include "proc/elf.h"
 #include "fs/vfs.h"
 #include "core/selftest.h"
+#include "crypto.h"
 #include "asm/arch.h"
 
 #define CHECK(cond, ...) do { if (!(cond)) { kprintf("  FAIL: " __VA_ARGS__); kprintf("\n"); fails++; } } while (0)
@@ -295,6 +296,45 @@ static void test_user(void)
 }
 
 
+/* WPA2's arithmetic against published vectors: FIPS 180 "abc", RFC 2202
+ * test 1, the 802.11 passphrase vector ("password", "IEEE"), the 802.11
+ * PRF vector, FIPS 197 C.1, RFC 3394 4.1 */
+static int hexeq(const uint8_t *p, const char *hex)
+{
+    for (size_t i = 0; hex[2 * i]; i++) {
+        unsigned v = 0;
+        for (int k = 0; k < 2; k++) { char c = hex[2 * i + k]; v = v << 4 | (unsigned)(c <= '9' ? c - '0' : c - 'a' + 10); }
+        if (p[i] != v) return 0;
+    }
+    return 1;
+}
+
+static void test_crypto(void)
+{
+    uint8_t o[64], k[20], key[16], pt[16];
+    struct sha1 s;
+    sha1_init(&s); sha1_update(&s, "abc", 3); sha1_final(&s, o);
+    CHECK(hexeq(o, "a9993e364706816aba3e25717850c26c9cd0d89d"), "sha1");
+    memset(k, 0x0b, 20);
+    hmac_sha1(k, 20, "Hi There", 8, o);
+    CHECK(hexeq(o, "b617318655057264e28bc0b6fb378c8ef146be00"), "hmac-sha1");
+    pbkdf2_sha1("password", (const uint8_t *)"IEEE", 4, 4096, o, 32);
+    CHECK(hexeq(o, "f42c6fc52df0ebef9ebb4b90b38a5f902e83fe1b135a70e23aed762e9710a12e"), "pbkdf2 (passphrase to PMK)");
+    prf_sha1(k, 20, "prefix", (const uint8_t *)"Hi There", 8, o, 64);
+    CHECK(hexeq(o, "bcd4c650b30b9684951829e0d75f9d54b862175ed9f00606e17d8da35402ffee"), "802.11 PRF");
+    for (int i = 0; i < 16; i++) { key[i] = (uint8_t)i; pt[i] = (uint8_t)(i * 0x11); }
+    struct aes128 a;
+    aes128_key(&a, key);
+    aes128_encrypt(&a, pt, o);
+    CHECK(hexeq(o, "69c4e0d86a7b0430d8cdb78070b4c55a"), "aes-128");
+    aes128_decrypt(&a, o, o);
+    CHECK(!memcmp(o, pt, 16), "aes-128 decrypt");
+    static const uint8_t wrapped[24] = { 0x1f, 0xa6, 0x8b, 0x0a, 0x81, 0x12, 0xb4, 0x47, 0xae, 0xf3, 0x4b, 0xd8,
+                                         0xfb, 0x5a, 0x7b, 0x82, 0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5 };
+    CHECK(aes_unwrap(key, 2, wrapped, o) == 0 && !memcmp(o, pt, 16), "aes key unwrap");
+    kprintf("crypto: sha1, hmac, pbkdf2, prf, aes, key unwrap ok\n");
+}
+
 int selftest_run(void)
 {
     kprintf("\nself tests:\n");
@@ -305,6 +345,7 @@ int selftest_run(void)
     test_sched();
     test_smp();
     test_vfs();
+    test_crypto();
     test_user();
     if (fails)
         kprintf("\n%d self test(s) FAILED\n", fails);
