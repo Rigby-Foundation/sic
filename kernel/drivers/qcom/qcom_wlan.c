@@ -319,8 +319,9 @@ size_t qcom_wlan_report(char *buf, size_t len)
 /* Read: "state off|starting|ready|failed", "detail <text>", then a
  * "net <dBm> <secure> <ssid>" line per network once scanning exists.
  * Write: "on" (start the modem and the WLAN firmware), "scan",
- * "connect\t<ssid>\t<passphrase>", "disconnect": the last three answer
- * EOPNOTSUPP until the radio can be turned on (the copy engines). */
+ * "connect\t<ssid>\t<passphrase>" (open, or WPA2-Personal: the radio
+ * associates and runs the 4-way handshake), "disconnect" (not written
+ * yet). "scan" and "connect" wait for the radio (the copy engines). */
 #include "abi/abi.h"
 
 static char note[96];                       /* the answer to the last command that did not happen */
@@ -338,7 +339,11 @@ static size_t wlan_status(void)
         word = "starting"; ksnprintf(d, sizeof d, "the modem: %s", ms); detail = d;
     } else if (!strcmp(ms, "running")) {
         int a = st == S_ON ? qcom_ath_state() : 0;
-        if (st == S_ON && a > 0) { word = "ready"; detail = a == 2 ? "the radio is on; scanning" : "the radio is on"; }
+        if (st == S_ON && a > 0) {
+            word = "ready";
+            detail = a == 2 ? "the radio is on; scanning" : "the radio is on";
+            if (qcom_ath_join_report(d, sizeof d)) { d[strlen(d) - 1] = 0; detail = d; }   /* "join <ssid>: <how far>" */
+        }
         else if (st == S_ON && a < 0) { word = "failed"; detail = "the radio did not come up (cat /dev/mss for why)"; }
         else if (st == S_ON) { word = "starting"; detail = "the radio: copy engines, HTC, WMI"; }
         else if (st == S_FAILED) { word = "failed"; ksnprintf(d, sizeof d, "the WLAN firmware: %s", why); detail = d; }
@@ -384,8 +389,25 @@ static long wlan_write(struct file *f, const void *buf, size_t len)
         ksnprintf(note, sizeof note, "the radio is not on yet");
         return -EBUSY;
     }
-    if (!strcmp(cmd, "connect") || !strcmp(cmd, "disconnect") || !strcmp(cmd, "off")) {
-        ksnprintf(note, sizeof note, "'%s' is not written yet: scanning is, connecting comes next", cmd);
+    if (!strcmp(cmd, "connect")) {
+        /* connect\t<ssid>\t<passphrase> (empty for an open network) */
+        char ssid[33] = { 0 }, pass[64] = { 0 };
+        size_t o = i, k = 0;
+        if (o < len && ((const char *)buf)[o] == '\t') o++;
+        for (; o < len && ((const char *)buf)[o] != '\t' && ((const char *)buf)[o] != '\n'; o++)
+            if (k < sizeof ssid - 1) ssid[k++] = ((const char *)buf)[o]; else return -EINVAL;
+        if (o < len && ((const char *)buf)[o] == '\t') o++;
+        for (k = 0; o < len && ((const char *)buf)[o] != '\n'; o++)
+            if (k < sizeof pass - 1) pass[k++] = ((const char *)buf)[o]; else return -EINVAL;
+        note[0] = 0;
+        int rc = st == S_ON ? qcom_ath_connect(ssid, pass) : -1;
+        if (rc == 0) return (long)len;
+        ksnprintf(note, sizeof note, "%s", rc == -1 ? "the radio is not on yet" : rc == -2 ? "already joining or connected"
+                                                 : "a name of 1-32 bytes and a passphrase of 8-63 characters (or none)");
+        return rc == -3 ? -EINVAL : -EBUSY;
+    }
+    if (!strcmp(cmd, "disconnect") || !strcmp(cmd, "off")) {
+        ksnprintf(note, sizeof note, "'%s' is not written yet", cmd);
         return -EOPNOTSUPP;
     }
     return -EINVAL;

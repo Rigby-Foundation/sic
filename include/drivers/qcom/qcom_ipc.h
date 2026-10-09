@@ -35,6 +35,9 @@ int    qcom_ath_scan(void);
 int    qcom_ath_state(void);                    /* 0 not up, 1 up, 2 scanning, -1 failed */
 size_t qcom_ath_nets(char *buf, size_t len);
 size_t qcom_ath_report(char *buf, size_t len);
+int    qcom_ath_connect(const char *ssid, const char *pass);   /* -1 radio not up, -2 busy, -3 bad name/passphrase */
+int    qcom_ath_join_state(void);               /* 0 idle, 1 joining, 2 connected, -1 failed */
+size_t qcom_ath_join_report(char *buf, size_t len);
 int    qcom_rpm_wlan_power(void);               /* qcom_rpm.c: the WLAN's regulators, through the RPM */
 size_t qcom_rpm_report(char *buf, size_t len);
 
