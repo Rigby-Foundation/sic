@@ -30,6 +30,8 @@
 #include "printf.h"
 #include "crypto.h"
 #include "random.h"
+#include "spinlock.h"
+#include "net/net.h"
 
 #define CE_BASE         0x0c800000ULL
 #define SMMU_BASE       0x0c600000ULL
@@ -600,20 +602,28 @@ static void htt_rx_msg(const uint8_t *p, size_t n)
  * stays in a buffer the radio reads by reference through a fragment
  * descriptor in the bank set up at HTT configure time (one per msdu id). */
 enum { HTT_H2T_TX_FRM = 1 };
-#define HTT_TX_SLOTS 8
+#define HTT_TX_SLOTS 32
+#define HTT_TX_BUF   2048
 
 static uint8_t *htt_tx_buf[HTT_TX_SLOTS];
 static uint64_t htt_tx_phys[HTT_TX_SLOTS];
 static int htt_tx_next;
+static uint32_t htt_tx_busy;            /* refused: every slot still in flight */
 
-static int htt_tx_data(const uint8_t *frame, size_t len)
+/* crypt: 0 sends the frame as it is (EAPOL before the keys are in), 1
+ * lets the radio encrypt it with the installed key. */
+static int htt_tx_data(const uint8_t *frame, size_t len, int crypt)
 {
-    if (htt_ep < 0 || htt_stage != 2 || !frag_phys || len > 512) return -1;
-    if (!htt_tx_buf[0])
-        for (int i = 0; i < HTT_TX_SLOTS; i++)
-            if (!(htt_tx_buf[i] = dma_alloc(512, &htt_tx_phys[i]))) return -1;
+    if (htt_ep < 0 || htt_stage != 2 || !frag_phys || len > HTT_TX_BUF) return -1;
+    if (!htt_tx_buf[0]) {
+        uint64_t ph = htt_alloc((size_t)HTT_TX_SLOTS * HTT_TX_BUF);
+        if (!ph) return -1;
+        for (int i = 0; i < HTT_TX_SLOTS; i++) { htt_tx_phys[i] = ph + (uint64_t)i * HTT_TX_BUF; htt_tx_buf[i] = P2V(htt_tx_phys[i]); }
+    }
+    if (htt_tx_n - htt_tx_compl >= HTT_TX_SLOTS) { htt_tx_busy++; return -1; }
     int id = htt_tx_next++ % HTT_TX_SLOTS;
     memcpy(htt_tx_buf[id], frame, len);
+    qcom_dma_clean(htt_tx_buf[id], len);
 
     /* the fragment descriptor for this id: the one fragment, then a zero
      * terminator (htt_msdu_ext_desc_64: frags[] start 24 bytes in) */
@@ -630,15 +640,16 @@ static int htt_tx_data(const uint8_t *frame, size_t len)
     uint8_t c[1 + 19 + 64];
     size_t pf = len < 64 ? len : 64;
     c[0] = HTT_H2T_TX_FRM;
-    c[1] = 0x27;                                            /* mac hdr present, no aggr, no encrypt, pkt type native wifi (1 << 5) */
+    c[1] = crypt ? 0x23 : 0x27;                             /* mac hdr present, no aggr, [no encrypt], native wifi (1 << 5) */
     put16le(c + 2, 0x0400);                                 /* vdev 0, ext tid 16 (non-QoS) */
     put16le(c + 4, (uint32_t)len);
     put16le(c + 6, (uint32_t)id);
     put64le(c + 8, frag_phys + (uint64_t)HTT_FRAG_DESC * id);
     put32(c + 16, 0, 0xffff);                               /* peer id: let the firmware find it */
     memcpy(c + 20, frame, pf);
+    if (htc_send(htt_ep, c, 20 + pf)) return -1;
     htt_tx_n++;
-    return htc_send(htt_ep, c, 20 + pf);
+    return 0;
 }
 
 /* ---- scanning ----------------------------------------------------------------------------------- */
@@ -833,8 +844,12 @@ static uint8_t *mgmt_buf[MGMT_BUFS];
 static uint64_t mgmt_phys[MGMT_BUFS];
 static int mgmt_next;
 
+static void wlan0_up(void), wlan0_down(void), wlan0_send(void);
+static void wlan0_in(const uint8_t *dst, const uint8_t *src, uint16_t type, const uint8_t *p, size_t n);
+
 static void join_fail(const char *fmt, unsigned a)
 {
+    wlan0_down();
     ksnprintf(jwhy, sizeof jwhy, fmt, a);
     kprintf("ath: join: %s: %s\n", join_names[jstate], jwhy);
     jstate = J_FAILED;
@@ -1124,7 +1139,7 @@ static void eapol_rx(const uint8_t *e, size_t n)
         memcpy(replay, e + EAP_REPLAY, 8);
         uint8_t f[192], ie[22];
         size_t fl = build_eapol(f, 0x010a, 16, snonce, ie, sta_rsn_ie(ie));   /* version 2, pairwise, MIC */
-        if (htt_tx_data(f, fl) == 0) eapol_tx_n++;
+        if (htt_tx_data(f, fl, 0) == 0) eapol_tx_n++;
         hs = 1; jsent = timer_ms();
         return;
     }
@@ -1151,12 +1166,13 @@ static void eapol_rx(const uint8_t *e, size_t n)
         memcpy(replay, e + EAP_REPLAY, 8);
         uint8_t f[192];
         size_t fl = build_eapol(f, 0x030a, 0, NULL, NULL, 0);   /* message 4: version 2, pairwise, MIC, secure */
-        if (htt_tx_data(f, fl) == 0) eapol_tx_n++;          /* send it in the clear, then install the keys */
+        if (htt_tx_data(f, fl, 0) == 0) eapol_tx_n++;          /* send it in the clear, then install the keys */
         if (first) {
             install_key(0, WMI_KEY_PAIRWISE, ptk + 32, 16, NULL);
             if (gtk_len) install_key((uint32_t)gtk_id, WMI_KEY_GROUP, gtk, (uint32_t)gtk_len, gtk_rsc);
             send_peer_param(3, 1);                          /* authorize: open the controlled port */
             hs = 2; jstate = J_UP;
+            wlan0_up();
             kprintf("ath: join: connected to %s (WPA2)\n", jb.ssid);
         }
     }
@@ -1176,10 +1192,147 @@ static void wlan_frame(const uint8_t *f, size_t n, int decrypted)
     rx_last_type = ether;
     const uint8_t *pl = f + hdr + 8;
     size_t pn = n - hdr - 8;
-    if (ether == 0x888e) { rx_eapol++; eapol_rx(pl, pn); }
-    else if (ether == 0x0806) rx_arp++;
+    if (ether == 0x888e) { rx_eapol++; eapol_rx(pl, pn); return; }
+    if (ether == 0x0806) rx_arp++;
     else if (ether == 0x0800) rx_ip++;
-    else rx_other++;
+    else { rx_other++; return; }
+    /* from the access point (from-DS): the destination is addr1, the source addr3 */
+    wlan0_in(f + 4, (f[1] & 3) == 2 ? f + 16 : f + 10, ether, pl, pn);
+}
+
+/* ---- wlan0 ----------------------------------------------------------------------------------- */
+/* The connection as an Ethernet interface. The radio's side runs on the
+ * IPC thread, the network stack on its own (with net_lock held), so
+ * frames cross in two small queues under a lock of their own:
+ *   in   IP and ARP from the access point, as Ethernet frames; the
+ *        stack's poll takes them
+ *   out  what the stack sends, Ethernet; the IPC thread's poll turns it
+ *        into a native Wi-Fi frame to the access point (to-DS, LLC/SNAP)
+ *        and the radio encrypts it */
+
+#define WQ_SLOTS 64
+#define WQ_BUF   1600
+struct wq { uint8_t *buf[WQ_SLOTS]; uint16_t len[WQ_SLOTS]; unsigned head, tail; };
+static struct wq q_in, q_out;
+static spinlock_t q_lock;
+static struct netdev wlan0;
+static int wlan0_registered;
+static uint32_t in_drop, out_drop, out_sent;
+
+static int wq_init(struct wq *q)
+{
+    if (q->buf[0]) return 0;
+    for (int i = 0; i < WQ_SLOTS; i++) if (!(q->buf[i] = kmalloc(WQ_BUF))) return -1;
+    return 0;
+}
+
+/* a frame in, from any thread; -1 when full */
+static int wq_put(struct wq *q, const void *a, size_t an, const void *b, size_t bn)
+{
+    if (!q->buf[0] || an + bn > WQ_BUF) return -1;
+    spin_lock(&q_lock);
+    int ok = q->tail - q->head < WQ_SLOTS;
+    if (ok) {
+        unsigned i = q->tail % WQ_SLOTS;
+        memcpy(q->buf[i], a, an);
+        if (bn) memcpy(q->buf[i] + an, b, bn);
+        q->len[i] = (uint16_t)(an + bn);
+        q->tail++;
+    }
+    spin_unlock(&q_lock);
+    return ok ? 0 : -1;
+}
+
+/* the oldest frame, copied out; 0 when empty */
+static size_t wq_get(struct wq *q, uint8_t *out)
+{
+    size_t n = 0;
+    spin_lock(&q_lock);
+    if (q->head != q->tail) {
+        unsigned i = q->head % WQ_SLOTS;
+        n = q->len[i];
+        memcpy(out, q->buf[i], n);
+        q->head++;
+    }
+    spin_unlock(&q_lock);
+    return n;
+}
+
+/* From wlan_frame: dst, src and type with the payload, as Ethernet. */
+static void wlan0_in(const uint8_t *dst, const uint8_t *src, uint16_t type, const uint8_t *p, size_t n)
+{
+    if (!wlan0_registered || jstate != J_UP) return;
+    if (!memcmp(src, mac, 6)) return;                       /* our own broadcasts, back from the access point */
+    uint8_t h[14];
+    memcpy(h, dst, 6); memcpy(h + 6, src, 6);
+    h[12] = (uint8_t)(type >> 8); h[13] = (uint8_t)type;
+    if (wq_put(&q_in, h, 14, p, n)) in_drop++;
+    else netdev_kick(&wlan0);
+}
+
+/* The stack's side: net_lock held. */
+static void wlan0_poll(struct netdev *d)
+{
+    static uint8_t f[WQ_BUF];
+    for (int k = 0; k < WQ_SLOTS; k++) {
+        size_t n = wq_get(&q_in, f);
+        if (!n) break;
+        struct pkt *p = pkt_alloc();
+        if (!p) { d->rx_dropped++; continue; }
+        if (n > pkt_tailroom(p)) { pkt_free(p); d->rx_dropped++; continue; }
+        memcpy(pkt_data(p), f, n);
+        p->len = (uint32_t)n;
+        net_rx(d, p);
+    }
+}
+
+static int wlan0_xmit(struct netdev *d, struct pkt *p)
+{
+    int rc = 0;
+    if (jstate != J_UP || p->len < 14 || wq_put(&q_out, pkt_data(p), p->len, NULL, 0)) { d->tx_errors++; out_drop++; rc = -1; }
+    pkt_free(p);
+    return rc;
+}
+
+/* The IPC thread's side: Ethernet out as 802.11 to the access point. */
+static void wlan0_send(void)
+{
+    static uint8_t e[WQ_BUF], f[WQ_BUF + 32];
+    for (int k = 0; k < 16 && htt_tx_n - htt_tx_compl < HTT_TX_SLOTS; k++) {
+        size_t n = wq_get(&q_out, e);
+        if (!n) break;
+        if (jstate != J_UP) { out_drop++; continue; }
+        f[0] = 0x08; f[1] = 0x01; f[2] = f[3] = 0;          /* data, to-DS */
+        memcpy(f + 4, jb.bssid, 6);                         /* receiver: the access point */
+        memcpy(f + 10, mac, 6);                             /* transmitter: us */
+        memcpy(f + 16, e, 6);                               /* the destination */
+        f[22] = f[23] = 0;                                  /* sequence: the firmware's */
+        static const uint8_t snap[6] = { 0xaa, 0xaa, 3, 0, 0, 0 };
+        memcpy(f + 24, snap, 6);
+        memcpy(f + 30, e + 12, n - 12);                     /* type, then the payload */
+        if (htt_tx_data(f, 30 + n - 12, 1)) out_drop++; else out_sent++;
+    }
+}
+
+static void wlan0_up(void)
+{
+    if (!wlan0_registered) {
+        if (wq_init(&q_in) || wq_init(&q_out)) { kprintf("ath: no memory for wlan0\n"); return; }
+        strcpy(wlan0.name, "wlan0");
+        wlan0.xmit = wlan0_xmit;
+        wlan0.poll = wlan0_poll;
+        wlan0.mtu = 1500;
+        netdev_register(&wlan0);
+        wlan0_registered = 1;
+    }
+    memcpy(wlan0.mac, mac, 6);
+    wlan0.flags = IFF_UP | IFF_BROADCAST | IFF_RUNNING;
+    kprintf("ath: wlan0 up (run dhcp)\n");
+}
+
+static void wlan0_down(void)
+{
+    if (wlan0_registered) wlan0.flags &= ~IFF_RUNNING;
 }
 
 /* A network that can be joined: open, or RSN with PSK and CCMP (no
@@ -1254,7 +1407,7 @@ static void join_mgmt(const uint8_t *f, size_t n)
         send_peer_assoc();
         send_vdev_up();
         if (jb.secure == 2) { jstate = J_KEYS; jsent = timer_ms(); }
-        else { send_peer_param(3, 1); jstate = J_UP; kprintf("ath: join: connected to %s (open)\n", jb.ssid); }
+        else { send_peer_param(3, 1); jstate = J_UP; kprintf("ath: join: connected to %s (open)\n", jb.ssid); wlan0_up(); }
         break;
     case 0xc0: case 0xa0:                                   /* deauthentication, disassociation */
         if (jstate >= J_AUTH && jstate <= J_UP) join_fail("the access point sent us away (reason %u)", n >= 26 ? (unsigned)(b[0] | b[1] << 8) : 0);
@@ -1561,7 +1714,7 @@ void qcom_ath_poll(void)
 {
     if (stage == A_OFF || stage == A_FAILED) return;
     ce_poll();
-    if (stage == A_UP) join_poll();
+    if (stage == A_UP) { join_poll(); if (jstate == J_UP) wlan0_send(); }
 }
 
 int qcom_ath_scan(void)
@@ -1628,5 +1781,8 @@ size_t qcom_ath_report(char *buf, size_t len)
     if ((eapol_rx_n || htt_tx_n) && n < len)
         n += (size_t)ksnprintf(buf + n, len - n, "  handshake: %u eapol in, %u out; htt tx %u (%u done)%s\n",
                                eapol_rx_n, eapol_tx_n, htt_tx_n, htt_tx_compl, hs == 2 ? ", keys installed" : "");
+    if (wlan0_registered && n < len)
+        n += (size_t)ksnprintf(buf + n, len - n, "  wlan0: %s; out %u sent, %u dropped (%u with every slot busy); in %u dropped\n",
+                               wlan0.flags & IFF_RUNNING ? "running" : "down", out_sent, out_drop, htt_tx_busy, in_drop);
     return n;
 }
