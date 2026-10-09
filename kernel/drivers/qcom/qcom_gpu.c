@@ -30,7 +30,7 @@
 #include "proc/syscall.h"
 #include "asm/timer.h"
 #include "abi/adreno.h"
-#include "asm/qcom_scm.h"
+#include "drivers/qcom/qcom_scm.h"
 
 #define GCC         0x1400000
 #define GPUCC       0x5990000

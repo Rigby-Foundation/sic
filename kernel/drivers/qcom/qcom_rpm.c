@@ -10,7 +10,7 @@
  * requests, when the WLAN is powered up. */
 #include "asm/fdt.h"
 #include "asm/memlayout.h"
-#include "asm/qcom_ipc.h"
+#include "drivers/qcom/qcom_ipc.h"
 #include "asm/timer.h"
 #include "proc/sched.h"
 #include "endian.h"

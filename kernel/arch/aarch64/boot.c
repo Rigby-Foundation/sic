@@ -102,13 +102,16 @@ static void find_tar_in_initrd(void)
 /* ---- the precise direct map ------------------------------------------------------ */
 
 /* [0, 1 GiB) stays device memory in one block (every register of these
- * boards lives there); [1, 4 GiB) maps RAM only, and none of firmware's
- * no-map regions: 2 MiB blocks where a block is all one kind, 4 KiB pages
- * where an edge falls inside. The splash screen is mapped uncached. */
+ * boards lives there); [1, 64 GiB) maps RAM only, and none of firmware's
+ * no-map regions: a 1 GiB block where a gigabyte is all RAM, else 2 MiB
+ * blocks where a block is all one kind, 4 KiB pages where an edge falls
+ * inside. The splash screen is mapped uncached. */
 #define DM_L3_MAX 256
 static uint64_t dm_l0[512] __attribute__((aligned(4096), section(".bss.pagetables")));
 static uint64_t dm_l1[512] __attribute__((aligned(4096), section(".bss.pagetables")));
-static uint64_t dm_l2[3][512] __attribute__((aligned(4096), section(".bss.pagetables")));
+#define DM_GB (HHDM_SIZE >> 30)
+#define DM_L2_MAX 16                /* gigabytes that need finer maps than one block */
+static uint64_t dm_l2[DM_L2_MAX][512] __attribute__((aligned(4096), section(".bss.pagetables")));
 static uint64_t dm_l3[DM_L3_MAX][512] __attribute__((aligned(4096), section(".bss.pagetables")));
 uint64_t kernel_ttbr1;              /* the kernel half's level-0 table, physical: mmu.c, and head.S for other CPUs */
 
@@ -155,9 +158,19 @@ static void build_direct_map(void)
     }
     dm_l0[0] = V2P(dm_l1) | 3;
     dm_l1[0] = 0x401 | (1 << 2);                    /* [0, 1 GiB): device, as head.S had it */
-    int nl3 = 0;
-    for (uint64_t gb = 1; gb < 4; gb++) {
-        uint64_t *l2 = dm_l2[gb - 1];
+    int nl3 = 0, nl2 = 0;
+    for (uint64_t gb = 1; gb < DM_GB; gb++) {
+        uint64_t g0 = gb << 30, g1 = (gb + 1) << 30;
+        int any = 0;
+        for (int i = 0; i < dm_nram; i++) if (dm_ram[i].s < g1 && dm_ram[i].e > g0) any = 1;
+        if (dm_fb_e && dm_fb_s < g1 && dm_fb_e > g0) any = 1;
+        if (!any) continue;                         /* no RAM in this gigabyte */
+        if (!dm_edge_inside(g0, g1) && dm_kind(g0) == 1) {
+            dm_l1[gb] = dm_desc(g0, 1, 0);          /* all of it plain RAM: one block */
+            continue;
+        }
+        if (nl2 == DM_L2_MAX) continue;
+        uint64_t *l2 = dm_l2[nl2++];
         for (uint64_t i = 0; i < 512; i++) {
             uint64_t pa = gb << 30 | i << 21;
             if (!dm_edge_inside(pa, pa + (2UL << 20)) || nl3 == DM_L3_MAX) {
@@ -379,7 +392,7 @@ static void scan_tree(void)
     if (pci >= 0) scan_pcie(pci);
 }
 
-void aarch64_early_main(uint64_t dtb_phys)
+void aarch64_early_main(uint64_t dtb_phys, uint64_t magic, uint64_t rd_base, uint64_t rd_size)
 {
     memset(&platform, 0, sizeof platform);
     platform.dtb_phys = dtb_phys;
@@ -394,6 +407,12 @@ void aarch64_early_main(uint64_t dtb_phys)
         platform.uart_base = 0x09000000; platform.uart_irq = 33;
         platform.gicd_base = 0x08000000; platform.gicc_base = 0x08010000;
         platform.timer_freq = (uint32_t)read_sysreg(cntfrq_el0);
+    }
+    /* zaeboot (UEFI) says where it put the initrd in registers, not in /chosen */
+    if (magic == 0x53494342 && rd_base && rd_size && !platform.initrd_size) {
+        platform.initrd_base = rd_base;
+        platform.initrd_size = rd_size;
+        find_tar_in_initrd();
     }
 
     memset(&boot_info, 0, sizeof boot_info);

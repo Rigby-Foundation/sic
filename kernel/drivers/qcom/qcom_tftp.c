@@ -6,7 +6,7 @@
  * /readonly/..., from the modem partition's image/ directory; and files it
  * keeps under /readwrite/..., here in RAM (gone at the next boot).
  * Each transfer gets its own port, which the modem's ACKs come to. */
-#include "asm/qcom_ipc.h"
+#include "drivers/qcom/qcom_ipc.h"
 #include "fs/vfs.h"
 #include "mm/heap.h"
 #include "string.h"

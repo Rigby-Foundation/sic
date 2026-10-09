@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
 /* TrustZone calls, for the GPU's zap shader and the modem's firmware. */
-#include "asm/qcom_scm.h"
+#include "drivers/qcom/qcom_scm.h"
 #include "proc/sched.h"
 #include "printf.h"
 #include "string.h"

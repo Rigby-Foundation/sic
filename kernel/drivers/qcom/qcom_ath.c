@@ -18,9 +18,9 @@
  * Polled from the IPC thread: no interrupts. Memory the WLAN reads and
  * writes is mapped uncached (it does not snoop the CPU's caches). */
 #include "asm/memlayout.h"
-#include "asm/qcom_ipc.h"
-#include "asm/qcom_scm.h"
-#include "asm/qcom_smem.h"
+#include "drivers/qcom/qcom_ipc.h"
+#include "drivers/qcom/qcom_scm.h"
+#include "drivers/qcom/qcom_smem.h"
 #include "asm/timer.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"

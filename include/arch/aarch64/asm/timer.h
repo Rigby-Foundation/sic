@@ -7,7 +7,7 @@ void     timer_init(void);      /* the generic timer (CNTV), frequency from CNTF
 void     timer_init_cpu(void);  /* this CPU's copy of it */
 uint64_t timer_ticks(void);
 uint64_t timer_ms(void);
-static inline uint64_t timer_boot_epoch(void) { return 0; }   /* no clock read yet: time counts from boot */
+uint64_t timer_boot_epoch(void);  /* the date at boot (a PL031), seconds since 1970; 0 if unknown */
 const char *timer_source(void);
 
 /* What the timer looked like when it stayed due after being re-armed (gic.c reports it). */

@@ -14,7 +14,7 @@
 #include "printf.h"
 #include "string.h"
 #include "abi/abi.h"
-#include "asm/qcom_smem.h"
+#include "drivers/qcom/qcom_smem.h"
 
 #define SMEM_ITEM_COUNT         512
 #define SMEM_HW_SW_BUILD_ID     137         /* socinfo */

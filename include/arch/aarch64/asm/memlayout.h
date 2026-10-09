@@ -3,29 +3,29 @@
 /* aarch64 virtual layout (4 KiB granule, 48-bit addresses, TTBR0 user /
  * TTBR1 kernel):
  *   0x0000000000000000 - 0x0000ffffffffffff   user space (TTBR0, per process)
- *   0xffff000000000000 - 0xffff0000ffffffff   direct map of the first 4 GiB of
+ *   0xffff000000000000 - 0xffff000fffffffff   direct map of the first 64 GiB of
  *                                             physical space (RAM normal-cacheable,
- *                                             everything below RAM as device memory:
+ *                                             everything below 1 GiB as device memory:
  *                                             the GIC, UART, PCI windows of QEMU virt)
- *   0xffff000100000000 - 0xffff00010fffffff   kernel heap
- *   0xffff000110000000 - ...                  uncached MMIO windows (vmm_map_mmio)
+ *   0xffff001000000000 - 0xffff00103fffffff   kernel heap
+ *   0xffff001080000000 - ...                  uncached MMIO windows (vmm_map_mmio)
  * The kernel image is linked inside the direct map at RAM base + 2 MiB. */
 #pragma once
 #include "types.h"
 
 #define KERNEL_VIRT_BASE 0xffff000000000000UL
 #define HHDM_BASE   0xffff000000000000UL
-#define HHDM_SIZE   0x100000000UL
-#define HEAP_BASE   0xffff000100000000UL
+#define HHDM_SIZE   0x1000000000UL           /* 64 GiB: QEMU virt's RAM runs from 1 GiB up to however much it was given */
+#define HEAP_BASE   0xffff001000000000UL
 #define HEAP_SIZE   (1024UL * 1024 * 1024)      /* virtual room; the root filesystem alone takes ~170 MB with the desktop */
-#define MMIO_BASE   0xffff000180000000UL
+#define MMIO_BASE   0xffff001080000000UL
 #define USER_BASE   0x0000000000001000UL
 #define USER_END    0x0000800000000000UL
 #define USER_STACK_TOP  0x00007ffffffff000UL
 #define USER_STACK_SIZE (64UL * 1024)          /* mapped at exec; grows on demand up to USER_STACK_MAX */
 #define USER_STACK_MAX  (8UL * 1024 * 1024)
 #define USER_MMAP_BASE  0x0000100000000000UL
-#define VMM_TEST_VIRT   0xffff0001c0000000UL   /* self test: a free page-mappable kernel address */
+#define VMM_TEST_VIRT   0xffff0010c0000000UL   /* self test: a free page-mappable kernel address */
 
 #define P2V(p) ((void *)((uintptr_t)(p) + HHDM_BASE))
 #define V2P(v) ((uint64_t)((uintptr_t)(v) - HHDM_BASE))

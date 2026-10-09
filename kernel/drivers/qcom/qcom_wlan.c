@@ -8,8 +8,8 @@
  *   board) -> the board data file (bdwlan.*) -> calibration report
  * and then the firmware says FW_READY. Turning the radio on (WLAN mode,
  * with the copy engine configuration) comes with the copy engines. */
-#include "asm/qcom_ipc.h"
-#include "asm/qcom_scm.h"
+#include "drivers/qcom/qcom_ipc.h"
+#include "drivers/qcom/qcom_scm.h"
 #include "asm/timer.h"
 #include "fs/vfs.h"
 #include "mm/heap.h"

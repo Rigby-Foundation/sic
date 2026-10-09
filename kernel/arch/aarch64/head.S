@@ -24,6 +24,9 @@ _head:
 
 _start:
     mov     x20, x0                     /* the device tree, physical */
+    mov     x21, x1                     /* zaeboot (arm64 UEFI): x1 = 'SICB', x2/x3 = the initrd (Linux passes zeros) */
+    mov     x22, x2
+    mov     x23, x3
 
     /* Not where we were linked to run: move there (overlap-safe), then
      * continue in the copy. Caches are off; the I-cache may not be. */
@@ -54,9 +57,12 @@ _start:
     adr     x1, _head
     adr     x3, _start
     sub     x3, x3, x1                  /* _start's offset in the image */
-    add     x2, x2, x3
+    add     x5, x2, x3
     mov     x0, x20
-    br      x2
+    mov     x1, x21
+    mov     x2, x22
+    mov     x3, x23
+    br      x5
 0:
 
     /* EL2 (virtualization=on): set EL1 to AArch64 and drop down. */
@@ -130,6 +136,9 @@ _start:
     ldr     x1, =cpus
     msr     tpidr_el1, x1
     mov     x0, x20
+    mov     x1, x21
+    mov     x2, x22
+    mov     x3, x23
     bl      aarch64_early_main
 5:  wfi
     b       5b

@@ -6,7 +6,7 @@
  * one that runs the WLAN firmware and offers WLFW, only once it has its
  * answer. The table is Linux's qcom_pd_mapper's for SM6115-class SoCs
  * (what this phone's modemr.jsn and modemuw.jsn say too). */
-#include "asm/qcom_ipc.h"
+#include "drivers/qcom/qcom_ipc.h"
 #include "string.h"
 #include "printf.h"
 

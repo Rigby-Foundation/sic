@@ -10,8 +10,8 @@
  * Read-only, as `rmtfs -r`: each partition is read into RAM once, and what
  * the modem writes stays in that copy; nothing goes back to the flash. */
 #include "asm/memlayout.h"
-#include "asm/qcom_ipc.h"
-#include "asm/qcom_scm.h"
+#include "drivers/qcom/qcom_ipc.h"
+#include "drivers/qcom/qcom_scm.h"
 #include "fs/vfs.h"
 #include "fs/blkdev.h"
 #include "mm/pmm.h"

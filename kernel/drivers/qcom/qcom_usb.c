@@ -264,7 +264,7 @@ static int tty_poll(struct file *f, struct waitqueue **wq)
     return (rx_tail != rx_head ? POLLIN : 0) | POLLOUT;
 }
 
-static const struct dev_ops tty_ops = { .read = tty_read, .write = tty_write, .poll = tty_poll };
+static const struct dev_ops tty_ops = { .tty = 1, .read = tty_read, .write = tty_write, .poll = tty_poll };
 
 /* ---- endpoint 0 ------------------------------------------------------------------- */
 

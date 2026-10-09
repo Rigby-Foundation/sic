@@ -5,6 +5,7 @@
 #include "asm/cpu.h"
 #include "asm/timer.h"
 #include "asm/fdt.h"
+#include "drivers/qcom.h"
 #include "asm/memlayout.h"
 #include "asm/sysreg.h"
 #include "asm/smp.h"
@@ -77,8 +78,11 @@ int arch_reboot_reason(const char *mode)
         *(volatile uint32_t *)P2V(base + at) = imem_v;
         kprintf("restart reason: imem %llx = %08x\n", base + at, *(volatile uint32_t *)P2V(base + at));
     }
-    extern int qcom_pon_set_reason(uint8_t reason);
+#ifdef CONFIG_QCOM
     int rc = qcom_pon_set_reason(pon_v);
+#else
+    int rc = -1;
+#endif
     __asm__ volatile("dsb sy" ::: "memory");
     return rc;
 }
@@ -109,30 +113,16 @@ int arch_skip_selftest(void)
 
 void arch_init_smp(void)
 {
-    extern void qcom_usb_probe(void);
-    qcom_usb_probe();               /* before the other CPUs: its report survives a failed bring-up */
+#ifdef CONFIG_QCOM
+    qcom_init_early();              /* before the other CPUs: its report survives a failed bring-up */
+#endif
 #ifdef CONFIG_SMP
     smp_init();
 #endif
-    extern void qcom_keys_init(void);
-    qcom_keys_init();               /* a Qualcomm phone's buttons, if this is one */
     extern void physmem_init(void);
     physmem_init();
-    extern void qcom_touch_init(void);
-    qcom_touch_init();              /* a "creek" phone's touch controller, if this is one */
-    extern void qcom_gpu_init(void);
-    qcom_gpu_init();                /* its Adreno 610: /dev/adreno */
-    extern void qcom_panel_init(void);
-    qcom_panel_init();              /* its panel through the running DSI controller: /dev/panel */
-    extern void qcom_i2c_init(void);
-    qcom_i2c_init();                /* its I2C buses and the battery's fuel gauge: /dev/battery */
-    extern void qcom_smem_init(void);
-    qcom_smem_init();               /* its shared memory with the modem (Wi-Fi's way in): /dev/smem */
-    extern void qcom_mss_init(void);
-    qcom_mss_init();                /* its modem, started by hand: /dev/mss */
-#ifdef CONFIG_UFS
-    extern void qcom_ufs_init(void);
-    qcom_ufs_init();                /* its flash, the bootloader's UFS controller: /dev/sdX */
+#ifdef CONFIG_QCOM
+    qcom_init();                    /* a Qualcomm phone's devices, if this is one */
 #endif
 }
 

@@ -5,6 +5,7 @@
 #include "asm/timer.h"
 #include "asm/irq.h"
 #include "asm/fdt.h"
+#include "asm/memlayout.h"
 #include "asm/sysreg.h"
 #include "asm/cpu.h"
 #include "proc/sched.h"
@@ -15,6 +16,7 @@
 
 static uint32_t reload;
 static volatile uint64_t ticks;
+static uint64_t boot_epoch;             /* seconds since 1970 when timer_ms() was 0; 0 if no clock says */
 
 /* The virtual counter, read until two reads agree: a Cortex-A73
  * (erratum 858921) can return a wrong value as the low word rolls over. */
@@ -68,7 +70,19 @@ void timer_init(void)
     irq_install(TIMER_IRQ, timer_irq);
     timer_init_cpu();
     kprintf("timer: %u Hz via the generic timer (%u Hz counter, interrupt %d)\n", TIMER_HZ, freq, TIMER_IRQ);
+    /* the date: a PL031 real-time clock (QEMU virt has one), its data register in seconds */
+    int rtc = fdt_find_compatible("arm,pl031");
+    uint64_t base;
+    if (rtc >= 0 && fdt_reg(rtc, 0, &base, NULL) == 0 && base < 0x40000000) {
+        uint32_t now = *(volatile uint32_t *)P2V(base);
+        if (now > 1000000000u) {
+            boot_epoch = now - timer_ms() / 1000;
+            kprintf("rtc: PL031 says %u seconds since 1970\n", now);
+        }
+    }
 }
+
+uint64_t timer_boot_epoch(void) { return boot_epoch; }
 
 uint64_t timer_ticks(void) { return ticks; }
 uint64_t timer_ms(void)    { return ticks * 1000 / TIMER_HZ; }

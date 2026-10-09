@@ -48,6 +48,7 @@ CONFIG_RADEON     := $(call cfg,CONFIG_RADEON)
 CONFIG_PCI        := $(call cfg,CONFIG_PCI)
 CONFIG_NVME       := $(call cfg,CONFIG_NVME)
 CONFIG_UFS        := $(call cfg,CONFIG_UFS)
+CONFIG_QCOM       := $(call cfg,CONFIG_QCOM)
 CONFIG_AHCI       := $(call cfg,CONFIG_AHCI)
 CONFIG_IDE        := $(call cfg,CONFIG_IDE)
 CONFIG_NET        := $(call cfg,CONFIG_NET)
@@ -72,18 +73,24 @@ ASFLAGS := $(ARCH_ASFLAGS) -g -Iinclude -Iinclude/arch/$(ARCH) $(if $(EMBED_INIT
 LINKER_SCRIPT := kernel/arch/$(ARCH)/linker.ld
 LDFLAGS := $(ARCH_LDFLAGS) -T $(LINKER_SCRIPT) -nostdlib -static -z max-page-size=0x1000
 
+# No C++ in the kernel (CONTRIBUTING): refuse to build if any shows up.
+CXX_FILES := $(shell find kernel include modules \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' -o -name '*.hpp' -o -name '*.hh' \) 2>/dev/null)
+ifneq ($(CXX_FILES),)
+$(error C++ is banned from the kernel (see CONTRIBUTING): $(CXX_FILES))
+endif
+
 # Sources live in kernel/<subsystem>/ (arch/x86_64, mm, fs, drivers, proc, lib, core).
 # Optional pieces are listed per config option; everything else is always built.
 OPTIONAL := kernel/arch/x86_64/smp.c kernel/arch/x86_64/ap_trampoline.S kernel/arch/aarch64/smp.c kernel/arch/powerpc/escc.c kernel/arch/aarch64/pl011.c \
             kernel/arch/x86_64/module.c kernel/arch/powerpc/module.c kernel/arch/aarch64/module.c \
             kernel/drivers/fb.c kernel/drivers/font.c kernel/drivers/serial.c kernel/drivers/keyboard.c kernel/drivers/mouse.c \
-            kernel/drivers/pci.c kernel/drivers/nvme.c kernel/drivers/ufs.c kernel/arch/aarch64/qcom_ufs.c kernel/drivers/ahci.c kernel/drivers/ide.c \
+            kernel/drivers/pci.c kernel/drivers/nvme.c kernel/drivers/ufs.c kernel/drivers/ahci.c kernel/drivers/ide.c \
             kernel/drivers/virtio.c kernel/drivers/virtio_gpu.c kernel/drivers/virtio_input.c kernel/drivers/radeon.c \
             kernel/fs/zaefs.c kernel/fs/fat.c kernel/fs/ext4.c \
             kernel/net/core.c kernel/net/arp.c kernel/net/ip.c kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c kernel/net/unix.c \
             kernel/drivers/e1000.c kernel/drivers/b44.c kernel/drivers/radeon_cp.c kernel/drivers/hda.c kernel/drivers/dsp.c \
             kernel/core/module.c kernel/core/ksyms.c kernel/proc/signal.c kernel/fs/pipe.c \
-            kernel/core/selftest.c
+            kernel/core/selftest.c $(wildcard kernel/drivers/qcom/*.c)
 SRC-y :=
 SRC-$(CONFIG_SMP)        += $(ARCH_SMP_SRC)
 SRC-$(CONFIG_FB_CONSOLE) += kernel/drivers/fb.c kernel/drivers/font.c
@@ -96,7 +103,9 @@ SRC-$(CONFIG_RADEON)     += kernel/drivers/radeon.c kernel/drivers/radeon_cp.c
 SRC-y += $(if $(CONFIG_VIRTIO_GPU)$(CONFIG_VIRTIO_INPUT),kernel/drivers/virtio.c,)
 SRC-$(CONFIG_PCI)        += kernel/drivers/pci.c
 SRC-$(CONFIG_NVME)       += kernel/drivers/nvme.c
-SRC-$(CONFIG_UFS)        += kernel/drivers/ufs.c $(if $(filter aarch64,$(ARCH)),kernel/arch/aarch64/qcom_ufs.c)
+SRC-$(CONFIG_UFS)        += kernel/drivers/ufs.c
+# Qualcomm SoCs (aarch64): every driver probes the device tree; the UFS one needs CONFIG_UFS
+SRC-$(CONFIG_QCOM)       += $(filter-out $(if $(CONFIG_UFS),,kernel/drivers/qcom/qcom_ufs.c),$(wildcard kernel/drivers/qcom/*.c))
 SRC-$(CONFIG_AHCI)       += kernel/drivers/ahci.c
 SRC-$(CONFIG_IDE)        += kernel/drivers/ide.c
 SRC-$(CONFIG_NET)        += kernel/net/core.c kernel/net/arp.c kernel/net/ip.c kernel/net/udp.c kernel/net/tcp.c kernel/net/socket.c kernel/net/unix.c

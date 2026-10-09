@@ -11,9 +11,9 @@
  * Nothing starts it at boot. ("check" works anywhere, a VM too.) */
 #include "asm/fdt.h"
 #include "asm/memlayout.h"
-#include "asm/qcom_scm.h"
-#include "asm/qcom_smem.h"
-#include "asm/qcom_ipc.h"
+#include "drivers/qcom/qcom_scm.h"
+#include "drivers/qcom/qcom_smem.h"
+#include "drivers/qcom/qcom_ipc.h"
 #include "asm/timer.h"
 #include "fs/vfs.h"
 #include "mm/pmm.h"

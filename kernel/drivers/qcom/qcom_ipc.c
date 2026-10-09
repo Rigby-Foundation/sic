@@ -12,8 +12,8 @@
  * the modem through the APCS IPC register. */
 #include "asm/fdt.h"
 #include "asm/memlayout.h"
-#include "asm/qcom_smem.h"
-#include "asm/qcom_ipc.h"
+#include "drivers/qcom/qcom_smem.h"
+#include "drivers/qcom/qcom_ipc.h"
 #include "asm/timer.h"
 #include "fs/vfs.h"
 #include "mm/heap.h"
