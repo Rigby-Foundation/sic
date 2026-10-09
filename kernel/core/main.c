@@ -158,6 +158,8 @@ void kernel_main(struct zaeboot_info *info)
         if (f) { file_write(f, mode, strlen(mode)); file_close(f); }
     }
     vfs_mkdev("/dev/console", &console_ops, NULL);
+    extern void mem_devices_init(void);
+    mem_devices_init();             /* /dev/null, zero, full, random, urandom */
     shm_init();
 #ifdef CONFIG_FB_CONSOLE
     fb_dev_init();
@@ -181,6 +183,8 @@ void kernel_main(struct zaeboot_info *info)
 #endif
     sched_init();
     prof_init();                    /* /proc/prof: where the CPUs spend their ticks */
+    extern void sysfail_init(void);
+    sysfail_init();                 /* /proc/sysfail: failing system calls to the log */
 #if defined(CONFIG_VIRTIO_GPU) && defined(CONFIG_FB_CONSOLE)
     virtio_gpu_init();              /* needs the scheduler (present thread) and the timer */
     fb_dev_init();                  /* /dev/fb0, if the display only appeared now (aarch64: no firmware framebuffer) */
