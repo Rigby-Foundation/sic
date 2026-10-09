@@ -200,7 +200,10 @@ static struct zinode *zi_of(struct vnode *n) { return n->priv; }
 static int zi_flush(struct vnode *n)
 {
     struct zinode *zi = zi_of(n);
-    if (!zi || !zi->dirty) return 0;
+    if (!zi) return 0;
+    uint64_t m = n->mtime_ms / 1000, c = n->ctime_ms / 1000;
+    if (zi->di.mtime != m || zi->di.ctime != c) { zi->di.mtime = m; zi->di.ctime = c; zi->dirty = 1; }   /* utimensat, writes */
+    if (!zi->dirty) return 0;
     zi->dirty = 0;
     return inode_write(fs_of(n), zi->ino, &zi->di);
 }
@@ -360,7 +363,7 @@ static long zaefs_write(struct vnode *n, uint64_t pos, const void *buf, size_t l
         zi->di.size = pos + done;
         n->size = zi->di.size;
     }
-    zi->di.mtime = timer_ms() / 1000;
+    vfs_touch(n);
     zi->dirty = 1;
     zi_flush(n);
     return done ? (long)done : (len ? -1 : 0);
@@ -393,6 +396,8 @@ static struct vnode *make_vnode(struct vnode *dir, const char *name, size_t len,
     n->ino = ino;
     n->size = zi->di.size;
     n->priv = zi;
+    n->mtime_ms = zi->di.mtime * 1000;          /* as stored, not when we looked */
+    n->ctime_ms = zi->di.ctime * 1000;
     return n;
 }
 
@@ -514,7 +519,7 @@ static struct vnode *zaefs_create(struct vnode *dir, const char *name, size_t le
     di.type = type == VNODE_DIR ? ZAEFS_TYPE_DIR : ZAEFS_TYPE_FILE;
     di.links = 1;
     di.mode = type == VNODE_DIR ? 0755 : 0644;
-    di.ctime = di.mtime = timer_ms() / 1000;
+    di.ctime = di.mtime = vfs_now_ms() / 1000;
     if (inode_write(fs, (uint32_t)ino, &di) != 0 ||
         dir_add(dir, name, len, (uint32_t)ino, (uint8_t)di.type) != 0) {
         free_inode(fs, (uint64_t)ino);
