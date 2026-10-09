@@ -5,8 +5,8 @@
 #include "proc/sched.h"
 #include "proc/syscall.h"
 
-#define ARG_MAX   64        /* argv + envp entries */
-#define ARG_BYTES 8192
+#define ARG_MAX   4096      /* argv + envp entries (each list) */
+#define ARG_BYTES (256 * 1024)   /* their strings: compilers and linkers get long command lines */
 
 /* Start `path` (an ELF in the VFS) as a new user process with stdio on the
  * console; used by the kernel to launch init. argv/envp may be NULL. */

@@ -268,14 +268,19 @@ int process_grow_stack(struct task *t, uint64_t addr)
 /* Build the initial stack; returns the user rsp (pointing at argc). */
 static int build_stack(const struct image *im, const struct argpack *ap, uint64_t *rsp_out)
 {
-    if (map_zeroed(im->pgd, USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE / PAGE_SIZE,
-                   PTE_WRITE | PTE_NX) != 0)
+    /* what the arguments take (strings, pointers, auxv), on top of the usual stack */
+    size_t need = ap->used + (size_t)(ap->argc + ap->envc + 2) * sizeof(elf_word_t) + 1024;
+    size_t map = (USER_STACK_SIZE + need + PAGE_SIZE - 1) & ~(size_t)(PAGE_SIZE - 1);
+    if (map_zeroed(im->pgd, USER_STACK_TOP - map, map / PAGE_SIZE, PTE_WRITE | PTE_NX) != 0)
         return -ENOMEM;
 
     uint64_t sp = USER_STACK_TOP;
-    elf_word_t argv_ptrs[ARG_MAX + 1], envp_ptrs[ARG_MAX + 1];
+    elf_word_t *argv_ptrs = kmalloc((size_t)(ap->argc + 1) * sizeof(elf_word_t));
+    elf_word_t *envp_ptrs = kmalloc((size_t)(ap->envc + 1) * sizeof(elf_word_t));
+    int rc = -ENOMEM;
+    if (!argv_ptrs || !envp_ptrs) goto out;
 
-#define PUSH_BYTES(src, len) do { sp -= (len); if (copy_to_space(im->pgd, sp, (src), (len)) != 0) return -ENOMEM; } while (0)
+#define PUSH_BYTES(src, len) do { sp -= (len); if (copy_to_space(im->pgd, sp, (src), (len)) != 0) goto out; } while (0)
     for (int i = 0; i < ap->envc; i++) { PUSH_BYTES(ap->envp[i], strlen(ap->envp[i]) + 1); envp_ptrs[i] = (elf_word_t)sp; }
     for (int i = 0; i < ap->argc; i++) { PUSH_BYTES(ap->argv[i], strlen(ap->argv[i]) + 1); argv_ptrs[i] = (elf_word_t)sp; }
     argv_ptrs[ap->argc] = 0;
@@ -306,17 +311,21 @@ static int build_stack(const struct image *im, const struct argpack *ap, uint64_
     sp = (sp - vec_bytes) & ~15ULL;
     uint64_t p = sp;
     elf_word_t argc_w = (elf_word_t)ap->argc;
-    if (copy_to_space(im->pgd, p, &argc_w, W) != 0) return -ENOMEM;
+    if (copy_to_space(im->pgd, p, &argc_w, W) != 0) goto out;
     p += W;
-    if (copy_to_space(im->pgd, p, argv_ptrs, (ap->argc + 1) * W) != 0) return -ENOMEM;
+    if (copy_to_space(im->pgd, p, argv_ptrs, (ap->argc + 1) * W) != 0) goto out;
     p += (ap->argc + 1) * W;
-    if (copy_to_space(im->pgd, p, envp_ptrs, (ap->envc + 1) * W) != 0) return -ENOMEM;
+    if (copy_to_space(im->pgd, p, envp_ptrs, (ap->envc + 1) * W) != 0) goto out;
     p += (ap->envc + 1) * W;
-    if (copy_to_space(im->pgd, p, auxv, sizeof(auxv)) != 0) return -ENOMEM;
+    if (copy_to_space(im->pgd, p, auxv, sizeof(auxv)) != 0) goto out;
 #undef PUSH_BYTES
 
     *rsp_out = sp;
-    return 0;
+    rc = 0;
+out:
+    kfree(argv_ptrs);
+    kfree(envp_ptrs);
+    return rc;
 }
 
 /* Load `path` + args into a brand-new address space. */
@@ -441,6 +450,60 @@ struct task *process_spawn(const char *path, const char *const argv[], const cha
 
 /* ---- exec --------------------------------------------------------------------------- */
 
+/* A script: "#!interpreter [one argument]" on its first line. The
+ * interpreter runs instead, with the argument (if any) and the script's
+ * path before the script's own arguments (argv[0] dropped), as on Linux.
+ * Returns 1 and rewrites ap/path, 0 if it isn't one, -errno. */
+static int script(struct argpack *ap, const char **path)
+{
+    struct vnode *n = vfs_lookup(task_current()->cwd, *path);
+    if (!n || n->type != VNODE_FILE || !n->ops || !n->ops->read) return 0;
+    char line[128];
+    long got = n->ops->read(n, 0, line, sizeof line - 1);
+    if (got < 3 || line[0] != '#' || line[1] != '!') return 0;
+    line[got] = 0;
+    char *p = line + 2, *end = line;
+    while (*end && *end != '\n') end++;
+    if (!*end) end = NULL;
+    if (!end) return -ENOEXEC;              /* a first line longer than we read */
+    *end = 0;
+    while (*p == ' ' || *p == '\t') p++;
+    char *interp = p;
+    while (*p && *p != ' ' && *p != '\t') p++;
+    char *arg = NULL;
+    if (*p) {
+        *p++ = 0;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p) {
+            arg = p;                        /* the rest of the line is one argument */
+            char *t = p + strlen(p);
+            while (t > p && (t[-1] == ' ' || t[-1] == '\t' || t[-1] == '\r')) *--t = 0;
+        }
+    }
+    if (!*interp) return -ENOEXEC;
+    const char **list = kmalloc((ARG_MAX + 1) * sizeof *list);
+    if (!list) return -ENOMEM;
+    int k = 0;
+    list[k++] = interp;
+    if (arg) list[k++] = arg;
+    list[k++] = *path;
+    for (int i = 1; i < ap->argc && k < ARG_MAX; i++) list[k++] = ap->argv[i];
+    list[k] = NULL;
+    struct argpack *old = kmalloc(sizeof *old);
+    if (!old) { kfree(list); return -ENOMEM; }
+    memcpy(old, ap, sizeof *old);           /* list[] points into the old copy's strings */
+    for (int i = 0; i < k; i++)
+        if (list[i] >= ap->data && list[i] < ap->data + ARG_BYTES) list[i] = old->data + (list[i] - ap->data);
+    ap->used = 0;
+    int rc = pack_list(ap, list, ap->argv, &ap->argc);
+    if (rc == 0) rc = pack_list(ap, (const char *const *)old->envp, ap->envp, &ap->envc);
+    kfree(old);
+    kfree(list);
+    if (rc) return rc;
+    *path = ap->argv[0];
+    return 1;
+}
+
 long process_exec(const char *path, const char *const argv[], const char *const envp[])
 {
     struct task *t = task_current();
@@ -451,6 +514,16 @@ long process_exec(const char *path, const char *const argv[], const char *const 
     int rc = pack_list(ap, argv ? argv : dflt_argv, ap->argv, &ap->argc);
     if (rc == 0)
         rc = pack_list(ap, envp, ap->envp, &ap->envc);
+    for (int depth = 0; rc == 0; depth++) {      /* scripts, maybe run by scripts: a few levels */
+        int s = script(ap, &path);
+        if (s <= 0) { rc = s; break; }
+        if (depth == 4) rc = -ELOOP;
+    }
+    char exe[VFS_PATH_MAX];                     /* the path may now be in ap, which goes before set_name */
+    size_t pl = strlen(path) < sizeof exe - 1 ? strlen(path) : sizeof exe - 1;
+    memcpy(exe, path, pl);
+    exe[pl] = 0;
+    path = exe;
 
     struct image im;
     uint64_t rsp;
