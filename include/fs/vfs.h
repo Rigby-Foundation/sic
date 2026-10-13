@@ -3,8 +3,8 @@
 #pragma once
 #include "types.h"
 
-#define VFS_NAME_MAX 64
-#define VFS_PATH_MAX 256
+#define VFS_NAME_MAX 256
+#define VFS_PATH_MAX 1024
 #define MAX_FDS      64
 
 enum vnode_type { VNODE_FILE = 1, VNODE_DIR = 2, VNODE_DEV = 3, VNODE_LINK = 4 };   /* LINK: a symbolic link, its target in `link` */
@@ -38,8 +38,10 @@ struct vnode_ops {
     long (*read)(struct vnode *n, uint64_t pos, void *buf, size_t len);
     long (*write)(struct vnode *n, uint64_t pos, const void *buf, size_t len);
     int  (*truncate)(struct vnode *n, uint64_t size);
-    int  (*readdir)(struct vnode *dir, size_t index, struct dirent *out);   /* 1 = entry, 0 = end */
+    int  (*readdir)(struct vnode *dir, uint64_t *pos, struct dirent *out);   /* 1 = entry, 0 = end */
     int  (*sync)(struct vnode *n);
+    int  (*link)(struct vnode *dir, struct vnode *target, const char *name, size_t len);
+    void (*release)(struct vnode *n);
 };
 
 struct vnode {
@@ -57,6 +59,8 @@ struct vnode {
     int      is_block;              /* VNODE_DEV backed by a block device */
     int      is_sock;               /* VNODE_DEV that is a socket (priv = struct socket) */
     int      seekable;              /* VNODE_DEV with a position (framebuffer, initrd) */
+    int      open_count;            /* open file handles referencing this vnode */
+    int      unlinked;              /* unlinked while open */
     struct vnode *mounted;          /* a filesystem's root mounted on this directory */
     struct file *lock_owner;        /* fcntl record lock: one whole-file lock per file, held by an open file */
     uint32_t lock_pid;
@@ -101,6 +105,7 @@ struct file {
     int      flags;
     int      refs;
     const struct file_ops *fops;
+    void    *priv;                  /* generic per-open private state */
     void    *priv_gpu;              /* a device's per-open state (virtio-gpu contexts, shm segments) */
     uint32_t fb_gen;                /* /dev/fb0: the mode generation this file last read */
 };
@@ -134,6 +139,8 @@ void          vnode_free(struct vnode *n);
 struct vnode *vfs_lookup(struct vnode *cwd, const char *path);            /* follows symbolic links */
 struct vnode *vfs_lookup_nofollow(struct vnode *cwd, const char *path);   /* ... but not a final one (lstat, readlink) */
 int           vfs_symlink(struct vnode *cwd, const char *target, const char *path);   /* -errno */
+int           vfs_link(struct vnode *cwd, const char *oldpath, struct vnode *newcwd, const char *newpath);   /* -errno */
+uint16_t      vfs_nlink(struct vnode *n);
 int           vfs_readlink(struct vnode *n, char *buf, size_t len);   /* bytes, or -EINVAL if n is no link */
 struct vnode *vfs_create(struct vnode *cwd, const char *path, enum vnode_type type);
 int           vfs_mkdev(const char *path, const struct dev_ops *ops, void *priv);
@@ -150,10 +157,14 @@ struct file  *file_dup(struct file *f);
 void          file_close(struct file *f);
 long          file_read(struct file *f, void *buf, size_t len);
 long          file_write(struct file *f, const void *buf, size_t len);
+long          file_pread(struct file *f, void *buf, size_t len, uint64_t offset);
+long          file_pwrite(struct file *f, const void *buf, size_t len, uint64_t offset);
 long          file_seek(struct file *f, long off, int whence);
 int           file_poll(struct file *f, struct waitqueue **wq);   /* POLL* bits ready now */
-int           file_readdir(struct file *f, size_t index, struct dirent *out);
+/* Read the next directory entry at *pos and advance *pos. Returns 1 on entry, 0 on end, -1 on error. */
+int           file_readdir(struct file *f, uint64_t *pos, struct dirent *out);
 void          vnode_stat(struct vnode *n, struct stat *st);
 
 /* Whole-file read into a fresh kmalloc buffer (for exec). */
 void         *vfs_read_all(struct vnode *n, size_t *size);
+long          vfs_pread(struct vnode *n, void *buf, size_t len, uint64_t offset);

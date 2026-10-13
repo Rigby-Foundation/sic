@@ -518,6 +518,7 @@ static int fat_unlink(struct vnode *dir, struct vnode *n)
 {
     struct fat *fs = fs_of(dir);
     struct fnode *fn = fn_of(n);
+    if (!fn) return -1;
     if (n->type == VNODE_DIR && dir_walk(fs, fn, empty_cb, NULL) != 0)
         return -1;
     if (read_sector(fs, fn->dirent_sector, fs->sec) != 0) return -1;
@@ -529,10 +530,17 @@ static int fat_unlink(struct vnode *dir, struct vnode *n)
         fs->sec[off] = 0xE5;
     }
     if (write_sector(fs, fn->dirent_sector, fs->sec) != 0) return -1;
+    return 0;
+}
+
+static void fat_release(struct vnode *n)
+{
+    struct fat *fs = fs_of(n);
+    struct fnode *fn = fn_of(n);
+    if (!fn) return;
     free_chain(fs, fn->cluster);
     kfree(fn);
     n->priv = NULL;
-    return 0;
 }
 
 /* ---- file data --------------------------------------------------------------------- */
@@ -550,7 +558,7 @@ static long fat_read(struct vnode *n, uint64_t pos, void *buf, size_t len)
 {
     struct fat *fs = fs_of(n);
     struct fnode *fn = fn_of(n);
-    if (pos >= n->size) return 0;
+    if (!fn || pos >= n->size) return 0;
     if (pos + len > n->size) len = (size_t)(n->size - pos);
     uint8_t *sec = fs->sec;
     size_t done = 0;
@@ -580,6 +588,7 @@ static long fat_write(struct vnode *n, uint64_t pos, const void *buf, size_t len
 {
     struct fat *fs = fs_of(n);
     struct fnode *fn = fn_of(n);
+    if (!fn) return -1;
     uint8_t *sec = fs->sec;
     size_t done = 0;
     batch_begin(fs);
@@ -616,6 +625,7 @@ static int fat_truncate(struct vnode *n, uint64_t size)
 {
     if (size != 0) return -1;
     struct fnode *fn = fn_of(n);
+    if (!fn) return -1;
     free_chain(fs_of(n), fn->cluster);
     fn->cluster = 0;
     fn->hint_cluster = 0;
@@ -623,7 +633,7 @@ static int fat_truncate(struct vnode *n, uint64_t size)
     return write_dirent(n);
 }
 
-struct readdir_arg { size_t index; struct dirent *out; };
+struct readdir_arg { uint64_t index; struct dirent *out; };
 
 static int readdir_cb(struct fat *fs, const struct fat_dirent *e, const char *name, struct dir_pos *pos, void *arg)
 {
@@ -642,10 +652,12 @@ static int readdir_cb(struct fat *fs, const struct fat_dirent *e, const char *na
     return 1;
 }
 
-static int fat_readdir(struct vnode *dir, size_t index, struct dirent *out)
+static int fat_readdir(struct vnode *dir, uint64_t *pos, struct dirent *out)
 {
-    struct readdir_arg ra = { index, out };
-    return dir_walk(fs_of(dir), fn_of(dir), readdir_cb, &ra) == 1 ? 1 : 0;
+    struct readdir_arg ra = { *pos, out };
+    int rc = dir_walk(fs_of(dir), fn_of(dir), readdir_cb, &ra) == 1 ? 1 : 0;
+    if (rc) (*pos)++;
+    return rc;
 }
 
 static const struct vnode_ops fat_ops = {
@@ -656,6 +668,7 @@ static const struct vnode_ops fat_ops = {
     .write    = fat_write,
     .truncate = fat_truncate,
     .readdir  = fat_readdir,
+    .release  = fat_release,
 };
 
 /* ---- mount --------------------------------------------------------------------------- */

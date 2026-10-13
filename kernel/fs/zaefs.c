@@ -9,6 +9,7 @@
 #include "printf.h"
 #include "asm/timer.h"
 #include "abi/zaefs.h"
+#include "abi/abi.h"
 
 #define BS ZAEFS_BLOCK_SIZE
 #define CACHE_SLOTS 64
@@ -319,7 +320,7 @@ static long zaefs_read(struct vnode *n, uint64_t pos, void *buf, size_t len)
 {
     struct zaefs *fs = fs_of(n);
     struct zinode *zi = zi_of(n);
-    if (pos >= zi->di.size) return 0;
+    if (!zi || pos >= zi->di.size) return 0;
     if (pos + len > zi->di.size) len = (size_t)(zi->di.size - pos);
 
     uint8_t blk[BS];
@@ -344,6 +345,7 @@ static long zaefs_write(struct vnode *n, uint64_t pos, const void *buf, size_t l
 {
     struct zaefs *fs = fs_of(n);
     struct zinode *zi = zi_of(n);
+    if (!zi) return -1;
     uint8_t blk[BS];
     size_t done = 0;
     while (done < len) {
@@ -372,9 +374,11 @@ static long zaefs_write(struct vnode *n, uint64_t pos, const void *buf, size_t l
 static int zaefs_truncate(struct vnode *n, uint64_t size)
 {
     struct zinode *zi = zi_of(n);
+    if (!zi) return -1;
     if (size != 0)
         return -1;              /* only truncate-to-zero for now */
     free_all_blocks(fs_of(n), zi);
+    zi->di.size = 0;
     n->size = 0;
     return zi_flush(n);
 }
@@ -391,13 +395,22 @@ static struct vnode *make_vnode(struct vnode *dir, const char *name, size_t len,
     if (!zi) return NULL;
     zi->ino = ino;
     if (inode_read(fs, ino, &zi->di) != 0) { kfree(zi); return NULL; }
-    struct vnode *n = vnode_alloc(name, len, zi->di.type == ZAEFS_TYPE_DIR ? VNODE_DIR : VNODE_FILE, dir);
+    enum vnode_type vt = zi->di.type == ZAEFS_TYPE_DIR ? VNODE_DIR :
+                         zi->di.type == ZAEFS_TYPE_LINK ? VNODE_LINK : VNODE_FILE;
+    struct vnode *n = vnode_alloc(name, len, vt, dir);
     if (!n) { kfree(zi); return NULL; }
     n->ino = ino;
     n->size = zi->di.size;
     n->priv = zi;
     n->mtime_ms = zi->di.mtime * 1000;          /* as stored, not when we looked */
     n->ctime_ms = zi->di.ctime * 1000;
+    if (vt == VNODE_LINK && zi->di.size > 0) {
+        n->link = kmalloc(zi->di.size + 1);
+        if (n->link) {
+            zaefs_read(n, 0, n->link, zi->di.size);
+            n->link[zi->di.size] = '\0';
+        }
+    }
     return n;
 }
 
@@ -468,7 +481,7 @@ static int dir_add(struct vnode *dir, const char *name, size_t len, uint32_t ino
     return zi_flush(dir);
 }
 
-static int dir_remove(struct vnode *dir, uint32_t ino)
+static int dir_remove(struct vnode *dir, const char *name, size_t len)
 {
     struct zaefs *fs = fs_of(dir);
     struct zinode *zi = zi_of(dir);
@@ -479,14 +492,17 @@ static int dir_remove(struct vnode *dir, uint32_t ino)
         for (uint32_t off = 0; off + 8 <= BS;) {
             struct zaefs_dirent *e = (void *)(blk + off);
             if (le16toh(e->rec_len) < 8) break;
-            if (le32toh(e->ino) == ino) {
-                e->ino = 0;
-                return write_block(fs, (uint64_t)pb, blk);
+            if (e->name_len == len && memcmp(e->name, name, len) == 0) {
+                if (le32toh(e->ino)) {
+                    e->ino = 0;
+                    return write_block(fs, (uint64_t)pb, blk);
+                }
+                return 0;
             }
             off += le16toh(e->rec_len);
         }
     }
-    return -1;
+    return 0;
 }
 
 static int dir_is_empty(struct vnode *dir)
@@ -507,6 +523,18 @@ static int dir_is_empty(struct vnode *dir)
     return 1;
 }
 
+static void sync_ino_links(struct vnode *dir, uint32_t ino, uint16_t links)
+{
+    for (struct vnode *c = dir->children; c; c = c->sibling) {
+        if (c->ino == ino && c->priv) {
+            struct zinode *zi = c->priv;
+            zi->di.links = links;
+        }
+        if (c->type == VNODE_DIR)
+            sync_ino_links(c, ino, links);
+    }
+}
+
 static struct vnode *zaefs_create(struct vnode *dir, const char *name, size_t len, enum vnode_type type)
 {
     struct zaefs *fs = fs_of(dir);
@@ -516,9 +544,10 @@ static struct vnode *zaefs_create(struct vnode *dir, const char *name, size_t le
 
     struct zaefs_inode di;
     memset(&di, 0, sizeof(di));
-    di.type = type == VNODE_DIR ? ZAEFS_TYPE_DIR : ZAEFS_TYPE_FILE;
+    di.type = type == VNODE_DIR ? ZAEFS_TYPE_DIR :
+              type == VNODE_LINK ? ZAEFS_TYPE_LINK : ZAEFS_TYPE_FILE;
     di.links = 1;
-    di.mode = type == VNODE_DIR ? 0755 : 0644;
+    di.mode = type == VNODE_DIR ? 0755 : type == VNODE_LINK ? 0777 : 0644;
     di.ctime = di.mtime = vfs_now_ms() / 1000;
     if (inode_write(fs, (uint32_t)ino, &di) != 0 ||
         dir_add(dir, name, len, (uint32_t)ino, (uint8_t)di.type) != 0) {
@@ -528,55 +557,107 @@ static struct vnode *zaefs_create(struct vnode *dir, const char *name, size_t le
     return make_vnode(dir, name, len, (uint32_t)ino);
 }
 
+static int zaefs_link(struct vnode *dir, struct vnode *target, const char *name, size_t len)
+{
+    if (target->type == VNODE_DIR) return -EPERM;
+    if (len > ZAEFS_NAME_MAX) return -ENAMETOOLONG;
+    struct zinode *zi = zi_of(target);
+    if (!zi) return -EINVAL;
+    if (dir_add(dir, name, len, zi->ino, (uint8_t)zi->di.type) != 0) return -ENOSPC;
+    zi->di.links++;
+    zi->dirty = 1;
+    zi_flush(target);
+    if (dir->mnt && dir->mnt->root)
+        sync_ino_links(dir->mnt->root, zi->ino, zi->di.links);
+    if (!make_vnode(dir, name, len, zi->ino)) return -ENOMEM;
+    return 0;
+}
+
 static int zaefs_unlink(struct vnode *dir, struct vnode *n)
 {
-    struct zaefs *fs = fs_of(dir);
     struct zinode *zi = zi_of(n);
+    if (!zi) return -1;
     if (n->type == VNODE_DIR && !dir_is_empty(n)) return -1;
-    if (dir_remove(dir, zi->ino) != 0) return -1;
-    free_all_blocks(fs, zi);
-    free_inode(fs, zi->ino);
+    if (dir_remove(dir, n->name, strlen(n->name)) != 0) return -1;
+    if (zi->di.links > 1) {
+        zi->di.links--;
+        zi->dirty = 1;
+        zi_flush(n);
+        if (dir->mnt && dir->mnt->root)
+            sync_ino_links(dir->mnt->root, zi->ino, zi->di.links);
+        return 0;
+    }
+    zi->di.links = 0;
+    zi->dirty = 1;
+    return 0;
+}
+
+static void zaefs_release(struct vnode *n)
+{
+    struct zaefs *fs = fs_of(n);
+    struct zinode *zi = zi_of(n);
+    if (!zi) return;
+    if (zi->di.links == 0) {
+        free_all_blocks(fs, zi);
+        free_inode(fs, zi->ino);
+    }
     kfree(zi);
     n->priv = NULL;
-    return 0;
 }
 
 /* Move the directory entry: the inode and its blocks stay. */
 static int zaefs_rename(struct vnode *olddir, struct vnode *n, struct vnode *newdir, const char *name, size_t len)
 {
     struct zinode *zi = zi_of(n);
-    if (len > ZAEFS_NAME_MAX) return -1;
-    if (dir_remove(olddir, zi->ino) != 0) return -1;
+    if (!zi || len > ZAEFS_NAME_MAX) return -1;
+    if (dir_remove(olddir, n->name, strlen(n->name)) != 0) return -1;
     return dir_add(newdir, name, len, zi->ino, (uint8_t)zi->di.type);
 }
 
-static int zaefs_readdir(struct vnode *dir, size_t index, struct dirent *out)
+static int zaefs_readdir(struct vnode *dir, uint64_t *pos, struct dirent *out)
 {
     struct zaefs *fs = fs_of(dir);
     struct zinode *zi = zi_of(dir);
+    if (!zi) return 0;
     uint8_t blk[BS];
-    for (uint64_t lblk = 0; lblk * BS < zi->di.size; lblk++) {
+    uint64_t cur = *pos;
+
+    while (cur < zi->di.size) {
+        uint64_t lblk = cur / BS;
+        uint32_t off = (uint32_t)(cur % BS);
         int64_t pb = bmap(fs, zi, lblk, 0);
-        if (pb < 0 || read_block(fs, (uint64_t)pb, blk) != 0) continue;
-        for (uint32_t off = 0; off + 8 <= BS;) {
-            struct zaefs_dirent *e = (void *)(blk + off);
-            if (le16toh(e->rec_len) < 8) break;
-            if (le32toh(e->ino)) {
-                if (index == 0) {
-                    size_t l = e->name_len < VFS_NAME_MAX - 1 ? e->name_len : VFS_NAME_MAX - 1;
-                    memset(out->name, 0, VFS_NAME_MAX);
-                    memcpy(out->name, e->name, l);
-                    out->type = e->type == ZAEFS_TYPE_DIR ? VNODE_DIR : VNODE_FILE;
-                    out->ino = le32toh(e->ino);
-                    struct zaefs_inode di;
-                    out->size = inode_read(fs, le32toh(e->ino), &di) == 0 ? di.size : 0;
-                    return 1;
-                }
-                index--;
-            }
-            off += le16toh(e->rec_len);
+        if (pb < 0 || read_block(fs, (uint64_t)pb, blk) != 0) {
+            cur = (lblk + 1) * BS;
+            continue;
         }
+
+        while (off + 8 <= BS) {
+            struct zaefs_dirent *e = (void *)(blk + off);
+            uint16_t rlen = le16toh(e->rec_len);
+            if (rlen < 8 || off + rlen > BS) {
+                cur = (lblk + 1) * BS;
+                break;
+            }
+            uint32_t ino = le32toh(e->ino);
+            if (ino != 0) {
+                size_t l = e->name_len < VFS_NAME_MAX - 1 ? e->name_len : VFS_NAME_MAX - 1;
+                memset(out->name, 0, VFS_NAME_MAX);
+                memcpy(out->name, e->name, l);
+                out->type = e->type == ZAEFS_TYPE_DIR ? VNODE_DIR :
+                            e->type == ZAEFS_TYPE_LINK ? VNODE_LINK : VNODE_FILE;
+                out->ino = ino;
+                struct zaefs_inode di;
+                out->size = inode_read(fs, ino, &di) == 0 ? di.size : 0;
+                *pos = lblk * BS + off + rlen;
+                return 1;
+            }
+            off += rlen;
+            cur = lblk * BS + off;
+        }
+        if (cur < (lblk + 1) * BS)
+            cur = (lblk + 1) * BS;
     }
+    *pos = zi->di.size;
     return 0;
 }
 
@@ -590,6 +671,8 @@ static const struct vnode_ops zaefs_ops = {
     .truncate = zaefs_truncate,
     .readdir  = zaefs_readdir,
     .sync     = zi_flush,
+    .link     = zaefs_link,
+    .release  = zaefs_release,
 };
 
 /* ---- mount ----------------------------------------------------------------------------- */

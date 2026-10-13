@@ -9,11 +9,13 @@
 #include "mm/heap.h"
 #include "string.h"
 #include "printf.h"
+#include "abi/abi.h"
 
 struct tmpfs_file {
     uint8_t *data;
     size_t   cap;
     int      borrowed;          /* data is the initrd's: copy before writing, never free */
+    int      links;
 };
 
 static uint64_t next_ino = 1;
@@ -30,8 +32,22 @@ static struct vnode *tmpfs_create(struct vnode *dir, const char *name, size_t le
             vnode_free(n);
             return NULL;
         }
+        ((struct tmpfs_file *)n->priv)->links = 1;
     }
     return n;
+}
+
+static int tmpfs_link(struct vnode *dir, struct vnode *target, const char *name, size_t len)
+{
+    if (target->type == VNODE_DIR) return -EPERM;
+    struct tmpfs_file *tf = target->priv;
+    struct vnode *n = vnode_alloc(name, len, target->type, dir);
+    if (!n) return -ENOMEM;
+    n->ino = target->ino;
+    n->priv = tf;
+    n->size = target->size;
+    if (tf) tf->links++;
+    return 0;
 }
 
 static int tmpfs_unlink(struct vnode *dir, struct vnode *n)
@@ -39,15 +55,28 @@ static int tmpfs_unlink(struct vnode *dir, struct vnode *n)
     (void)dir;
     if (n->type == VNODE_FILE && n->priv) {
         struct tmpfs_file *tf = n->priv;
-        if (!tf->borrowed) kfree(tf->data);
-        kfree(tf);
+        tf->links--;
     }
     return 0;
+}
+
+static void tmpfs_release(struct vnode *n)
+{
+    if (n->type == VNODE_FILE && n->priv) {
+        struct tmpfs_file *tf = n->priv;
+        if (tf->links <= 0) {
+            if (!tf->borrowed) kfree(tf->data);
+            kfree(tf);
+        }
+        n->priv = NULL;
+    }
 }
 
 static long tmpfs_read(struct vnode *n, uint64_t pos, void *buf, size_t len)
 {
     struct tmpfs_file *tf = n->priv;
+    if (!tf || !tf->data)
+        return 0;
     size_t avail = pos < n->size ? n->size - pos : 0;
     if (len > avail)
         len = avail;
@@ -58,6 +87,8 @@ static long tmpfs_read(struct vnode *n, uint64_t pos, void *buf, size_t len)
 static long tmpfs_write(struct vnode *n, uint64_t pos, const void *buf, size_t len)
 {
     struct tmpfs_file *tf = n->priv;
+    if (!tf)
+        return -1;
     size_t end = pos + len;
     if (tf->borrowed) {                 /* the first write: a copy of our own */
         size_t cap = n->size > end ? n->size : end;
@@ -90,19 +121,28 @@ static long tmpfs_write(struct vnode *n, uint64_t pos, const void *buf, size_t l
 static int tmpfs_truncate(struct vnode *n, uint64_t size)
 {
     struct tmpfs_file *tf = n->priv;
+    if (!tf)
+        return -1;
     if (size > n->size) {
         uint8_t z = 0;
         return tmpfs_write(n, size - 1, &z, 1) == 1 ? 0 : -1;
     }
+    if (size == 0 && tf) {
+        if (!tf->borrowed)
+            kfree(tf->data);
+        tf->data = NULL;
+        tf->cap = 0;
+        tf->borrowed = 0;
+    }
     n->size = size;
-    (void)tf;
     return 0;
 }
 
-static int tmpfs_readdir(struct vnode *dir, size_t index, struct dirent *out)
+static int tmpfs_readdir(struct vnode *dir, uint64_t *pos, struct dirent *out)
 {
+    uint64_t idx = *pos;
     struct vnode *c = dir->children;
-    while (c && index--)
+    while (c && idx--)
         c = c->sibling;
     if (!c)
         return 0;
@@ -110,6 +150,7 @@ static int tmpfs_readdir(struct vnode *dir, size_t index, struct dirent *out)
     out->type = c->type;
     out->ino = (uint32_t)c->ino;
     out->size = c->size;
+    (*pos)++;
     return 1;
 }
 
@@ -120,6 +161,8 @@ static const struct vnode_ops tmpfs_ops = {
     .write    = tmpfs_write,
     .truncate = tmpfs_truncate,
     .readdir  = tmpfs_readdir,
+    .link     = tmpfs_link,
+    .release  = tmpfs_release,
 };
 
 static struct vnode *tmpfs_mount(struct vfs_mount *mnt, struct vnode *dev, const char *opts)

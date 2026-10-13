@@ -20,6 +20,7 @@ struct fdtable *fdt_clone(struct fdtable *src)
     for (int i = 0; i < MAX_FDS; i++)
         if (src->files[i])
             t->files[i] = file_dup(src->files[i]);
+    t->cloexec = src->cloexec;
     spin_unlock(&src->lock);
     return t;
 }
@@ -37,4 +38,20 @@ void fdt_put(struct fdtable *t)
             file_close(t->files[i]);
         kfree(t);
     }
+}
+
+void fdt_close_on_exec(struct fdtable *t)
+{
+    if (!t) return;
+    spin_lock(&t->lock);
+    uint64_t mask = t->cloexec;
+    for (int i = 0; i < MAX_FDS; i++) {
+        if ((mask & (1ULL << i)) && t->files[i]) {
+            struct file *f = t->files[i];
+            t->files[i] = NULL;
+            file_close(f);
+        }
+    }
+    t->cloexec = 0;
+    spin_unlock(&t->lock);
 }

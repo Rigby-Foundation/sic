@@ -10,6 +10,7 @@
 #include "spinlock.h"
 #include "fs/blkdev.h"
 #include "asm/timer.h"
+#include "abi/zaefs.h"
 
 static struct vnode *root;
 static struct vfs_mount root_mount;
@@ -106,7 +107,7 @@ static struct vnode *follow(struct vnode *dir, struct vnode *n, int *depth)
  * empty for "/"). */
 static struct vnode *walk_parent_d(struct vnode *cwd, const char *path, const char **last, size_t *lastlen, int *depth)
 {
-    struct vnode *dir = (*path == '/') ? root : (cwd ? cwd : root);
+    struct vnode *dir = (*path == '/') ? vfs_root() : (cwd ? cwd : vfs_root());
     while (*path == '/')
         path++;
 
@@ -139,6 +140,8 @@ static struct vnode *walk_parent(struct vnode *cwd, const char *path, const char
 
 static struct vnode *resolve(struct vnode *cwd, const char *path, int follow_last, int *depth)
 {
+    if (!path || !*path)
+        return NULL;
     const char *last;
     size_t len;
     struct vnode *dir = walk_parent_d(cwd, path, &last, &len, depth);
@@ -220,15 +223,15 @@ void vfs_init(void)
     kprintf("vfs: tmpfs root mounted\n");
 }
 
-struct vnode *vfs_root(void) { return root; }
+struct vnode *vfs_root(void) { return (root && root->mounted) ? root->mounted : root; }
 
 int vfs_mount(const char *fstype, struct vnode *dev, struct vnode *dir, const char *opts)
 {
     struct fs_type *fs = find_fs(fstype);
     if (!fs || !dir || dir->type != VNODE_DIR)
         return -1;
-    if (dir->mounted || dir->mountpoint || dir == root)
-        return -2;                          /* already a mount point / a mounted root */
+    if (dir->mounted || dir->mountpoint)
+        return -2;                          /* already a mount point */
 
     struct vfs_mount *mnt = kzalloc(sizeof(*mnt));
     if (!mnt)
@@ -243,6 +246,29 @@ int vfs_mount(const char *fstype, struct vnode *dev, struct vnode *dir, const ch
     spin_lock(&vfs_lock);
     r->mountpoint = dir;
     dir->mounted = r;
+    if (dir == root) {
+        /* When mounting over root, mount old /dev and /proc onto new /dev and /proc */
+        struct vnode *old_dev = dir_find(root, "dev", 3);
+        struct vnode *old_proc = dir_find(root, "proc", 4);
+        if (old_dev) {
+            struct vnode *new_dev = dir_find(r, "dev", 3);
+            if (!new_dev && r->ops && r->ops->create)
+                new_dev = r->ops->create(r, "dev", 3, VNODE_DIR);
+            if (new_dev && !new_dev->mounted) {
+                new_dev->mounted = old_dev;
+                old_dev->mountpoint = new_dev;
+            }
+        }
+        if (old_proc) {
+            struct vnode *new_proc = dir_find(r, "proc", 4);
+            if (!new_proc && r->ops && r->ops->create)
+                new_proc = r->ops->create(r, "proc", 4, VNODE_DIR);
+            if (new_proc && !new_proc->mounted) {
+                new_proc->mounted = old_proc;
+                old_proc->mountpoint = new_proc;
+            }
+        }
+    }
     spin_unlock(&vfs_lock);
     return 0;
 }
@@ -296,14 +322,39 @@ int vfs_symlink(struct vnode *cwd, const char *target, const char *path)
     if (!dir || dir->type != VNODE_DIR || len == 0) rc = -ENOENT;
     else if (dir_find(dir, last, len)) rc = -EEXIST;
     else if (!dir->ops || !dir->ops->create) rc = -EPERM;
-    else if (!dir->mnt || !dir->mnt->type || strcmp(dir->mnt->type->name, "tmpfs") != 0) rc = -EPERM;   /* links live in memory only, for now */
     else {
         struct vnode *n = dir->ops->create(dir, last, len, VNODE_LINK);
         if (!n) rc = -EPERM;                /* a filesystem without links */
-        else { n->link = copy; n->size = tl; copy = NULL; }
+        else {
+            n->link = copy; n->size = tl; copy = NULL;
+            if (n->mnt && n->mnt->type && strcmp(n->mnt->type->name, "tmpfs") != 0) {
+                if (n->ops && n->ops->write) {
+                    n->ops->write(n, 0, target, tl);
+                    if (n->ops->sync) n->ops->sync(n);
+                }
+            }
+        }
     }
     spin_unlock(&vfs_lock);
     kfree(copy);
+    return rc;
+}
+
+int vfs_link(struct vnode *cwd, const char *oldpath, struct vnode *newcwd, const char *newpath)
+{
+    spin_lock(&vfs_lock);
+    int rc = 0;
+    struct vnode *target = lookup_nofollow_locked(cwd, oldpath);
+    const char *last; size_t len;
+    struct vnode *newdir = walk_parent(newcwd, newpath, &last, &len);
+    if (!target) rc = -ENOENT;
+    else if (target->type == VNODE_DIR) rc = -EPERM;
+    else if (!newdir || newdir->type != VNODE_DIR || len == 0 || len >= VFS_NAME_MAX) rc = -ENOENT;
+    else if (newdir->mnt != target->mnt) rc = -EXDEV;
+    else if (dir_find(newdir, last, len)) rc = -EEXIST;
+    else if (!newdir->ops || !newdir->ops->link) rc = -EPERM;
+    else rc = newdir->ops->link(newdir, target, last, len);
+    spin_unlock(&vfs_lock);
     return rc;
 }
 
@@ -339,14 +390,21 @@ int vfs_unlink(struct vnode *cwd, const char *path)
     spin_lock(&vfs_lock);
     struct vnode *n = lookup_nofollow_locked(cwd, path);
     int rc = -1;
+    uint64_t pos = 0;
     if (n && n->parent && !n->mountpoint && !n->mounted &&
         (n->type != VNODE_DIR || !n->children) &&
-        (n->type != VNODE_DIR || !n->ops->readdir || n->ops->readdir(n, 0, &(struct dirent){0}) == 0)) {
+        (n->type != VNODE_DIR || !n->ops->readdir || n->ops->readdir(n, &pos, &(struct dirent){0}) == 0)) {
         rc = n->ops && n->ops->unlink ? n->ops->unlink(n->parent, n) : 0;
         if (rc == 0) {
             detach(n);
             kfree(n->link);
-            vnode_free(n);      /* leaks the node if still open; fine for now */
+            n->link = NULL;
+            n->unlinked = 1;
+            if (n->open_count == 0) {
+                if (n->ops && n->ops->release)
+                    n->ops->release(n);
+                vnode_free(n);
+            }
         }
     }
     spin_unlock(&vfs_lock);
@@ -376,7 +434,14 @@ int vfs_rename(struct vnode *cwd, const char *oldpath, struct vnode *newcwd, con
         if (target->type != VNODE_DIR && n->type == VNODE_DIR) { rc = -ENOTDIR; goto out; }
         if (target->ops && target->ops->unlink && target->ops->unlink(newdir, target) != 0) { rc = -EIO; goto out; }
         detach(target);
-        vnode_free(target);
+        kfree(target->link);
+        target->link = NULL;
+        target->unlinked = 1;
+        if (target->open_count == 0) {
+            if (target->ops && target->ops->release)
+                target->ops->release(target);
+            vnode_free(target);
+        }
     }
     if (n->ops->rename && n->ops->rename(n->parent, n, newdir, last, len) != 0) { rc = -EIO; goto out; }
     detach(n);
@@ -431,19 +496,36 @@ struct file *vfs_open(struct vnode *cwd, const char *path, int flags)
         n->ops->truncate(n, 0);
         vfs_touch(n);
     }
+    if (n)
+        __atomic_add_fetch(&n->open_count, 1, __ATOMIC_SEQ_CST);
     spin_unlock(&vfs_lock);
     if (!n)
         return NULL;
 
     struct file *f = kzalloc(sizeof(*f));
-    if (!f)
+    if (!f) {
+        spin_lock(&vfs_lock);
+        if (__atomic_sub_fetch(&n->open_count, 1, __ATOMIC_SEQ_CST) == 0 && n->unlinked) {
+            if (n->ops && n->ops->release)
+                n->ops->release(n);
+            vnode_free(n);
+        }
+        spin_unlock(&vfs_lock);
         return NULL;
+    }
     f->node = n;
     f->flags = flags;
     f->refs = 1;
     if ((flags & O_APPEND) && n->type == VNODE_FILE)
         f->pos = n->size;
     if (n->type == VNODE_DEV && n->dev && n->dev->open && n->dev->open(f) < 0) {
+        spin_lock(&vfs_lock);
+        if (__atomic_sub_fetch(&n->open_count, 1, __ATOMIC_SEQ_CST) == 0 && n->unlinked) {
+            if (n->ops && n->ops->release)
+                n->ops->release(n);
+            vnode_free(n);
+        }
+        spin_unlock(&vfs_lock);
         kfree(f);                       /* the device said no (busy) */
         return NULL;
     }
@@ -459,13 +541,25 @@ struct file *file_dup(struct file *f)
 void file_close(struct file *f)
 {
     if (f && __atomic_sub_fetch(&f->refs, 1, __ATOMIC_SEQ_CST) == 0) {
-        if (f->node->lock_owner == f) f->node->lock_owner = NULL;   /* a record lock dies with its file */
-        if (f->fops && f->fops->release)
+        struct vnode *n = f->node;
+        if (n && n->lock_owner == f) n->lock_owner = NULL;   /* a record lock dies with its file */
+        if (f->fops && f->fops->release) {
             f->fops->release(f);
-        else if (f->node->type == VNODE_DEV && f->node->dev && f->node->dev->release)
-            f->node->dev->release(f);
-        else if (f->node->ops && f->node->ops->sync)
-            f->node->ops->sync(f->node);
+        } else {
+            if (n && n->type == VNODE_DEV && n->dev && n->dev->release)
+                n->dev->release(f);
+            else if (n && n->ops && n->ops->sync)
+                n->ops->sync(n);
+            if (n) {
+                spin_lock(&vfs_lock);
+                if (__atomic_sub_fetch(&n->open_count, 1, __ATOMIC_SEQ_CST) == 0 && n->unlinked) {
+                    if (n->ops && n->ops->release)
+                        n->ops->release(n);
+                    vnode_free(n);
+                }
+                spin_unlock(&vfs_lock);
+            }
+        }
         kfree(f);
     }
 }
@@ -510,9 +604,59 @@ long file_write(struct file *f, const void *buf, size_t len)
     return r;
 }
 
+long file_pread(struct file *f, void *buf, size_t len, uint64_t offset)
+{
+    if (!f) return -EBADF;
+    struct vnode *n = f->node;
+    if (!n) return -EBADF;
+    if (n->type == VNODE_DIR)
+        return -EISDIR;
+    struct blkdev *b = blkdev_from_vnode(n);
+    if (b) {
+        if ((f->flags & 3) == O_WRONLY)
+            return -EBADF;
+        return blkdev_read_bytes(b, offset, buf, len);
+    }
+    if (n->type == VNODE_DEV)
+        return -ESPIPE;
+    if (n->type != VNODE_FILE || (f->flags & 3) == O_WRONLY || !n->ops || !n->ops->read)
+        return -EBADF;
+
+    spin_lock(&vfs_lock);
+    long r = n->ops->read(n, offset, buf, len);
+    spin_unlock(&vfs_lock);
+    return r;
+}
+
+long file_pwrite(struct file *f, const void *buf, size_t len, uint64_t offset)
+{
+    if (!f) return -EBADF;
+    struct vnode *n = f->node;
+    if (!n) return -EBADF;
+    if (n->type == VNODE_DIR)
+        return -EISDIR;
+    struct blkdev *b = blkdev_from_vnode(n);
+    if (b) {
+        if ((f->flags & 3) == O_RDONLY)
+            return -EBADF;
+        return blkdev_write_bytes(b, offset, buf, len);
+    }
+    if (n->type == VNODE_DEV)
+        return -ESPIPE;
+    if (n->type != VNODE_FILE || (f->flags & 3) == O_RDONLY || !n->ops || !n->ops->write)
+        return -EBADF;
+
+    spin_lock(&vfs_lock);
+    long r = n->ops->write(n, offset, buf, len);
+    if (r > 0)
+        vfs_touch(n);
+    spin_unlock(&vfs_lock);
+    return r;
+}
+
 long file_seek(struct file *f, long off, int whence)
 {
-    if (f->node->type != VNODE_FILE && f->node->type != VNODE_DEV)
+    if (f->node->type != VNODE_FILE && f->node->type != VNODE_DEV && f->node->type != VNODE_DIR)
         return -1;
     long base = whence == 0 ? 0 : whence == 1 ? (long)f->pos : (long)f->node->size;
     if (base + off < 0)
@@ -535,13 +679,13 @@ int file_poll(struct file *f, struct waitqueue **wq)
     return POLLIN | POLLOUT;
 }
 
-int file_readdir(struct file *f, size_t index, struct dirent *out)
+int file_readdir(struct file *f, uint64_t *pos, struct dirent *out)
 {
     struct vnode *d = f->node;
     if (d->type != VNODE_DIR || !d->ops->readdir)
         return -1;
     spin_lock(&vfs_lock);
-    int r = d->ops->readdir(d, index, out);
+    int r = d->ops->readdir(d, pos, out);
     spin_unlock(&vfs_lock);
     return r;
 }
@@ -551,6 +695,24 @@ void vnode_stat(struct vnode *n, struct stat *st)
     st->type = n->type;
     st->ino = (uint32_t)n->ino;
     st->size = n->size;
+}
+
+uint16_t vfs_nlink(struct vnode *n)
+{
+    if (!n) return 0;
+    if (n->type == VNODE_DIR) return 2;
+    if (n->type == VNODE_DEV) return 1;
+    if (n->mnt && n->mnt->type) {
+        if (strcmp(n->mnt->type->name, "zaefs") == 0 && n->priv) {
+            struct { uint32_t ino; struct zaefs_inode di; int dirty; } *zi = n->priv;
+            return zi->di.links ? zi->di.links : 1;
+        }
+        if (strcmp(n->mnt->type->name, "tmpfs") == 0 && n->priv) {
+            struct { uint8_t *data; size_t cap; int borrowed; int links; } *tf = n->priv;
+            return tf->links > 0 ? (uint16_t)tf->links : 1;
+        }
+    }
+    return 1;
 }
 
 void *vfs_read_all(struct vnode *n, size_t *size)
@@ -569,3 +731,14 @@ void *vfs_read_all(struct vnode *n, size_t *size)
     *size = sz;
     return buf;
 }
+
+long vfs_pread(struct vnode *n, void *buf, size_t len, uint64_t offset)
+{
+    if (!n || n->type != VNODE_FILE || !n->ops || !n->ops->read)
+        return -1;
+    spin_lock(&vfs_lock);
+    long r = n->ops->read(n, offset, buf, len);
+    spin_unlock(&vfs_lock);
+    return r;
+}
+

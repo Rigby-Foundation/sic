@@ -50,6 +50,7 @@ struct zaefs_superblock {
 
 #define ZAEFS_TYPE_FILE 1
 #define ZAEFS_TYPE_DIR  2
+#define ZAEFS_TYPE_LINK 3
 
 struct zaefs_inode {
     uint16_t type;

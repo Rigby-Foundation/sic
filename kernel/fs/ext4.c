@@ -693,6 +693,7 @@ static void free_all_blocks(struct ext4 *fs, uint8_t *in)
 
 static long ext4_read(struct vnode *n, uint64_t pos, void *buf, size_t len)
 {
+    if (!n->priv) return 0;
     struct ext4 *fs = EFS(n);
     lock(fs);
     uint8_t *in = fs->ibuf;
@@ -783,6 +784,7 @@ static int writable(struct ext4 *fs)
 
 static long ext4_write(struct vnode *n, uint64_t pos, const void *buf, size_t len)
 {
+    if (!n->priv) return -1;
     struct ext4 *fs = EFS(n);
     if (!writable(fs)) return -1;
     lock(fs);
@@ -932,7 +934,7 @@ static struct vnode *ext4_lookup(struct vnode *dir, const char *name, size_t len
     return v;
 }
 
-struct readdir_arg { size_t index; struct dirent *out; };
+struct readdir_arg { uint64_t index; struct dirent *out; };
 
 static int readdir_cb(struct ext4 *fs, uint8_t *blk, uint8_t *e, uint64_t lblk, void *arg)
 {
@@ -949,16 +951,19 @@ static int readdir_cb(struct ext4 *fs, uint8_t *blk, uint8_t *e, uint64_t lblk, 
     return 1;
 }
 
-static int ext4_readdir(struct vnode *dir, size_t index, struct dirent *out)
+static int ext4_readdir(struct vnode *dir, uint64_t *pos, struct dirent *out)
 {
     struct ext4 *fs = EFS(dir);
     lock(fs);
-    struct readdir_arg a = { index, out };
+    struct readdir_arg a = { *pos, out };
     int rc = !iread(fs, INO(dir), fs->ibuf) && dir_walk(fs, fs->ibuf, readdir_cb, &a) == 1;
-    if (rc && out->type == VNODE_FILE) {
-        uint8_t *in = kmalloc(fs->inode_size);
-        if (in && !iread(fs, out->ino, in)) out->size = isize(in);
-        kfree(in);
+    if (rc) {
+        (*pos)++;
+        if (out->type == VNODE_FILE) {
+            uint8_t *in = kmalloc(fs->inode_size);
+            if (in && !iread(fs, out->ino, in)) out->size = isize(in);
+            kfree(in);
+        }
     }
     unlock(fs);
     return rc;
@@ -1325,12 +1330,20 @@ static int ext4_unlink(struct vnode *dir, struct vnode *n)
         ifree(fs, ino, isdir);
     }
     rc = iwrite(fs, ino, in);
-    if (!rc) kfree(n->priv), n->priv = NULL;
+    if (!rc && n->open_count == 0) { kfree(n->priv); n->priv = NULL; }
 out:
     flush_meta(fs);                                     /* bitmaps and counts as the blocks now are */
     kfree(din);
     unlock(fs);
     return rc;
+}
+
+static void ext4_release(struct vnode *n)
+{
+    if (n->priv) {
+        kfree(n->priv);
+        n->priv = NULL;
+    }
 }
 
 static int ext4_rename(struct vnode *olddir, struct vnode *n, struct vnode *newdir, const char *name, size_t len)
@@ -1448,6 +1461,7 @@ static int ext4_sync(struct vnode *n)
 static const struct vnode_ops ext4_ops = {
     .lookup = ext4_lookup, .create = ext4_create, .unlink = ext4_unlink, .rename = ext4_rename,
     .read = ext4_read, .write = ext4_write, .truncate = ext4_truncate, .readdir = ext4_readdir, .sync = ext4_sync,
+    .release = ext4_release,
 };
 
 static void ext4_free(struct ext4 *fs)
