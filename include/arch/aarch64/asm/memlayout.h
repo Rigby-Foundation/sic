@@ -46,6 +46,7 @@
 #define PTE_GLOBAL  (1UL << 8)      /* unused: the kernel half is global by construction */
 #define PTE_DEV     (1UL << 9)      /* device page: never freed, never copied */
 #define PTE_NX      (1UL << 10)     /* no-execute */
+#define PTE_COW     (1UL << 11)     /* copy-on-write */
 #define PTE_ADDR_MASK 0x0000fffffffff000UL
 
 static inline void invlpg(uint64_t virt)

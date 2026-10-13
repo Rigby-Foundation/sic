@@ -398,6 +398,11 @@ void ppc_mmu_activate(pgd_t pgd)
     __asm__ volatile("isync");
 }
 
+void vmm_activate(pgd_t pgd)
+{
+    ppc_mmu_activate(pgd);
+}
+
 /* A hash miss: if the software table knows the page, re-insert it. */
 int ppc_mmu_fault(uint32_t addr, int write, int user)
 {
@@ -418,4 +423,11 @@ int ppc_mmu_fault(uint32_t addr, int write, int user)
     if (write && !(*pte & PTE_WRITE)) return -1;
     hpte_insert(vsid_for(ctx, addr), addr, *pte & 0xFFFFF000u, *pte & 0xFFF);
     return 0;
+}
+
+int vmm_handle_cow(pgd_t pgd, uint64_t virt)
+{
+    (void)pgd;
+    (void)virt;
+    return -1;
 }

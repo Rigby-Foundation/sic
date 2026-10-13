@@ -43,6 +43,7 @@
 #define PTE_GLOBAL  (1UL << 8)      /* unused */
 #define PTE_DEV     (1UL << 9)      /* device page: never freed, never copied */
 #define PTE_NX      (1UL << 10)     /* no-execute (segment-level on 32-bit: recorded only) */
+#define PTE_COW     (1UL << 11)     /* copy-on-write */
 #define PTE_ADDR_MASK 0xFFFFF000UL
 
 static inline void invlpg(uint64_t virt)

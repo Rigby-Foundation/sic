@@ -22,6 +22,9 @@ uint64_t pmm_alloc_pages(size_t count);     /* physically contiguous */
 uint64_t pmm_alloc_pages_below(size_t count, uint64_t limit);   /* ... with base+size <= limit */
 void     pmm_free_page(uint64_t phys);
 void     pmm_free_pages(uint64_t phys, size_t count);
+void     pmm_page_inc_ref(uint64_t phys);
+uint16_t pmm_page_get_ref(uint64_t phys);
+int      pmm_page_dec_ref(uint64_t phys);
 
 uint64_t pmm_total_pages(void);
 uint64_t pmm_used_pages(void);

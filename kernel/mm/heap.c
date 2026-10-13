@@ -27,7 +27,7 @@
 #define SLAB_MAGIC      0x534C4142u     /* "SLAB" */
 #define LARGE_MAGIC     0x4C52474Cu     /* "LRGL" */
 #define OWNER_LARGE     1UL             /* low bit tag; slab pointers are page aligned */
-#define MAX_FREE_RUNS   1024
+#define MAX_FREE_RUNS   4096
 #define MAX_SMALL       2048
 
 /* ---- page layer ------------------------------------------------------------ */
@@ -49,14 +49,22 @@ static inline void    *page_addr(uint64_t idx)   { return (void *)(HEAP_BASE + (
 
 static int64_t take_virtual_pages(size_t count)
 {
+    size_t best_idx = (size_t)-1;
+    uint64_t best_count = (uint64_t)-1;
     for (size_t i = 0; i < free_run_count; i++) {
-        if (free_runs[i].count < count)
-            continue;
-        uint64_t page = free_runs[i].page;
-        free_runs[i].page  += count;
-        free_runs[i].count -= count;
-        if (free_runs[i].count == 0)
-            free_runs[i] = free_runs[--free_run_count];
+        if (free_runs[i].count >= count && free_runs[i].count < best_count) {
+            best_idx = i;
+            best_count = free_runs[i].count;
+            if (best_count == count)
+                break;
+        }
+    }
+    if (best_idx != (size_t)-1) {
+        uint64_t page = free_runs[best_idx].page;
+        free_runs[best_idx].page  += count;
+        free_runs[best_idx].count -= count;
+        if (free_runs[best_idx].count == 0)
+            free_runs[best_idx] = free_runs[--free_run_count];
         return (int64_t)page;
     }
     if (bump_page + count > HEAP_PAGES)
@@ -85,6 +93,18 @@ static void give_virtual_pages(uint64_t page, size_t count)
     }
     if (page + count == bump_page) {        /* shrink the bump pointer */
         bump_page = page;
+        int shrunk = 1;
+        while (shrunk) {
+            shrunk = 0;
+            for (size_t i = 0; i < free_run_count; i++) {
+                if (free_runs[i].page + free_runs[i].count == bump_page) {
+                    bump_page = free_runs[i].page;
+                    free_runs[i] = free_runs[--free_run_count];
+                    shrunk = 1;
+                    break;
+                }
+            }
+        }
         return;
     }
     if (free_run_count < MAX_FREE_RUNS)

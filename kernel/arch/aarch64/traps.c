@@ -95,11 +95,26 @@ void aarch64_sync(struct pt_regs *r, int user)
     case EC_IABT_LOW: {
         uint64_t addr = r->far;
         interrupts_enable();
+        if (ec == EC_DABT_LOW) {
+            struct task *cur = task_current();
+            if (cur && cur->mm && vmm_handle_cow(cur->mm->pgd, addr) == 0) {
+                interrupts_disable();
+                break;
+            }
+        }
         if (process_grow_stack(task_current(), addr) == 0) { interrupts_disable(); break; }
         kill_user(r, SIGSEGV, addr);
         break;
     }
     case EC_DABT_CUR:
+        if (r->far >= USER_BASE && r->far < USER_END) {
+            struct task *cur = task_current();
+            if (cur && cur->mm && vmm_handle_cow(cur->mm->pgd, r->far) == 0)
+                break;
+            if (process_grow_stack(cur, r->far) == 0)
+                break;
+        }
+        fatal(r, " (in the kernel)");
     case EC_IABT_CUR:
         fatal(r, " (in the kernel)");
     case EC_UNKNOWN:

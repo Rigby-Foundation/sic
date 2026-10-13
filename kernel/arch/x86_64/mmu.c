@@ -352,3 +352,16 @@ uint64_t vmm_clone_address_space(uint64_t src)
     }
     return dst;
 }
+
+void vmm_activate(pgd_t pgd)
+{
+    if (read_cr3() != pgd)
+        write_cr3(pgd);
+}
+
+int vmm_handle_cow(pgd_t pgd, uint64_t virt)
+{
+    (void)pgd;
+    (void)virt;
+    return -1;
+}

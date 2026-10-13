@@ -37,7 +37,9 @@ void     vmm_destroy_address_space(pgd_t pgd);          /* frees user frames and
 int      vmm_map_user_page(pgd_t pgd, uint64_t virt, uint64_t phys, uint64_t flags);
 uint64_t vmm_unmap_user_page(pgd_t pgd, uint64_t virt);         /* returns phys or 0 */
 int      vmm_protect_user_page(pgd_t pgd, uint64_t virt, uint64_t flags); /* W/NX bits */
+int      vmm_handle_cow(pgd_t pgd, uint64_t virt);
 uint64_t vmm_translate_in(pgd_t pgd, uint64_t virt);
+void     vmm_activate(pgd_t pgd);
 
 static inline uint64_t read_cr3(void)
 {

@@ -19,6 +19,8 @@ static size_t   region_count;
 
 static uint64_t *bitmap;            /* virtual address */
 static uint64_t  bitmap_pages;      /* pages the bitmap covers */
+static uint16_t *refcounts;         /* frame reference count for COW */
+static uint64_t  refcount_bytes;
 static uint64_t  highest_addr;
 static uint64_t  total_pages, used_pages;
 static uint64_t  search_hint;       /* first frame that might be free */
@@ -40,9 +42,11 @@ static void mark_range(uint64_t base, uint64_t len, int used)
         uint64_t i = a >> PAGE_SHIFT;
         if (used && !test_bit(i)) {
             set_bit(i);
+            if (refcounts) refcounts[i] = 1;
             used_pages++;
         } else if (!used && test_bit(i)) {
             clr_bit(i);
+            if (refcounts) refcounts[i] = 0;
             used_pages--;
             if (i < search_hint)
                 search_hint = i;
@@ -67,8 +71,10 @@ void pmm_init(const struct zaeboot_info *info)
 
     bitmap_pages = highest_addr >> PAGE_SHIFT;
     uint64_t bitmap_bytes = PAGE_ALIGN_UP((bitmap_pages + 7) / 8);
+    refcount_bytes = PAGE_ALIGN_UP(bitmap_pages * sizeof(uint16_t));
+    uint64_t total_meta_bytes = bitmap_bytes + refcount_bytes;
 
-    /* Place the bitmap in the first usable region (above 1 MiB, outside the
+    /* Place the bitmap and refcounts in the first usable region (above 1 MiB, outside the
      * kernel image) that can hold it. */
     uint64_t kstart = PAGE_ALIGN_DOWN(KERNEL_SYM_PHYS(_kernel_start));
     uint64_t kend   = PAGE_ALIGN_UP(KERNEL_SYM_PHYS(_kernel_end));
@@ -82,7 +88,7 @@ void pmm_init(const struct zaeboot_info *info)
             base = 0x100000;
         if (base < kend && end > kstart)
             base = kend;
-        if (end > base && end - base >= bitmap_bytes)
+        if (end > base && end - base >= total_meta_bytes)
             bitmap_phys = base;
     }
     if (!bitmap_phys) {
@@ -92,8 +98,10 @@ void pmm_init(const struct zaeboot_info *info)
     bitmap_phys_addr = bitmap_phys;
 
     bitmap = EARLY_P2V(bitmap_phys);        /* the direct map comes later on x86 */
+    refcounts = (uint16_t *)EARLY_P2V(bitmap_phys + bitmap_bytes);
     bitmap_is_early = 1;
     memset(bitmap, 0xFF, bitmap_bytes);
+    memset(refcounts, 0, refcount_bytes);
     total_pages = bitmap_pages;
     used_pages  = bitmap_pages;
     search_hint = bitmap_pages;
@@ -104,7 +112,7 @@ void pmm_init(const struct zaeboot_info *info)
 
     mark_range(0, 0x100000, 1);                     /* legacy low memory, and NULL */
     mark_range(kstart, kend - kstart, 1);           /* ourselves */
-    mark_range(bitmap_phys, bitmap_bytes, 1);       /* the bitmap */
+    mark_range(bitmap_phys, total_meta_bytes, 1);   /* the bitmap and refcounts */
 }
 
 void pmm_keep(uint64_t base, uint64_t len)
@@ -164,8 +172,10 @@ uint64_t pmm_alloc_pages_below(size_t count, uint64_t limit)
             i += run;
             continue;
         }
-        for (size_t k = 0; k < count; k++)
+        for (size_t k = 0; k < count; k++) {
             set_bit(i + k);
+            if (refcounts) refcounts[i + k] = 1;
+        }
         used_pages += count;
         if (count == 1 || i == search_hint)
             search_hint = i + count;
@@ -195,6 +205,11 @@ void pmm_free_pages(uint64_t phys, size_t count)
             kprintf("pmm: double free of %llx\n", (i + k) << PAGE_SHIFT);
             continue;
         }
+        if (refcounts && refcounts[i + k] > 1) {
+            refcounts[i + k]--;
+            continue;
+        }
+        if (refcounts) refcounts[i + k] = 0;
         clr_bit(i + k);
         used_pages--;
     }
@@ -208,6 +223,49 @@ void pmm_free_page(uint64_t phys)
     pmm_free_pages(phys, 1);
 }
 
+void pmm_page_inc_ref(uint64_t phys)
+{
+    uint64_t i = phys >> PAGE_SHIFT;
+    if (i < bitmap_pages && refcounts) {
+        spin_lock(&pmm_lock);
+        refcounts[i]++;
+        spin_unlock(&pmm_lock);
+    }
+}
+
+uint16_t pmm_page_get_ref(uint64_t phys)
+{
+    uint64_t i = phys >> PAGE_SHIFT;
+    uint16_t r = 1;
+    if (i < bitmap_pages && refcounts) {
+        spin_lock(&pmm_lock);
+        r = refcounts[i];
+        spin_unlock(&pmm_lock);
+    }
+    return r;
+}
+
+int pmm_page_dec_ref(uint64_t phys)
+{
+    uint64_t i = phys >> PAGE_SHIFT;
+    int rem = 0;
+    if (i < bitmap_pages && refcounts) {
+        spin_lock(&pmm_lock);
+        if (refcounts[i] > 1) {
+            refcounts[i]--;
+            rem = refcounts[i];
+        } else {
+            refcounts[i] = 0;
+            clr_bit(i);
+            used_pages--;
+            if (i < search_hint) search_hint = i;
+            rem = 0;
+        }
+        spin_unlock(&pmm_lock);
+    }
+    return rem;
+}
+
 uint64_t pmm_total_pages(void)     { return total_pages; }
 uint64_t pmm_used_pages(void)      { return used_pages; }
 uint64_t pmm_highest_address(void) { return highest_addr; }
@@ -216,7 +274,12 @@ uint64_t pmm_highest_address(void) { return highest_addr; }
  * is accessed through it rather than the identity map. */
 void pmm_relocate_to_hhdm(void)
 {
-    if (bitmap_is_early && (void *)bitmap != P2V(bitmap_phys_addr))
+    if (bitmap_is_early && (void *)bitmap != P2V(bitmap_phys_addr)) {
         bitmap = P2V(bitmap_phys_addr);
+        if (refcounts) {
+            uint64_t bitmap_bytes = PAGE_ALIGN_UP((bitmap_pages + 7) / 8);
+            refcounts = (uint16_t *)P2V(bitmap_phys_addr + bitmap_bytes);
+        }
+    }
     bitmap_is_early = 0;
 }

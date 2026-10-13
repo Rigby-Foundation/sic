@@ -27,6 +27,7 @@
 #define D_PXN       (1UL << 53)
 #define D_UXN       (1UL << 54)
 #define D_SW_DEV    (1UL << 55)     /* software: a device page, never freed */
+#define D_SW_COW    (1UL << 56)     /* software: copy-on-write page */
 #define D_ADDR      0x0000fffffffff000UL
 
 extern uint64_t boot_l0[];          /* head.S: the rough first kernel table (TTBR1) */
@@ -57,11 +58,12 @@ static uint64_t page_desc(uint64_t phys, uint64_t flags)
     if (flags & PTE_PCD) d |= D_ATTR(1);                                 /* device nGnRnE */
     else if (flags & PTE_PWT) d |= D_ATTR(3) | D_SH_INNER;               /* normal non-cacheable: frame buffers */
     else d |= D_ATTR(0) | D_SH_INNER;                                    /* normal write-back */
-    if (!(flags & PTE_WRITE)) d |= D_AP_RO;
+    if (!(flags & PTE_WRITE) || (flags & PTE_COW)) d |= D_AP_RO;
     if (flags & PTE_USER) d |= D_AP_USER | D_NG | D_PXN;                 /* the kernel never executes user pages */
     else d |= D_UXN;
     if (flags & PTE_NX) d |= D_UXN | D_PXN;
     if (flags & PTE_DEV) d |= D_SW_DEV;
+    if (flags & PTE_COW) d |= D_SW_COW;
     return d;
 }
 
@@ -73,6 +75,7 @@ static uint64_t desc_flags(uint64_t d)
     if (d & D_AP_USER) f |= PTE_USER;
     if (d & D_UXN) f |= PTE_NX;
     if (d & D_SW_DEV) f |= PTE_DEV;
+    if (d & D_SW_COW) f |= PTE_COW;
     if ((d & D_ATTR(7)) == D_ATTR(1)) f |= PTE_PCD;
     if ((d & D_ATTR(7)) == D_ATTR(3)) f |= PTE_PWT;
     return f;
@@ -112,7 +115,10 @@ static int map_in(uint64_t l0_phys, uint64_t virt, uint64_t phys, uint64_t flags
     else if (l3[IDX(virt, 0)] & D_VALID) rc = -2;
     else l3[IDX(virt, 0)] = page_desc(phys, flags);
     spin_unlock(&vmm_lock);
-    if (rc == 0) { dsb(ishst); invlpg(virt); }
+    if (rc == 0 && (l0_phys == kernel_l0 || l0_phys == (read_sysreg(ttbr0_el1) & D_ADDR))) {
+        dsb(ishst);
+        invlpg(virt);
+    }
     return rc;
 }
 
@@ -154,8 +160,12 @@ int vmm_protect_user_page(uint64_t l0_phys, uint64_t virt, uint64_t flags)
     int rc = -1;
     if (l3 && (l3[IDX(virt, 0)] & D_VALID)) {
         uint64_t d = l3[IDX(virt, 0)];
-        uint64_t keep = desc_flags(d) & ~(PTE_WRITE | PTE_NX);
-        l3[IDX(virt, 0)] = page_desc(d & D_ADDR, keep | (flags & (PTE_WRITE | PTE_NX)));
+        uint64_t keep = desc_flags(d) & ~(PTE_WRITE | PTE_NX | PTE_COW);
+        if (d & D_SW_COW) {
+            if (flags & PTE_WRITE)
+                flags = (flags & ~PTE_WRITE) | PTE_COW;
+        }
+        l3[IDX(virt, 0)] = page_desc(d & D_ADDR, keep | (flags & (PTE_WRITE | PTE_NX | PTE_COW)));
         rc = 0;
     }
     spin_unlock(&vmm_lock);
@@ -243,6 +253,10 @@ static void free_table_recursive(uint64_t phys, int level)
 
 void vmm_destroy_address_space(uint64_t l0)
 {
+    if ((read_sysreg(ttbr0_el1) & D_ADDR) == l0) {
+        write_sysreg(ttbr0_el1, empty_l0);
+        __asm__ volatile("isb; tlbi vmalle1; dsb nsh; isb" ::: "memory");
+    }
     free_table_recursive(l0, 3);
     /* No ASIDs: a CPU may still cache this tree's translations, and the
      * next address space can get the same root page back, which a switch
@@ -263,46 +277,147 @@ void arch_icache_invalidate_all(void)
     __asm__ volatile("dsb ish; ic ialluis; dsb ish; isb" ::: "memory");
 }
 
-/* Copy every user page of `src` into a fresh address space (no COW yet). */
+/* Copy-on-Write: share every user page of `src` with `dst`.
+ * Writable pages are marked read-only with D_SW_COW in both parent and child. */
 uint64_t vmm_clone_address_space(uint64_t src)
 {
     uint64_t dst = vmm_create_address_space();
-    int code = 0;           /* executable pages copied: the frames may hold another program's code in the I-cache */
-    uint64_t *l0 = table_virt(src);
+    if (!dst) return 0;
+
+    spin_lock(&vmm_lock);
+    uint64_t *src_l0 = table_virt(src);
+    uint64_t *dst_l0 = table_virt(dst);
+
     for (int i = 0; i < ENTRIES; i++) {
-        if (!(l0[i] & D_VALID)) continue;
-        uint64_t *l1 = table_virt(l0[i] & D_ADDR);
+        if ((src_l0[i] & (D_VALID | D_TABLE)) != (D_VALID | D_TABLE)) continue;
+        uint64_t *src_l1 = table_virt(src_l0[i] & D_ADDR);
+        uint64_t dst_l1_phys = alloc_table();
+        dst_l0[i] = dst_l1_phys | D_VALID | D_TABLE;
+        uint64_t *dst_l1 = table_virt(dst_l1_phys);
+
         for (int j = 0; j < ENTRIES; j++) {
-            if (!(l1[j] & D_VALID)) continue;
-            uint64_t *l2 = table_virt(l1[j] & D_ADDR);
+            if ((src_l1[j] & (D_VALID | D_TABLE)) != (D_VALID | D_TABLE)) continue;
+            uint64_t *src_l2 = table_virt(src_l1[j] & D_ADDR);
+            uint64_t dst_l2_phys = alloc_table();
+            dst_l1[j] = dst_l2_phys | D_VALID | D_TABLE;
+            uint64_t *dst_l2 = table_virt(dst_l2_phys);
+
             for (int k = 0; k < ENTRIES; k++) {
-                if (!(l2[k] & D_VALID)) continue;
-                uint64_t *l3 = table_virt(l2[k] & D_ADDR);
+                if ((src_l2[k] & (D_VALID | D_TABLE)) != (D_VALID | D_TABLE)) continue;
+                uint64_t *src_l3 = table_virt(src_l2[k] & D_ADDR);
+                uint64_t dst_l3_phys = alloc_table();
+                dst_l2[k] = dst_l3_phys | D_VALID | D_TABLE;
+                uint64_t *dst_l3 = table_virt(dst_l3_phys);
+
                 for (int l = 0; l < ENTRIES; l++) {
-                    uint64_t e = l3[l];
+                    uint64_t e = src_l3[l];
                     if (!(e & D_VALID)) continue;
-                    uint64_t virt = ((uint64_t)i << 39) | ((uint64_t)j << 30) | ((uint64_t)k << 21) | ((uint64_t)l << 12);
-                    uint64_t flags = desc_flags(e) & (PTE_WRITE | PTE_NX | PTE_USER | PTE_DEV | PTE_PCD);
+                    uint64_t phys = e & D_ADDR;
+
                     if (e & D_SW_DEV) {
-                        if (vmm_map_user_page(dst, virt, e & D_ADDR, flags) != 0) { vmm_destroy_address_space(dst); return 0; }
+                        dst_l3[l] = e;
                         continue;
                     }
-                    uint64_t phys = pmm_alloc_page();
-                    if (!phys) { vmm_destroy_address_space(dst); return 0; }
-                    memcpy(P2V(phys), P2V(e & D_ADDR), PAGE_SIZE);
-                    if (!(e & D_UXN)) { arch_dcache_clean(P2V(phys), PAGE_SIZE); code = 1; }
-                    if (vmm_map_user_page(dst, virt, phys, flags) != 0) { pmm_free_page(phys); vmm_destroy_address_space(dst); return 0; }
+
+                    if (!(e & D_AP_RO) || (e & D_SW_COW)) {
+                        /* Writable or already COW: mark both parent and child RO + COW */
+                        src_l3[l] = (e | D_AP_RO | D_SW_COW);
+                        pmm_page_inc_ref(phys);
+                        dst_l3[l] = (e | D_AP_RO | D_SW_COW);
+                    } else {
+                        /* Plain read-only page (e.g. executable code / rodata) */
+                        pmm_page_inc_ref(phys);
+                        dst_l3[l] = e;
+                    }
                 }
             }
         }
     }
-    if (code) arch_icache_invalidate_all();
+    spin_unlock(&vmm_lock);
+
+    /* Broadcast TLBI so all CPUs executing parent drop cached writable entries */
+    __asm__ volatile("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
     return dst;
 }
 
-/* Switch the user half. No ASIDs yet: flush everything. */
+int vmm_handle_cow(pgd_t pgd, uint64_t virt)
+{
+    if (!pgd || virt < USER_BASE || virt >= USER_END)
+        return -1;
+
+    uint64_t page_virt = PAGE_ALIGN_DOWN(virt);
+
+    spin_lock(&vmm_lock);
+    uint64_t *l0 = table_virt(pgd);
+    uint64_t *l1 = next_level(l0, IDX(page_virt, 3), 0);
+    uint64_t *l2 = l1 ? next_level(l1, IDX(page_virt, 2), 0) : NULL;
+    uint64_t *l3 = l2 ? next_level(l2, IDX(page_virt, 1), 0) : NULL;
+    if (!l3) {
+        spin_unlock(&vmm_lock);
+        return -1;
+    }
+
+    size_t idx = IDX(page_virt, 0);
+    uint64_t e = l3[idx];
+    if (!(e & D_VALID)) {
+        spin_unlock(&vmm_lock);
+        return -1;
+    }
+
+    if (!(e & D_SW_COW)) {
+        int already_writable = !(e & D_AP_RO);
+        spin_unlock(&vmm_lock);
+        return already_writable ? 0 : -1;
+    }
+
+    uint64_t old_phys = e & D_ADDR;
+    uint16_t ref = pmm_page_get_ref(old_phys);
+
+    if (ref <= 1) {
+        /* Last owner: simply make the page writable and clear COW bit */
+        l3[idx] = (e & ~(D_SW_COW | D_AP_RO));
+        spin_unlock(&vmm_lock);
+        dsb(ishst);
+        invlpg(page_virt);
+        return 0;
+    }
+
+    /* Allocate private frame and copy */
+    uint64_t new_phys = pmm_alloc_page();
+    if (!new_phys) {
+        spin_unlock(&vmm_lock);
+        return -1;
+    }
+
+    memcpy(P2V(new_phys), P2V(old_phys), PAGE_SIZE);
+    if (!(e & D_UXN)) {
+        arch_dcache_clean(P2V(new_phys), PAGE_SIZE);
+        arch_icache_invalidate_all();
+    }
+
+    pmm_free_page(old_phys);
+
+    uint64_t new_entry = (e & ~D_ADDR & ~(D_SW_COW | D_AP_RO)) | new_phys;
+    l3[idx] = new_entry;
+    spin_unlock(&vmm_lock);
+
+    dsb(ishst);
+    invlpg(page_virt);
+    return 0;
+}
+
+/* Switch the user half. Local TLB invalidation; no broadcast TLB shootdowns. */
 void aarch64_mmu_activate(uint64_t l0)
 {
-    write_sysreg(ttbr0_el1, l0 == kernel_l0 ? empty_l0 : l0);
-    __asm__ volatile("isb; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+    uint64_t target = (l0 == kernel_l0 ? empty_l0 : l0);
+    uint64_t cur = read_sysreg(ttbr0_el1) & D_ADDR;
+    if (cur != target) {
+        write_sysreg(ttbr0_el1, target);
+        __asm__ volatile("isb; tlbi vmalle1; dsb nsh; isb" ::: "memory");
+    }
+}
+
+void vmm_activate(pgd_t pgd)
+{
+    aarch64_mmu_activate(pgd);
 }
