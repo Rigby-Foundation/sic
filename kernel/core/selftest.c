@@ -332,7 +332,22 @@ static void test_crypto(void)
     static const uint8_t wrapped[24] = { 0x1f, 0xa6, 0x8b, 0x0a, 0x81, 0x12, 0xb4, 0x47, 0xae, 0xf3, 0x4b, 0xd8,
                                          0xfb, 0x5a, 0x7b, 0x82, 0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5 };
     CHECK(aes_unwrap(key, 2, wrapped, o) == 0 && !memcmp(o, pt, 16), "aes key unwrap");
-    kprintf("crypto: sha1, hmac, pbkdf2, prf, aes, key unwrap ok\n");
+    /* WPA3's arithmetic: FIPS 180 "abc", RFC 4231 test 1, RFC 4493 (empty
+     * and one block), and the P-256 known-answer checks. */
+    struct sha256 s2;
+    sha256_init(&s2); sha256_update(&s2, "abc", 3); sha256_final(&s2, o);
+    CHECK(hexeq(o, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"), "sha256");
+    memset(k, 0x0b, 20);
+    hmac_sha256(k, 20, "Hi There", 8, o);
+    CHECK(hexeq(o, "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"), "hmac-sha256");
+    static const uint8_t ck[16] = { 0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c };
+    aes_cmac(ck, NULL, 0, o);
+    CHECK(hexeq(o, "bb1d6929e95937287fa37d129b756746"), "aes-cmac (empty)");
+    static const uint8_t cm[16] = { 0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a };
+    aes_cmac(ck, cm, 16, o);
+    CHECK(hexeq(o, "070a16b46b4d4144f79bdd9dd04a287c"), "aes-cmac (one block)");
+    CHECK(p256_selftest() == 0, "p-256 (secp256r1)");
+    kprintf("crypto: sha1/256, hmac, pbkdf2, prf, kdf, aes, cmac, key unwrap, p-256 ok\n");
 }
 
 int selftest_run(void)
