@@ -319,9 +319,11 @@ size_t qcom_wlan_report(char *buf, size_t len)
 /* Read: "state off|starting|ready|failed", "detail <text>", then a
  * "net <dBm> <secure> <ssid>" line per network once scanning exists.
  * Write: "on" (start the modem and the WLAN firmware), "scan",
- * "connect\t<ssid>\t<passphrase>" (open, or WPA2-Personal: the radio
- * associates and runs the 4-way handshake), "disconnect" (not written
- * yet). "scan" and "connect" wait for the radio (the copy engines). */
+ * "connect\t<ssid>\t<passphrase>" (open, WPA2-Personal, or WPA3-SAE:
+ * the radio associates, runs SAE where offered and the 4-way handshake,
+ * protects management frames when the network wants it, and reconnects if
+ * the link drops), "disconnect" (not written yet). "scan" and "connect"
+ * wait for the radio (the copy engines). */
 #include "abi/abi.h"
 
 static char note[96];                       /* the answer to the last command that did not happen */

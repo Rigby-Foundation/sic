@@ -415,7 +415,7 @@ static void send_init(void)
     wmi_send(WMI_INIT, t.b, t.n);
 }
 
-static uint32_t eeprom_rd;
+static uint32_t eeprom_rd, hw_rf_chains, hw_vht_cap, hw_vht_mcs;
 
 static void send_pdev_param(uint32_t param, uint32_t value)
 {
@@ -535,10 +535,11 @@ static uint32_t htt_tx_n, htt_tx_compl;
 #define RXD_MSDU_END1   80          /* wcn3990: bits 10-12: L3 header pad */
 
 static uint32_t rx_alloc = HTT_RX_RING - 1;     /* the next ring slot to give back */
-static uint32_t rx_frames, rx_bad, rx_eapol, rx_ip, rx_arp, rx_other, rx_offload, rx_lost;
+static uint32_t rx_frames, rx_bad, rx_eapol, rx_ip, rx_arp, rx_other, rx_offload, rx_lost, rx_amsdu, rx_qos;
 static uint16_t rx_last_type;
 
 static void wlan_frame(const uint8_t *f, size_t n, int decrypted);
+static void deliver_llc(const uint8_t *da, const uint8_t *sa, const uint8_t *p, size_t n);
 
 static void rx_refill(uint64_t paddr)
 {
@@ -581,18 +582,53 @@ static void htt_rx_in_ord(const uint8_t *p, size_t n)
     }
 }
 
+/* Other target-to-host messages, handled past the data path: the ones that
+ * carry peer ids, security notifications, fragmented frames and the IPA
+ * "offload" delivery. Counted (and, for offload delivery, the inner MSDUs
+ * are fed up like ordinary frames); the rest of the protocol is noted. */
+enum { HTT_T2H_PEER_MAP = 3, HTT_T2H_PEER_UNMAP = 4, HTT_T2H_SEC_IND = 11, HTT_T2H_RX_FRAG_IND = 10,
+       HTT_T2H_RX_OFFLOAD_DELIVER_IND = 0x11 };
+static uint32_t htt_peer_evts, htt_sec_ind_n, htt_frag_n, htt_offload_n, htt_misc;
+
+/* RX_OFFLOAD_DELIVER_IND: a count, then per MSDU a short header (msdu_len,
+ * peer_id, vdev_id, tid, fw_desc) and the 802.3 frame (DA, SA, length). */
+static void htt_rx_offload(const uint8_t *p, size_t n)
+{
+    unsigned count = n >= 2 ? (unsigned)(p[1] | (n >= 3 ? p[2] << 8 : 0)) : 0;
+    const uint8_t *d = p + 4;
+    for (unsigned i = 0; i < count && d + 7 <= p + n; i++) {
+        unsigned len = (unsigned)(d[0] | d[1] << 8);
+        const uint8_t *e = d + 7;                           /* the Ethernet frame: DA(6) SA(6) len(2) then LLC */
+        if (e + len > p + n || len < 14) break;
+        rx_offload++;
+        deliver_llc(e, e + 6, e + 14, len - 14);
+        d = e + ((len + 3) & ~3u);
+    }
+}
+
 static void htt_rx_msg(const uint8_t *p, size_t n)
 {
     if (!n) return;
     htt_rx_msgs++;
     if (p[0] < 32) htt_types |= 1u << p[0];
-    if (p[0] == HTT_T2H_VERSION_CONF && n >= 3 && htt_stage == 1) {
-        htt_minor = p[1]; htt_major = p[2];
-        htt_configure();
-    } else if (p[0] == HTT_T2H_RX_IN_ORD_PADDR_IND && htt_stage == 2) {
-        htt_rx_in_ord(p, n);
-    } else if (p[0] == HTT_T2H_TX_COMPL_IND && n >= 3) {
-        htt_tx_compl += p[2];                               /* num_msdus done */
+    switch (p[0]) {
+    case HTT_T2H_VERSION_CONF:
+        if (n >= 3 && htt_stage == 1) { htt_minor = p[1]; htt_major = p[2]; htt_configure(); }
+        break;
+    case HTT_T2H_RX_IN_ORD_PADDR_IND:
+        if (htt_stage == 2) htt_rx_in_ord(p, n);
+        break;
+    case HTT_T2H_TX_COMPL_IND:
+        if (n >= 3) htt_tx_compl += p[2];                   /* num_msdus done */
+        break;
+    case HTT_T2H_RX_OFFLOAD_DELIVER_IND:
+        htt_offload_n++;
+        if (htt_stage == 2) htt_rx_offload(p, n);
+        break;
+    case HTT_T2H_PEER_MAP: case HTT_T2H_PEER_UNMAP: htt_peer_evts++; break;
+    case HTT_T2H_SEC_IND: htt_sec_ind_n++; break;
+    case HTT_T2H_RX_FRAG_IND: htt_frag_n++; break;          /* fragmented frames: not reassembled */
+    default: htt_misc++; break;
     }
 }
 
@@ -663,6 +699,10 @@ static struct bss {
     uint8_t bssid[6]; char ssid[33]; int rssi, freq, secure; uint64_t seen;
     uint16_t cap, bcn_int; uint8_t dtim, nrates, rates[16];
     uint8_t group[4]; uint8_t psk, ccmp, mfp_req;
+    uint8_t akm_psk256, akm_sae, mfp_cap;       /* the RSN's AKMs and PMF bits */
+    uint8_t has_ht; uint16_t ht_cap; uint8_t ampdu_param; uint8_t ht_mcs1;
+    uint8_t has_vht, vht_width, vht_cf1, vht_cf2;
+    uint32_t vht_cap; uint16_t vht_rx_mcs;
 } bsses[MAX_BSS];
 static int nbss;
 static int vdev_up, scanning, scans;
@@ -675,6 +715,40 @@ static const uint16_t chans_5g[] = { 5180, 5200, 5220, 5240, 5260, 5280, 5300, 5
                                      5600, 5620, 5640, 5660, 5680, 5700, 5720, 5745, 5765, 5785, 5805, 5825 };
 #define N2G (sizeof chans_2g / sizeof chans_2g[0])
 #define N5G (sizeof chans_5g / sizeof chans_5g[0])
+static int chan_to_freq(int chan)
+{
+    if (chan >= 1 && chan <= 13) return 2407 + 5 * chan;
+    if (chan == 14) return 2484;
+    if (chan >= 36 && chan <= 177) return 5000 + 5 * chan;
+    if (chan >= 2400) return chan;
+    return chan;
+}
+
+static int is2g(int freq) { return freq < 3000; }
+
+static int vht80_center(int freq)
+{
+    if (freq >= 5180 && freq <= 5240) return 5210;
+    if (freq >= 5260 && freq <= 5320) return 5290;
+    if (freq >= 5500 && freq <= 5560) return 5530;
+    if (freq >= 5580 && freq <= 5640) return 5610;
+    if (freq >= 5660 && freq <= 5720) return 5690;
+    if (freq >= 5745 && freq <= 5805) return 5775;
+    return freq;
+}
+
+static int bss_score(const struct bss *b)
+{
+    int score = b->rssi;
+    /* Strongly prefer 5 GHz when available and usable (signal >= -80 dBm).
+     * Dual-band APs have higher RSSI on 2.4 GHz due to physics, but 5 GHz VHT80
+     * provides vastly superior bandwidth (up to 867 Mbps vs 65 Mbps). */
+    if (!is2g(b->freq) && b->rssi >= -80) {
+        score += 30;
+        if (b->has_vht) score += 10;
+    }
+    return score;
+}
 
 static void send_chan_list(void)
 {
@@ -693,6 +767,7 @@ static void send_chan_list(void)
         put32(ch + 4, 1, f);                                /* band centre */
         put32(ch + 4, 2, 0);
         uint32_t flags = (is2 ? 5u : 4u) | 1u << 11;        /* 11ng/na HT20, HT allowed */
+        if (!is2) flags |= 1u << 12;                        /* VHT allowed */
         if (!is2 || f > 2462) flags |= 1u << 7;             /* passive where we may not be allowed to probe */
         if (!is2 && f >= 5260 && f <= 5720) flags |= 1u << 10;   /* DFS */
         put32(ch + 4, 3, flags);
@@ -745,7 +820,8 @@ static void send_start_scan(void)
     scanning = 1; scans++;
 }
 
-/* The RSN element: version, group cipher, pairwise ciphers, AKMs, capabilities. */
+/* The RSN element: version, group cipher, pairwise ciphers, AKMs (2 PSK,
+ * 6 PSK-SHA256, 8 SAE), capabilities (MFP capable/required). */
 static void rsn_parse(struct bss *b, const uint8_t *v, size_t l)
 {
     static const uint8_t oui[3] = { 0x00, 0x0f, 0xac };
@@ -758,8 +834,13 @@ static void rsn_parse(struct bss *b, const uint8_t *v, size_t l)
     if (o + 2 > l) return;
     unsigned na = (unsigned)(v[o] | v[o + 1] << 8);
     o += 2;
-    for (unsigned i = 0; i < na && o + 4 <= l; i++, o += 4) if (!memcmp(v + o, oui, 3) && v[o + 3] == 2) b->psk = 1;
-    if (o + 2 <= l && (v[o] & 0x40)) b->mfp_req = 1;
+    for (unsigned i = 0; i < na && o + 4 <= l; i++, o += 4)
+        if (!memcmp(v + o, oui, 3)) {
+            if (v[o + 3] == 2) b->psk = 1;
+            else if (v[o + 3] == 6) b->akm_psk256 = 1;
+            else if (v[o + 3] == 8) b->akm_sae = 1;
+        }
+    if (o + 2 <= l) { uint16_t caps = (uint16_t)(v[o] | v[o + 1] << 8); if (caps & 0x80) b->mfp_cap = 1; if (caps & 0x40) b->mfp_req = 1; }
 }
 
 static void join_saw(struct bss *b);
@@ -783,15 +864,33 @@ static void saw_frame(const uint8_t *f, size_t n, int rssi, int freq)
         if (o + 2 + l > n) break;
         const uint8_t *v = f + o + 2;
         if (id == 0 && l <= 32) { memcpy(ssid, v, l); ssid[l] = 0; }
-        else if (id == 3 && l >= 1) ds = v[0];
+        else if ((id == 3 || id == 61) && l >= 1) ds = v[0]; /* DS param or HT op: channel */
         else if ((id == 1 || id == 50) && l)                /* supported, extended rates */
             for (int i = 0; i < l && nb.nrates < sizeof nb.rates; i++) nb.rates[nb.nrates++] = v[i];
         else if (id == 5 && l >= 2 && v[1]) nb.dtim = v[1];
+        else if (id == 45 && l >= 2) {                       /* HT capabilities */
+            nb.has_ht = 1;
+            nb.ht_cap = (uint16_t)(v[0] | v[1] << 8);
+            if (l >= 3) nb.ampdu_param = v[2];
+            if (l >= 5) nb.ht_mcs1 = v[4];                  /* MCS 8..15 bitmask */
+        }
+        else if (id == 191 && l >= 12) {                     /* VHT capabilities */
+            nb.has_vht = 1;
+            nb.vht_cap = (uint32_t)v[0] | ((uint32_t)v[1] << 8) | ((uint32_t)v[2] << 16) | ((uint32_t)v[3] << 24);
+            nb.vht_rx_mcs = (uint16_t)((uint32_t)v[4] | ((uint32_t)v[5] << 8));
+        }
+        else if (id == 192 && l >= 3) {                      /* VHT operation */
+            nb.has_vht = 1;
+            nb.vht_width = v[0];
+            nb.vht_cf1 = v[1];
+            nb.vht_cf2 = v[2];
+        }
         else if (id == 48) { secure = 2; rsn_parse(&nb, v, l); }     /* RSN: WPA2/WPA3 */
         else if (id == 221 && l >= 4 && v[0] == 0 && v[1] == 0x50 && v[2] == 0xf2 && v[3] == 1 && secure < 2) secure = 1;
         o += 2 + (size_t)l;
     }
-    if (ds) freq = ds == 14 ? 2484 : ds < 14 ? 2407 + 5 * ds : 5000 + 5 * ds;
+    if (ds) freq = chan_to_freq(ds);
+    else if (freq < 1000) freq = chan_to_freq(freq);
     for (size_t i = 0; ssid[i]; i++) if ((unsigned char)ssid[i] < 32) ssid[i] = '?';
     struct bss *b = NULL;
     for (int i = 0; i < nbss; i++) if (!memcmp(bsses[i].bssid, bssid, 6)) b = &bsses[i];
@@ -813,31 +912,43 @@ static void saw_frame(const uint8_t *f, size_t n, int rssi, int freq)
  * association id. Legacy rates only for now (11a/11g, no HT). A network
  * with RSN goes on to the 4-way handshake; an open one is authorized. */
 
-enum { WMI_VDEV_START = 0x5003, WMI_VDEV_UP = 0x5005, WMI_VDEV_INSTALL_KEY = 0x5009, WMI_PEER_CREATE = 0x6001, WMI_PEER_SET_PARAM = 0x6004,
+enum { WMI_VDEV_START = 0x5003, WMI_VDEV_UP = 0x5005, WMI_VDEV_STOP = 0x5006, WMI_VDEV_DOWN = 0x5007, WMI_VDEV_INSTALL_KEY = 0x5009,
+       WMI_PEER_CREATE = 0x6001, WMI_PEER_DELETE = 0x6002, WMI_PEER_SET_PARAM = 0x6004,
        WMI_PEER_ASSOC = 0x6005, WMI_MGMT_TX_SEND = 0x7008, WMI_STA_POWERSAVE_MODE = 0x9001,
        EV_VDEV_START_RESP = 0x5001, EV_PEER_KICKOUT = 0x6001, EV_MGMT_TX_DONE = 0x7006, EV_MGMT_TX_BUNDLE = 0x7007 };
-enum { TAG_VDEV_START = 0x58, TAG_VDEV_UP = 0x5c, TAG_VDEV_INSTALL_KEY = 0x60, TAG_PEER_CREATE = 0x61, TAG_PEER_SET_PARAM = 0x64,
+enum { TAG_VDEV_START = 0x58, TAG_VDEV_UP = 0x5c, TAG_VDEV_STOP = 0x5d, TAG_VDEV_DOWN = 0x5e, TAG_VDEV_INSTALL_KEY = 0x60,
+       TAG_PEER_CREATE = 0x61, TAG_PEER_DELETE = 0x62, TAG_PEER_SET_PARAM = 0x64,
        TAG_PEER_ASSOC = 0x65, TAG_VHT_RATE_SET = 0x66, TAG_STA_PS_MODE = 0x6c, TAG_MGMT_TX = 0x1a6, TAG_VDEV_START_RESP = 0x28 };
-enum { WMI_CIPHER_AES_CCM = 4, WMI_KEY_PAIRWISE = 0, WMI_KEY_GROUP = 1 };
-enum { J_IDLE, J_FIND, J_START, J_AUTH, J_ASSOC, J_KEYS, J_UP, J_FAILED };
-static const char *const join_names[] = { "not connected", "looking for the network", "tuning to its channel", "authenticating",
-    "associating", "the 4-way handshake", "connected", "failed" };
+enum { WMI_CIPHER_AES_CCM = 4, WMI_CIPHER_AES_CMAC = 7, WMI_KEY_PAIRWISE = 0, WMI_KEY_GROUP = 1 };
+enum { PEER_QOS = 0x2, PEER_NEED_PTK_4_WAY = 0x4, PEER_NEED_GTK_2_WAY = 0x10,
+       PEER_HT = 0x1000, PEER_STBC = 0x8000, PEER_LDPC = 0x10000, PEER_PMF = 0x08000000 };
+enum { J_IDLE, J_FIND, J_START, J_SAE_COMMIT, J_SAE_CONFIRM, J_AUTH, J_ASSOC, J_KEYS, J_UP, J_FAILED };
+static const char *const join_names[] = { "not connected", "looking for the network", "tuning to its channel", "the SAE commit",
+    "the SAE confirm", "authenticating", "associating", "the 4-way handshake", "connected", "failed" };
 
 static int jstate;
 static char jssid[33], jpass[64], jwhy[96];
 static struct bss jb;                       /* the network being joined */
 static uint16_t jaid, jcap, mgmt_seq;
 static uint64_t jsent;
-static int jtries;
+static int jtries, jakm, jmfp;              /* the chosen AKM (2, 6, 8) and whether to protect management frames */
 static uint32_t mgmt_sent, mgmt_done;
+static int jauto, reconn_tries;             /* reconnect when an established link is lost */
+static uint64_t reconn_at;
 
-/* WPA2-Personal's 4-way handshake: the PMK from the passphrase, the PTK
- * from the nonces, the GTK the access point sends in message 3. */
+/* The 4-way handshake: the PMK (the passphrase, or SAE), the PTK from the
+ * nonces, the GTK (and, with PMF, the IGTK) the access point sends. */
 static uint8_t pmk[32], ptk[48];            /* PTK: KCK 0..15, KEK 16..31, TK 32..47 */
-static uint8_t anonce[32], snonce[32], replay[8];
-static uint8_t gtk[32], gtk_rsc[8];
-static int gtk_len, gtk_id, hs;             /* hs: 0 none, 1 message 2 sent, 2 keys in */
-static uint32_t eapol_rx_n, eapol_tx_n;
+static uint8_t anonce[32], snonce[32], replay[8], rx_replay[8];
+static uint8_t gtk[32], gtk_rsc[8], igtk[16];
+static int gtk_len, gtk_id, igtk_id, hs;    /* hs: 0 none, 1 message 2 sent, 2 keys in */
+static uint32_t eapol_rx_n, eapol_tx_n, eapol_replays, group_rekeys;
+
+/* SAE (WPA3-Personal): the password element, our and the peer's commit, the
+ * KCK and the PMK the dragonfly exchange yields. */
+static uint8_t sae_pwe[64], sae_rand[32], sae_mask[32], sae_scalar[32], sae_element[64];
+static uint8_t sae_peer_scalar[32], sae_peer_element[64], sae_kck[32], sae_token[256];
+static int sae_token_len, sae_confirmed;
 
 #define MGMT_BUFS 4
 static uint8_t *mgmt_buf[MGMT_BUFS];
@@ -854,8 +965,6 @@ static void join_fail(const char *fmt, unsigned a)
     kprintf("ath: join: %s: %s\n", join_names[jstate], jwhy);
     jstate = J_FAILED;
 }
-
-static int is2g(int freq) { return freq < 3000; }
 
 static void put_mac(void *p, const uint8_t *m) { memset(p, 0, 8); memcpy(p, m, 6); }
 
@@ -906,11 +1015,28 @@ static void send_vdev_start(void)
     put32(c, 3, jb.dtim);
     uint32_t *ch = tlv_put(&t, TAG_CHANNEL, 24);
     put32(ch, 0, (uint32_t)jb.freq);
-    put32(ch, 1, (uint32_t)jb.freq);
-    put32(ch, 3, is2g(jb.freq) ? 1u /* MODE_11G */ : 0u /* MODE_11A */);
+    int use_vht = !is2g(jb.freq) && jb.has_vht;
+    uint32_t cf1 = (uint32_t)jb.freq;
+    if (use_vht) {
+        cf1 = (uint32_t)(jb.vht_cf1 ? 5000 + 5 * (int)jb.vht_cf1 : vht80_center(jb.freq));
+    }
+    put32(ch, 1, cf1);
+    put32(ch, 2, 0);
+    uint32_t mode;
+    if (use_vht) {
+        mode = 10u /* MODE_11AC_VHT80 */ | (1u << 11) /* ALLOW_HT */ | (1u << 12) /* ALLOW_VHT */;
+    } else if (is2g(jb.freq)) {
+        mode = jb.has_ht ? 5u /* MODE_11NG_HT20 */ : 1u /* MODE_11G */;
+        if (jb.has_ht) mode |= 1u << 11;
+    } else {
+        mode = jb.has_ht ? 4u /* MODE_11NA_HT20 */ : 0u /* MODE_11A */;
+        if (jb.has_ht) mode |= 1u << 11;
+    }
+    put32(ch, 3, mode);
     put32(ch, 4, 0 | 40u << 8 | 40u << 16);
     put32(ch, 5, 0 | 40u << 8);
     tlv_put(&t, TAG_ARRAY_STRUCT, 0);                       /* no NoA descriptors */
+    kprintf("ath: vdev_start: freq %u cf1 %u mode %u\n", (unsigned)jb.freq, (unsigned)cf1, (unsigned)mode);
     wmi_send(WMI_VDEV_START, t.b, t.n);
 }
 
@@ -936,6 +1062,32 @@ static void send_peer_param(uint32_t param, uint32_t value)
     wmi_send(WMI_PEER_SET_PARAM, t.b, t.n);
 }
 
+/* Tearing the connection down (for a reconnect): the vdev down, the access
+ * point's peer deleted, the vdev stopped, so a fresh VDEV_START can run. */
+static void send_vdev_down(void)
+{
+    static struct tb t;
+    t.n = 0;
+    tlv_put(&t, TAG_VDEV_DOWN, 4);                          /* vdev 0 */
+    wmi_send(WMI_VDEV_DOWN, t.b, t.n);
+}
+static void send_vdev_stop(void)
+{
+    static struct tb t;
+    t.n = 0;
+    tlv_put(&t, TAG_VDEV_STOP, 4);
+    wmi_send(WMI_VDEV_STOP, t.b, t.n);
+}
+static void send_peer_delete(void)
+{
+    static struct tb t;
+    t.n = 0;
+    uint32_t *c = tlv_put(&t, TAG_PEER_DELETE, 12);
+    put32(c, 0, 0);
+    put_mac(c + 1, jb.bssid);
+    wmi_send(WMI_PEER_DELETE, t.b, t.n);
+}
+
 static void send_auth(void)
 {
     uint8_t f[30];
@@ -946,9 +1098,33 @@ static void send_auth(void)
     jsent = timer_ms();
 }
 
+/* The station's RSN element: the group cipher the network named, CCMP for
+ * the pair, the chosen AKM, and (when protecting management frames) the MFP
+ * capable bit, a zero PMKID list and the BIP group-management cipher. Used
+ * both in the association request and as the key data of handshake message 2. */
+static size_t build_rsn_ie(uint8_t *p)
+{
+    size_t n = 0;
+    p[n++] = 48; size_t lp = n++;                           /* element id, length (filled below) */
+    p[n++] = 1; p[n++] = 0;                                 /* version 1 */
+    memcpy(p + n, jb.group, 4); n += 4;                     /* group data cipher */
+    p[n++] = 1; p[n++] = 0;                                 /* one pairwise cipher: CCMP */
+    memcpy(p + n, "\x00\x0f\xac\x04", 4); n += 4;
+    p[n++] = 1; p[n++] = 0;                                 /* one AKM */
+    memcpy(p + n, "\x00\x0f\xac", 3); p[n + 3] = (uint8_t)jakm; n += 4;
+    uint16_t caps = jmfp ? 0x0080 : 0;                      /* MFP capable */
+    p[n++] = (uint8_t)caps; p[n++] = (uint8_t)(caps >> 8);
+    if (jmfp) {                                             /* PMKID count 0, then BIP-CMAC-128 */
+        p[n++] = 0; p[n++] = 0;
+        memcpy(p + n, "\x00\x0f\xac\x06", 4); n += 4;
+    }
+    p[lp] = (uint8_t)(n - 2);
+    return n;
+}
+
 static void send_assoc(void)
 {
-    uint8_t f[160];
+    uint8_t f[384];
     size_t n = mgmt_hdr(f, 0x00);
     uint16_t cap = 0x0001 | 0x0020;                         /* ESS, short preamble */
     if (is2g(jb.freq) && (jb.cap & 0x0400)) cap |= 0x0400; /* short slot time */
@@ -959,17 +1135,50 @@ static void send_assoc(void)
     uint8_t r1 = jb.nrates < 8 ? jb.nrates : 8;
     f[n++] = 1; f[n++] = r1; memcpy(f + n, jb.rates, r1); n += r1;
     if (jb.nrates > 8) { f[n++] = 50; f[n++] = (uint8_t)(jb.nrates - 8); memcpy(f + n, jb.rates + 8, jb.nrates - 8u); n += jb.nrates - 8u; }
-    if (jb.secure == 2) {                                   /* RSN: its group cipher, CCMP, PSK */
-        static const uint8_t rsn[] = { 48, 20, 1, 0, 0, 0, 0, 0, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0 };
-        memcpy(f + n, rsn, sizeof rsn);
-        memcpy(f + n + 4, jb.group, 4);
-        n += sizeof rsn;
+    if (jb.secure == 2) n += build_rsn_ie(f + n);
+    int use_vht = !is2g(jb.freq) && jb.has_vht;
+    if (jb.has_ht) {
+        /* WMM Information Element: vendor 221, length 7, OUI 00:50:f2:02, subtype 0 (WME info), ver 1, qos 0 */
+        static const uint8_t wmm_ie[9] = { 221, 7, 0x00, 0x50, 0xf2, 0x02, 0x00, 0x01, 0x00 };
+        memcpy(f + n, wmm_ie, sizeof wmm_ie); n += sizeof wmm_ie;
+        /* HT Capabilities Element: tag 45, length 26 */
+        f[n++] = 45; f[n++] = 26;
+        uint16_t htcap = 0x002c;                            /* SMPS disabled (0xc) | SGI20 (0x20) */
+        if (use_vht || (jb.ht_cap & 0x0002)) htcap |= 0x0062; /* 40MHz support (0x02) | SGI40 (0x40) */
+        if (jb.ht_cap & 0x1000) htcap |= 0x1000;            /* DSSS/CCK in 40MHz */
+        if (jb.ht_cap & 0x0001) htcap |= 0x0001;            /* LDPC if AP supports it */
+        if (jb.ht_cap & 0x0300) htcap |= 0x0100;            /* 1-stream Rx STBC */
+        f[n++] = (uint8_t)htcap; f[n++] = (uint8_t)(htcap >> 8);
+        f[n++] = 0x1b;                                      /* AMPDU: max 64K, 8us density */
+        f[n++] = 0xff;                                      /* MCS 0..7 supported */
+        f[n++] = (hw_rf_chains >= 2 && jb.ht_mcs1) ? 0xff : 0x00; /* MCS 8..15 only if hardware has 2+ chains */
+        memset(f + n, 0, 21); n += 21;                      /* MCS 16..76 zero, extended caps, BF, ASEL */
+    }
+    if (use_vht) {
+        /* VHT Capabilities Element: tag 191, length 12 */
+        f[n++] = 191; f[n++] = 12;
+        uint32_t vcap = (hw_vht_cap ? hw_vht_cap : 0x03800000u) | 0x0030u; /* Short GI 80 (0x20) | Rx LDPC (0x10) */
+        if (jb.vht_cap & 0x00000100u) vcap |= 0x00000100u;                  /* Rx STBC 1 stream */
+        f[n++] = (uint8_t)vcap; f[n++] = (uint8_t)(vcap >> 8);
+        f[n++] = (uint8_t)(vcap >> 16); f[n++] = (uint8_t)(vcap >> 24);
+        int nss = (hw_rf_chains >= 2 && (jb.vht_rx_mcs & (3 << 2)) != (3 << 2)) ? 2 : 1;
+        uint16_t mcs_map = nss == 2 ? 0xfffa : 0xfffe;
+        if (jb.vht_rx_mcs) {
+            uint32_t m1 = jb.vht_rx_mcs & 3;
+            uint32_t m2 = (jb.vht_rx_mcs >> 2) & 3;
+            if (m1 < 3) mcs_map = (mcs_map & ~3u) | (uint16_t)m1;
+            if (nss >= 2 && m2 < 3) mcs_map = (mcs_map & ~(3u << 2)) | (uint16_t)(m2 << 2);
+        }
+        f[n++] = (uint8_t)mcs_map; f[n++] = (uint8_t)(mcs_map >> 8);
+        f[n++] = 0; f[n++] = 0;                             /* rx_highest: 0 (governed by MCS map) */
+        f[n++] = (uint8_t)mcs_map; f[n++] = (uint8_t)(mcs_map >> 8);
+        f[n++] = 0; f[n++] = 0;                             /* tx_highest: 0 */
     }
     mgmt_tx(f, n);
     jsent = timer_ms();
 }
 
-/* The rates both have, as the firmware wants them: 500 kb/s units, CCK marked. */
+/* The rates both have, as the firmware wants them: 500 kb/s units, CCK marked, plus HT MCS. */
 static void send_peer_assoc(void)
 {
     static struct tb t;
@@ -979,11 +1188,53 @@ static void send_peer_assoc(void)
     put32(c, 2, 0);                                         /* vdev */
     put32(c, 3, 1);                                         /* a new association */
     put32(c, 4, jaid);
-    put32(c, 5, 1u /* AUTH */ | (jb.secure == 2 ? 4u /* NEED_PTK_4_WAY */ : 0));
+    uint32_t flags = 1u /* AUTH */ | (jb.secure == 2 ? PEER_NEED_PTK_4_WAY : 0u)
+                   | (jmfp ? PEER_PMF | PEER_NEED_GTK_2_WAY : 0u);
+    int use_vht = !is2g(jb.freq) && jb.has_vht;
+    if (jb.has_ht) {
+        flags |= PEER_HT | PEER_QOS;
+        if (jb.ht_cap & 0x0001) flags |= PEER_LDPC;
+        if (jb.ht_cap & 0x0380) flags |= PEER_STBC;
+    }
+    if (use_vht) {
+        flags |= 0x00002000u /* WMI_TLV_PEER_40MHZ */
+              |  0x04000000u /* WMI_TLV_PEER_80MHZ */
+              |  0x02000000u /* WMI_TLV_PEER_VHT */;
+    }
+    put32(c, 5, flags);
     put32(c, 6, jcap);
     put32(c, 7, 1);                                         /* listen interval */
-    put32(c, 12, 1);                                        /* spatial streams */
-    put32(c, 14, is2g(jb.freq) ? 1u : 0u);                  /* MODE_11G / MODE_11A */
+    int nss = (hw_rf_chains >= 2 && (use_vht ? ((jb.vht_rx_mcs & (3 << 2)) != (3 << 2)) : jb.ht_mcs1)) ? 2 : 1;
+    int num_ht = (jb.has_ht ? (nss == 2 ? 16 : 8) : 0);
+    if (jb.has_ht) {
+        uint32_t peer_ht = (uint32_t)jb.ht_cap;
+        if (use_vht) peer_ht |= 0x0062u;                    /* 40MHz, SGI20, SGI40 */
+        put32(c, 8, peer_ht);                               /* ht_caps */
+        uint32_t max_mpdu = (1u << (13 + (jb.ampdu_param ? (jb.ampdu_param & 3) : 3))) - 1;
+        put32(c, 9, max_mpdu);                              /* max_mpdu (e.g. 65535) */
+        uint8_t d = (jb.ampdu_param >> 2) & 7;
+        put32(c, 10, d == 0 ? 0 : d <= 3 ? 1 : 1u << (d - 3)); /* mpdu_density */
+        uint32_t rc = 0x08;                                 /* WMI_RC_HT_FLAG */
+        if (use_vht) {
+            rc |= 0x02;                                     /* WMI_RC_CW40_FLAG */
+            rc |= 0x04;                                     /* WMI_RC_SGI_FLAG */
+        }
+        if (nss >= 2) rc |= 0x01;                           /* WMI_RC_DS_FLAG (Dual Stream) */
+        if (jb.ht_cap & 0x0020) rc |= 0x04;                 /* WMI_RC_SGI_FLAG */
+        if (jb.ht_cap & 0x0080) rc |= 0x20;                 /* WMI_RC_TX_STBC_FLAG */
+        if (jb.ht_cap & 0x0300) rc |= ((jb.ht_cap & 0x0300) >> 8) << 6;
+        put32(c, 11, rc);                                   /* rate_caps */
+    }
+    put32(c, 12, (uint32_t)nss);                            /* spatial streams (1 or 2) */
+    kprintf("ath: bss: ht %04x vht_cap %08x rx_mcs %04x width %d cf1 %d nss %d\n",
+            jb.ht_cap, jb.vht_cap, jb.vht_rx_mcs, jb.vht_width, jb.vht_cf1, nss);
+    if (use_vht) {
+        put32(c, 13, jb.vht_cap ? jb.vht_cap : hw_vht_cap); /* vht_caps */
+        put32(c, 14, 10u /* MODE_11AC_VHT80 */);            /* phy_mode */
+    } else {
+        put32(c, 14, is2g(jb.freq) ? (jb.has_ht ? 5u /* MODE_11NG_HT20 */ : 1u /* MODE_11G */)
+                                   : (jb.has_ht ? 4u /* MODE_11NA_HT20 */ : 0u /* MODE_11A */));
+    }
     uint8_t rates[16];
     int nr = 0;
     for (int i = 0; i < jb.nrates; i++) {
@@ -992,11 +1243,34 @@ static void send_peer_assoc(void)
         rates[nr++] = (uint8_t)(r | (r == 2 || r == 4 || r == 11 || r == 22 ? 0x80 : 0));
     }
     put32(c, 17, (uint32_t)nr);
-    put32(c, 18, 0);                                        /* no HT rates */
+    put32(c, 18, (uint32_t)num_ht);                         /* MCS 0..7 or MCS 0..15 */
     uint8_t *lr = tlv_put(&t, TAG_ARRAY_BYTE, ((size_t)nr + 3) & ~(size_t)3);
     memcpy(lr, rates, (size_t)nr);
-    tlv_put(&t, TAG_ARRAY_BYTE, 0);
-    tlv_put(&t, TAG_VHT_RATE_SET, 16);
+    if (num_ht) {
+        static const uint8_t ht_rates[16] = {
+            0, 1, 2, 3, 4, 5, 6, 7,
+            8, 9, 10, 11, 12, 13, 14, 15
+        };
+        uint8_t *hr = tlv_put(&t, TAG_ARRAY_BYTE, (size_t)num_ht);
+        memcpy(hr, ht_rates, (size_t)num_ht);
+    } else {
+        tlv_put(&t, TAG_ARRAY_BYTE, 0);
+    }
+    uint32_t *vht = tlv_put(&t, TAG_VHT_RATE_SET, 16);
+    if (use_vht) {
+        uint32_t mcs_map = nss >= 2 ? 0xfffa : 0xfffe;
+        if (jb.vht_rx_mcs) {
+            uint32_t m1 = jb.vht_rx_mcs & 3;
+            uint32_t m2 = (jb.vht_rx_mcs >> 2) & 3;
+            if (m1 < 3) mcs_map = (mcs_map & ~3u) | m1;
+            if (nss >= 2 && m2 < 3) mcs_map = (mcs_map & ~(3u << 2)) | (m2 << 2);
+        }
+        uint32_t max_rate = nss >= 2 ? 867 : 433;
+        put32(vht, 0, max_rate);  /* rx_max_rate */
+        put32(vht, 1, mcs_map);   /* rx_mcs_set */
+        put32(vht, 2, max_rate);  /* tx_max_rate */
+        put32(vht, 3, mcs_map);   /* tx_mcs_set */
+    }
     wmi_send(WMI_PEER_ASSOC, t.b, t.n);
 }
 
@@ -1034,8 +1308,9 @@ static void send_ps_off(void)
 #define EAP_KDL     97
 #define EAP_KDATA   99
 
-/* The pairwise key: PRF-384(PMK, "Pairwise key expansion",
- * min(AA,SA) || max(AA,SA) || min(ANonce,SNonce) || max(ANonce,SNonce)). */
+/* The pairwise key: KDF-384(PMK, "Pairwise key expansion",
+ * min(AA,SA) || max(AA,SA) || min(ANonce,SNonce) || max(ANonce,SNonce)),
+ * the KDF being the SHA-1 PRF for AKM 2 and the SHA-256 KDF for 6 and 8. */
 static void derive_ptk(void)
 {
     uint8_t data[76];
@@ -1045,22 +1320,23 @@ static void derive_ptk(void)
     int nc = memcmp(anonce, snonce, 32);
     memcpy(data + 12, nc < 0 ? anonce : snonce, 32);
     memcpy(data + 44, nc < 0 ? snonce : anonce, 32);
-    prf_sha1(pmk, 32, "Pairwise key expansion", data, sizeof data, ptk, sizeof ptk);
+    if (jakm == 2) prf_sha1(pmk, 32, "Pairwise key expansion", data, sizeof data, ptk, sizeof ptk);
+    else kdf_sha256(pmk, 32, "Pairwise key expansion", data, sizeof data, ptk, 384);
 }
 
-/* The station's RSN element (what it did in the association), the group
- * cipher the network named: for the key data of message 2. */
-static size_t sta_rsn_ie(uint8_t *p)
+/* The EAPOL-Key descriptor version and MIC, by AKM: HMAC-SHA1-128 for AKM
+ * 2 (version 2), AES-128-CMAC for the SHA-256 AKMs (6: version 3, 8: the
+ * version field 0, "AKM defined"). The MIC key is the KCK (PTK's first 16). */
+static int kd_version(void) { return jakm == 2 ? 2 : jakm == 6 ? 3 : 0; }
+static void eapol_mic(const uint8_t *buf, size_t len, uint8_t out[16])
 {
-    static const uint8_t ie[22] = { 48, 20, 1, 0, 0, 0, 0, 0, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0 };
-    memcpy(p, ie, sizeof ie);
-    memcpy(p + 4, jb.group, 4);
-    return sizeof ie;
+    if (jakm == 2) { uint8_t h[20]; hmac_sha1(ptk, 16, buf, len, h); memcpy(out, h, 16); }
+    else aes_cmac(ptk, buf, len, out);
 }
 
 /* Build an EAPOL-Key frame inside a native-Wi-Fi data frame to the access
  * point (802.11 header to-DS, LLC/SNAP for the EAPOL ethertype), MIC last. */
-static size_t build_eapol(uint8_t *f, uint16_t keyinfo, int keylen, const uint8_t *nonce, const uint8_t *kdata, size_t kdlen)
+static size_t build_eapol(uint8_t *f, uint16_t flags, int keylen, const uint8_t *nonce, const uint8_t *kdata, size_t kdlen)
 {
     f[0] = 0x08; f[1] = 0x01; f[2] = f[3] = 0;              /* data, to-DS */
     memcpy(f + 4, jb.bssid, 6); memcpy(f + 10, mac, 6); memcpy(f + 16, jb.bssid, 6);
@@ -1068,6 +1344,7 @@ static size_t build_eapol(uint8_t *f, uint16_t keyinfo, int keylen, const uint8_
     static const uint8_t llc[8] = { 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e };
     memcpy(f + 24, llc, 8);
     uint8_t *e = f + 32;
+    uint16_t keyinfo = (uint16_t)(flags | kd_version());    /* the AKM's key descriptor version */
     size_t total = EAP_KDATA + kdlen;
     memset(e, 0, total);
     e[0] = 1; e[1] = 3;                                     /* 802.1X 2001, EAPOL-Key */
@@ -1079,33 +1356,37 @@ static size_t build_eapol(uint8_t *f, uint16_t keyinfo, int keylen, const uint8_
     if (nonce) memcpy(e + EAP_NONCE, nonce, 32);
     e[EAP_KDL] = (uint8_t)(kdlen >> 8); e[EAP_KDL + 1] = (uint8_t)kdlen;
     if (kdlen) memcpy(e + EAP_KDATA, kdata, kdlen);
-    if (keyinfo & 0x100) {                                  /* MIC bit set: fill it over the frame with it zeroed */
-        uint8_t mic[20];
-        hmac_sha1(ptk, 16, e, total, mic);                 /* KCK */
-        memcpy(e + EAP_MIC, mic, 16);
-    }
+    if (keyinfo & 0x100) eapol_mic(e, total, e + EAP_MIC);  /* MIC bit set: over the frame with it zeroed */
     return 32 + total;
 }
 
-/* The key data of message 3 (unwrapped): key descriptor elements; the one
- * that carries the group key is the GTK KDE (00-0f-ac type 1). */
-static void parse_gtk(const uint8_t *p, size_t n)
+/* The key data of a handshake message (unwrapped): key descriptor elements.
+ * The GTK rides in a GTK KDE (00-0f-ac type 1); with PMF the IGTK (the group
+ * management key) rides in an IGTK KDE (type 9: key id (2), IPN (6), key). */
+static void parse_keys(const uint8_t *p, size_t n)
 {
     for (size_t o = 0; o + 2 <= n; ) {
         uint8_t id = p[o], l = p[o + 1];
         if (o + 2 + (size_t)l > n) break;
-        if (id == 0xdd && l >= 8 && p[o + 2] == 0x00 && p[o + 3] == 0x0f && p[o + 4] == 0xac && p[o + 5] == 0x01) {
-            gtk_id = p[o + 6] & 3;
-            gtk_len = l - 6;
-            if (gtk_len > (int)sizeof gtk) gtk_len = sizeof gtk;
-            memcpy(gtk, p + o + 8, (size_t)gtk_len);
+        const uint8_t *v = p + o + 2;
+        if (id == 0xdd && l >= 6 && v[0] == 0x00 && v[1] == 0x0f && v[2] == 0xac) {
+            if (v[3] == 0x01 && l >= 8) {                   /* GTK KDE */
+                gtk_id = v[4] & 3;
+                gtk_len = l - 6;
+                if (gtk_len > (int)sizeof gtk) gtk_len = sizeof gtk;
+                memcpy(gtk, v + 6, (size_t)gtk_len);
+            } else if (v[3] == 0x09 && l >= 4 + 2 + 6 + 16) {   /* IGTK KDE */
+                igtk_id = (int)(v[4] | v[5] << 8);
+                memcpy(igtk, v + 4 + 2 + 6, 16);            /* after key id and the 6-byte IPN */
+            }
         }
         o += 2 + (size_t)l;
     }
 }
 
-/* One key into the firmware (WMI_VDEV_INSTALL_KEY); the radio does CCMP. */
-static void install_key(uint32_t idx, uint32_t flags, const uint8_t *key, uint32_t klen, const uint8_t *rsc)
+/* One key into the firmware (WMI_VDEV_INSTALL_KEY); the radio does the
+ * per-packet cipher (CCMP for data, BIP-CMAC for group management). */
+static void install_key(uint32_t idx, uint32_t flags, uint32_t cipher, const uint8_t *key, uint32_t klen, const uint8_t *rsc)
 {
     static struct tb t;
     t.n = 0;
@@ -1113,91 +1394,149 @@ static void install_key(uint32_t idx, uint32_t flags, const uint8_t *key, uint32
     memcpy(c + 4, jb.bssid, 6);                             /* peer_macaddr (vdev 0 at +0) */
     put32(c + 12, 0, idx);
     put32(c + 16, 0, flags);
-    put32(c + 20, 0, WMI_CIPHER_AES_CCM);
+    put32(c + 20, 0, cipher);
     if (rsc) memcpy(c + 24, rsc, 8);                        /* key_rsc_counter */
-    put32(c + 80, 0, klen);                                 /* key_len (txmic/rxmic 0: CCMP) */
+    put32(c + 80, 0, klen);                                 /* key_len (txmic/rxmic 0) */
     uint8_t *kd = tlv_put(&t, TAG_ARRAY_BYTE, (klen + 3) & ~3u);
     memcpy(kd, key, klen);
     wmi_send(WMI_VDEV_INSTALL_KEY, t.b, t.n);
 }
 
-/* EAPOL-Key frames from the access point: messages 1 and 3 of the 4-way. */
+/* The group key (and, with PMF, the group management key) into the radio. */
+static void install_group_keys(void)
+{
+    if (gtk_len) install_key((uint32_t)gtk_id, WMI_KEY_GROUP, WMI_CIPHER_AES_CCM, gtk, (uint32_t)gtk_len, gtk_rsc);
+    if (jmfp && igtk_id) install_key((uint32_t)igtk_id, WMI_KEY_GROUP, WMI_CIPHER_AES_CMAC, igtk, 16, NULL);
+}
+
+/* A frame carrying a replay counter not newer than the last we accepted is
+ * a replay (an equal one is a retransmit, which we still answer). */
+static int replay_old(const uint8_t *r) { return memcmp(r, rx_replay, 8) < 0; }
+
+/* EAPOL-Key frames from the access point: the pairwise 4-way (messages 1
+ * and 3) while joining, and once connected the group key 2-way handshake
+ * (a group message 1) and any retransmitted message 3. */
 static void eapol_rx(const uint8_t *e, size_t n)
 {
     if (n < EAP_KDATA || e[1] != 3) return;
-    if (jstate != J_KEYS && !(jstate == J_UP && hs == 2)) return;   /* J_UP: only a retransmitted message 3 */
+    if (jstate != J_KEYS && jstate != J_UP) return;
     uint16_t ki = (uint16_t)(e[EAP_KEYINFO] << 8 | e[EAP_KEYINFO + 1]);
-    if (!(ki & 0x08)) return;                               /* pairwise key frames only */
     size_t kdl = (size_t)(e[EAP_KDL] << 8 | e[EAP_KDL + 1]);
+    int pairwise = (ki & 0x08) != 0, mic = (ki & 0x100) != 0;
     eapol_rx_n++;
 
-    if (!(ki & 0x100)) {                                    /* message 1: no MIC, carries the ANonce */
+    if (pairwise && !mic) {                                 /* message 1 of the 4-way: ANonce, no MIC */
         if (jstate != J_KEYS) return;
         memcpy(anonce, e + EAP_NONCE, 32);
         random_bytes(snonce, sizeof snonce);
         derive_ptk();
         memcpy(replay, e + EAP_REPLAY, 8);
-        uint8_t f[192], ie[22];
-        size_t fl = build_eapol(f, 0x010a, 16, snonce, ie, sta_rsn_ie(ie));   /* version 2, pairwise, MIC */
+        memcpy(rx_replay, e + EAP_REPLAY, 8);
+        uint8_t f[256], ie[40];
+        size_t fl = build_eapol(f, 0x108, 16, snonce, ie, build_rsn_ie(ie));   /* pairwise, MIC */
         if (htt_tx_data(f, fl, 0) == 0) eapol_tx_n++;
         hs = 1; jsent = timer_ms();
         return;
     }
+    if (!mic) return;                                       /* every later message carries a MIC */
+    if (replay_old(e + EAP_REPLAY)) { eapol_replays++; return; }
 
-    /* a frame with a MIC: verify it over the frame with the MIC zeroed */
+    /* verify the MIC over the frame with the MIC field zeroed */
     size_t total = 4 + (size_t)(e[2] << 8 | e[3]);
     if (total > n) total = n;
-    uint8_t copy[256], mic[20];
+    uint8_t copy[512], mic16[16];
     if (total > sizeof copy) return;
     memcpy(copy, e, total);
     memset(copy + EAP_MIC, 0, 16);
-    hmac_sha1(ptk, 16, copy, total, mic);
-    if (memcmp(mic, e + EAP_MIC, 16)) { join_fail("the handshake failed (wrong passphrase?)", 0); return; }
+    eapol_mic(copy, total, mic16);
+    if (memcmp(mic16, e + EAP_MIC, 16)) {
+        if (jstate == J_KEYS) join_fail("the handshake failed (wrong passphrase?)", 0);
+        return;
+    }
+    memcpy(rx_replay, e + EAP_REPLAY, 8);
 
-    if (ki & 0x40) {                                        /* message 3: install bit set */
-        int first = hs != 2;                                /* otherwise this is a retransmit: answer, do no more */
-        if (first && (ki & 0x1000) && kdl >= 24 && kdl % 8 == 0 && EAP_KDATA + kdl <= n) {
-            uint8_t plain[256];                             /* the key data is wrapped with the KEK (RFC 3394) */
-            int nb = (int)(kdl / 8) - 1;
-            if ((size_t)nb * 8 <= sizeof plain && aes_unwrap(ptk + 16, nb, e + EAP_KDATA, plain) == 0)
-                parse_gtk(plain, (size_t)nb * 8);
-        }
+    /* the encrypted key data, unwrapped with the KEK (NIST AES key wrap) */
+    uint8_t plain[512];
+    size_t plen = 0;
+    if ((ki & 0x1000) && kdl >= 24 && kdl % 8 == 0 && EAP_KDATA + kdl <= n) {
+        int nb = (int)(kdl / 8) - 1;
+        if ((size_t)nb * 8 <= sizeof plain && aes_unwrap(ptk + 16, nb, e + EAP_KDATA, plain) == 0) plen = (size_t)nb * 8;
+    }
+
+    if (pairwise && (ki & 0x40)) {                          /* message 3: completes the 4-way */
+        int first = hs != 2;                                /* otherwise a retransmit: re-answer only */
+        if (first && plen) { gtk_len = 0; igtk_id = 0; parse_keys(plain, plen); }
         memcpy(gtk_rsc, e + EAP_RSC, 8);
         memcpy(replay, e + EAP_REPLAY, 8);
-        uint8_t f[192];
-        size_t fl = build_eapol(f, 0x030a, 0, NULL, NULL, 0);   /* message 4: version 2, pairwise, MIC, secure */
-        if (htt_tx_data(f, fl, 0) == 0) eapol_tx_n++;          /* send it in the clear, then install the keys */
+        uint8_t f[256];
+        size_t fl = build_eapol(f, 0x308, 0, NULL, NULL, 0);   /* message 4: pairwise, MIC, secure */
+        if (htt_tx_data(f, fl, 0) == 0) eapol_tx_n++;          /* in the clear, then the keys */
         if (first) {
-            install_key(0, WMI_KEY_PAIRWISE, ptk + 32, 16, NULL);
-            if (gtk_len) install_key((uint32_t)gtk_id, WMI_KEY_GROUP, gtk, (uint32_t)gtk_len, gtk_rsc);
-            send_peer_param(3, 1);                          /* authorize: open the controlled port */
-            hs = 2; jstate = J_UP;
+            install_key(0, WMI_KEY_PAIRWISE, WMI_CIPHER_AES_CCM, ptk + 32, 16, NULL);
+            install_group_keys();
+            send_peer_param(3, 1);                          /* authorize the controlled port */
+            hs = 2; jstate = J_UP; reconn_tries = 0;
             wlan0_up();
-            kprintf("ath: join: connected to %s (WPA2)\n", jb.ssid);
+            kprintf("ath: join: connected to %s (%s)\n", jb.ssid, jakm == 8 ? "WPA3" : "WPA2");
         }
+        return;
+    }
+    if (!pairwise && hs == 2) {                             /* group key handshake: a new GTK, install and ack */
+        if (plen) { parse_keys(plain, plen); install_group_keys(); }
+        memcpy(gtk_rsc, e + EAP_RSC, 8);
+        memcpy(replay, e + EAP_REPLAY, 8);
+        uint8_t f[128];
+        size_t fl = build_eapol(f, 0x300, 0, NULL, NULL, 0);   /* group, MIC, secure */
+        if (htt_tx_data(f, fl, 0) == 0) eapol_tx_n++;
+        group_rekeys++;
     }
 }
 
 /* A received data frame (native Wi-Fi: 802.11 header, LLC/SNAP, payload).
  * Only EAPOL matters to the driver; the rest is counted for the report. */
-static void wlan_frame(const uint8_t *f, size_t n, int decrypted)
+/* One de-encapsulated MSDU (its LLC/SNAP payload) with its addresses:
+ * EAPOL goes to the handshake, IP and ARP up to wlan0, the rest counted. */
+static void deliver_llc(const uint8_t *da, const uint8_t *sa, const uint8_t *p, size_t n)
 {
-    (void)decrypted;
-    if (n < 24 || (f[0] & 0x0c) != 0x08) { rx_other++; return; }   /* data frames only */
-    size_t hdr = (f[0] & 0x80) ? 26 : 24;                  /* QoS data has two more bytes */
-    if (n < hdr + 8) { rx_bad++; return; }
-    const uint8_t *llc = f + hdr;
-    if (!(llc[0] == 0xaa && llc[1] == 0xaa && llc[2] == 0x03)) { rx_other++; return; }
-    uint16_t ether = (uint16_t)(llc[6] << 8 | llc[7]);
+    if (n < 8 || !(p[0] == 0xaa && p[1] == 0xaa && p[2] == 0x03)) { rx_other++; return; }
+    uint16_t ether = (uint16_t)(p[6] << 8 | p[7]);
     rx_last_type = ether;
-    const uint8_t *pl = f + hdr + 8;
-    size_t pn = n - hdr - 8;
+    const uint8_t *pl = p + 8;
+    size_t pn = n - 8;
     if (ether == 0x888e) { rx_eapol++; eapol_rx(pl, pn); return; }
     if (ether == 0x0806) rx_arp++;
     else if (ether == 0x0800) rx_ip++;
     else { rx_other++; return; }
-    /* from the access point (from-DS): the destination is addr1, the source addr3 */
-    wlan0_in(f + 4, (f[1] & 3) == 2 ? f + 16 : f + 10, ether, pl, pn);
+    wlan0_in(da, sa, ether, pl, pn);
+}
+
+/* A received data frame (native Wi-Fi). QoS data carries a two-byte QoS
+ * control; when its A-MSDU bit is set the body is a run of aggregated
+ * subframes (DA, SA, length, payload, padded to four bytes). */
+static void wlan_frame(const uint8_t *f, size_t n, int decrypted)
+{
+    (void)decrypted;
+    if (n < 24 || (f[0] & 0x0c) != 0x08) { rx_other++; return; }   /* data frames only */
+    int qos = (f[0] & 0x80) != 0;
+    size_t hdr = qos ? 26 : 24;
+    if (n < hdr) { rx_bad++; return; }
+    if (qos) rx_qos++;
+    const uint8_t *da = f + 4, *sa = (f[1] & 3) == 2 ? f + 16 : f + 10;   /* from-DS: DA = addr1, SA = addr3 */
+    if (qos && (f[24] & 0x80)) {                           /* A-MSDU */
+        const uint8_t *p = f + hdr;
+        size_t rem = n - hdr;
+        while (rem >= 14) {
+            size_t sl = (size_t)(p[12] << 8 | p[13]);
+            if (14 + sl > rem) break;
+            rx_amsdu++;
+            deliver_llc(p, p + 6, p + 14, sl);             /* each subframe names its own DA and SA */
+            size_t adv = (14 + sl + 3) & ~(size_t)3;
+            if (adv >= rem) break;
+            p += adv; rem -= adv;
+        }
+        return;
+    }
+    deliver_llc(da, sa, f + hdr, n - hdr);
 }
 
 /* ---- wlan0 ----------------------------------------------------------------------------------- */
@@ -1335,13 +1674,14 @@ static void wlan0_down(void)
     if (wlan0_registered) wlan0.flags &= ~IFF_RUNNING;
 }
 
-/* A network that can be joined: open, or RSN with PSK and CCMP (no
- * protected management frames required: not written yet). */
+/* A network that can be joined: open, or RSN with CCMP and a personal AKM
+ * we support (PSK, PSK-SHA256, or SAE). Protected management frames and
+ * WPA3 are fine now. */
 static const char *usable(const struct bss *b)
 {
     if (b->secure == 1) return "it is WPA (version 1) only";
-    if (b->secure == 2 && (!b->psk || !b->ccmp)) return "it does not offer WPA2-Personal with CCMP";
-    if (b->secure == 2 && b->mfp_req) return "it requires protected management frames (WPA3)";
+    if (b->secure == 2 && !b->ccmp) return "it does not offer CCMP";
+    if (b->secure == 2 && !(b->psk || b->akm_psk256 || b->akm_sae)) return "it offers no personal AKM we support";
     if (!b->nrates) return "it named no rates";
     return NULL;
 }
@@ -1355,7 +1695,7 @@ static int join_pick(void)
         if (strcmp(bsses[i].ssid, jssid)) continue;
         const char *u = usable(&bsses[i]);
         if (u) { why_not = u; continue; }
-        if (best < 0 || bsses[i].rssi > bsses[best].rssi) best = i;
+        if (best < 0 || bss_score(&bsses[i]) > bss_score(&bsses[best])) best = i;
     }
     if (best < 0) {
         if (why_not) {
@@ -1366,13 +1706,24 @@ static int join_pick(void)
         return -1;
     }
     jb = bsses[best];
-    if (jb.secure == 2 && !jpass[0]) { join_fail("the network needs a passphrase", 0); return -1; }
-    if (jb.secure == 2) {                                   /* the PMK now, so the handshake only runs the fast arithmetic */
-        pbkdf2_sha1(jpass, (const uint8_t *)jb.ssid, strlen(jb.ssid), 4096, pmk, 32);
-        hs = 0; gtk_len = 0;
+    hs = 0; gtk_len = 0; igtk_id = 0; memset(rx_replay, 0, 8);
+    if (jb.secure == 2) {
+        if (!jpass[0]) { join_fail("the network needs a passphrase", 0); return -1; }
+        jakm = jb.akm_sae ? 8 : jb.psk ? 2 : 6;             /* prefer WPA3 (SAE), then WPA2-PSK, then PSK-SHA256 */
+        jmfp = jakm == 8 || jb.mfp_req;                     /* SAE requires PMF; honour a required bit otherwise */
+        if (jakm != 8) pbkdf2_sha1(jpass, (const uint8_t *)jb.ssid, strlen(jb.ssid), 4096, pmk, 32);
+    } else { jakm = 0; jmfp = 0; }
+    const char *phy = "";
+    if (!is2g(jb.freq) && jb.has_vht) {
+        phy = ((hw_rf_chains ? hw_rf_chains : 2) >= 2 && (jb.vht_rx_mcs & (3 << 2)) != (3 << 2))
+              ? ", 802.11ac VHT80 2x2 MIMO" : ", 802.11ac VHT80";
+    } else if (jb.has_ht) {
+        phy = (jb.ht_mcs1 ? ", 802.11n 2x2 MIMO" : ", 802.11n");
     }
-    kprintf("ath: join: %s at %02x:%02x:%02x:%02x:%02x:%02x, %d MHz, %d dBm%s\n", jb.ssid, jb.bssid[0], jb.bssid[1], jb.bssid[2],
-            jb.bssid[3], jb.bssid[4], jb.bssid[5], jb.freq, jb.rssi, jb.secure ? ", WPA2" : ", open");
+    kprintf("ath: join: %s at %02x:%02x:%02x:%02x:%02x:%02x, %d MHz, %d dBm, %s%s\n", jb.ssid, jb.bssid[0], jb.bssid[1], jb.bssid[2],
+            jb.bssid[3], jb.bssid[4], jb.bssid[5], jb.freq, jb.rssi,
+            jakm == 8 ? "WPA3-SAE" : jakm == 6 ? "WPA2-SHA256" : jakm == 2 ? "WPA2-PSK" : "open",
+            phy);
     jstate = J_START;
     jsent = timer_ms();
     send_vdev_start();
@@ -1384,6 +1735,125 @@ static void join_saw(struct bss *b)
     (void)b;
 }
 
+/* ---- SAE (WPA3-Personal): the dragonfly over Authentication frames -------------------------
+ * Group 19 (NIST P-256). Our commit is a scalar and an element built from a
+ * random and a mask; the peer's commit yields a shared secret, and from it
+ * the KCK and the PMK; a confirm hash then proves each side holds the
+ * passphrase. The PMK feeds the ordinary 4-way handshake (AKM 8). */
+
+static void sae_auth_hdr(uint8_t *f, size_t *n, uint16_t seq)
+{
+    *n = mgmt_hdr(f, 0xb0);
+    f[(*n)++] = 3; f[(*n)++] = 0;                           /* algorithm: SAE */
+    f[(*n)++] = (uint8_t)seq; f[(*n)++] = (uint8_t)(seq >> 8);
+    f[(*n)++] = 0; f[(*n)++] = 0;                           /* status 0 */
+}
+
+static void send_sae_commit(void)
+{
+    uint8_t f[420];
+    size_t n;
+    sae_auth_hdr(f, &n, 1);
+    f[n++] = 19; f[n++] = 0;                                /* finite cyclic group 19 */
+    if (sae_token_len) { memcpy(f + n, sae_token, (size_t)sae_token_len); n += (size_t)sae_token_len; }
+    memcpy(f + n, sae_scalar, 32); n += 32;
+    memcpy(f + n, sae_element, 64); n += 64;
+    mgmt_tx(f, n);
+    jsent = timer_ms();
+}
+
+static void send_sae_confirm(void)
+{
+    uint8_t cf[2 + 32 + 64 + 32 + 64], m16[32], f[128];
+    size_t c = 0;
+    cf[c++] = 1; cf[c++] = 0;                               /* send-confirm counter */
+    memcpy(cf + c, sae_scalar, 32); c += 32;
+    memcpy(cf + c, sae_element, 64); c += 64;
+    memcpy(cf + c, sae_peer_scalar, 32); c += 32;
+    memcpy(cf + c, sae_peer_element, 64); c += 64;
+    hmac_sha256(sae_kck, 32, cf, c, m16);
+    size_t n;
+    sae_auth_hdr(f, &n, 2);
+    f[n++] = 1; f[n++] = 0;                                 /* send-confirm */
+    memcpy(f + n, m16, 32); n += 32;
+    mgmt_tx(f, n);
+    jsent = timer_ms();
+}
+
+static void sae_start(void)
+{
+    if (p256_sae_pwe(jpass, mac, jb.bssid, sae_pwe)) { join_fail("SAE: no password element", 0); return; }
+    if (p256_scalar_rand(sae_rand) || p256_scalar_rand(sae_mask)) { join_fail("SAE: no randomness", 0); return; }
+    p256_scalar_add(sae_rand, sae_mask, sae_scalar);        /* commit-scalar = rand + mask */
+    uint8_t t[64];
+    p256_mul(sae_mask, sae_pwe, t);                         /* commit-element = -(mask * PWE) */
+    p256_negate(t, sae_element);
+    sae_token_len = 0; sae_confirmed = 0;
+    jstate = J_SAE_COMMIT; jtries = 0;
+    send_sae_commit();
+}
+
+/* The peer's commit (body after the 802.11 header): the shared secret
+ * K = rand * (peer-scalar*PWE + peer-element), then keyseed and KCK/PMK. */
+static void sae_process_commit(const uint8_t *b, size_t n)
+{
+    if (n < 6 + 2 + 32 + 64) return;
+    if ((b[6] | b[7] << 8) != 19) { join_fail("SAE: the access point wants another group", 0); return; }
+    memcpy(sae_peer_scalar, b + 8, 32);
+    memcpy(sae_peer_element, b + 40, 64);
+    if (!p256_point_valid(sae_peer_element)) { join_fail("SAE: a bad commit element", 0); return; }
+    uint8_t t1[64], t2[64], K[64], keyseed[32], zeros[32] = { 0 }, ctx[32], kckpmk[64];
+    p256_mul(sae_peer_scalar, sae_pwe, t1);
+    p256_add(t1, sae_peer_element, t2);
+    p256_mul(sae_rand, t2, K);
+    if (!p256_point_valid(K)) { join_fail("SAE: the shared secret is degenerate", 0); return; }
+    hmac_sha256(zeros, 32, K, 32, keyseed);                 /* keyseed = H(<0>32, k), k = K.x */
+    p256_scalar_add(sae_scalar, sae_peer_scalar, ctx);
+    kdf_sha256(keyseed, 32, "SAE KCK and PMK", ctx, 32, kckpmk, 512);
+    memcpy(sae_kck, kckpmk, 32);
+    memcpy(pmk, kckpmk + 32, 32);
+    jstate = J_SAE_CONFIRM; jtries = 0;
+    send_sae_confirm();
+}
+
+static void sae_process_confirm(const uint8_t *b, size_t n)
+{
+    if (n < 6 + 2 + 32) return;
+    uint8_t cf[2 + 32 + 64 + 32 + 64], m16[32];
+    size_t c = 0;
+    cf[c++] = b[6]; cf[c++] = b[7];                         /* the peer's send-confirm */
+    memcpy(cf + c, sae_peer_scalar, 32); c += 32;
+    memcpy(cf + c, sae_peer_element, 64); c += 64;
+    memcpy(cf + c, sae_scalar, 32); c += 32;
+    memcpy(cf + c, sae_element, 64); c += 64;
+    hmac_sha256(sae_kck, 32, cf, c, m16);
+    if (memcmp(m16, b + 8, 32)) { join_fail("SAE: the confirm did not verify (wrong passphrase?)", 0); return; }
+    sae_confirmed = 1;
+    kprintf("ath: join: SAE confirmed\n");
+    jstate = J_ASSOC; jtries = 0;
+    send_assoc();
+}
+
+/* The reconnect after an established link is lost: tear the firmware's vdev
+ * and peer down so a fresh scan and join can run. */
+static void join_lost(const char *fmt, unsigned a)
+{
+    wlan0_down();
+    ksnprintf(jwhy, sizeof jwhy, fmt, a);
+    kprintf("ath: link lost: %s\n", jwhy);
+    send_vdev_down();
+    send_peer_delete();
+    send_vdev_stop();
+    hs = 0;
+    if (jauto && reconn_tries < 5) {
+        reconn_tries++;
+        reconn_at = timer_ms() + 1500;
+        jstate = J_IDLE;
+        kprintf("ath: reconnecting (try %d)\n", reconn_tries);
+    } else
+        jstate = J_FAILED;
+}
+
 /* Management frames to us while joining: authentication, association. */
 static void join_mgmt(const uint8_t *f, size_t n)
 {
@@ -1391,8 +1861,24 @@ static void join_mgmt(const uint8_t *f, size_t n)
     const uint8_t *b = f + 24;
     switch (f[0]) {
     case 0xb0:                                              /* authentication */
-        if (jstate != J_AUTH || n < 30) return;
-        if (b[2] != 2) return;
+        if (n < 30) return;
+        if ((b[0] | b[1] << 8) == 3) {                      /* SAE */
+            uint16_t seq = (uint16_t)(b[2] | b[3] << 8), status = (uint16_t)(b[4] | b[5] << 8);
+            if (seq == 1) {
+                if (status == 76 && jstate == J_SAE_COMMIT) {   /* anti-clogging token required: echo it */
+                    size_t tl = n - 24 - 8;
+                    if (tl > sizeof sae_token) tl = sizeof sae_token;
+                    memcpy(sae_token, b + 8, tl); sae_token_len = (int)tl;
+                    send_sae_commit();
+                } else if (status) join_fail("SAE: the access point rejected the commit (status %u)", status);
+                else if (jstate == J_SAE_COMMIT) sae_process_commit(b, n - 24);
+            } else if (seq == 2) {
+                if (status) join_fail("SAE: the access point rejected the confirm (status %u)", status);
+                else if (jstate == J_SAE_CONFIRM) sae_process_confirm(b, n - 24);
+            }
+            return;
+        }
+        if (jstate != J_AUTH || (b[2] | b[3] << 8) != 2) return;   /* open system, the response */
         if (b[4] | b[5] << 8) { join_fail("the access point refused authentication (status %u)", (unsigned)(b[4] | b[5] << 8)); return; }
         kprintf("ath: join: authenticated\n");
         jstate = J_ASSOC; jtries = 0;
@@ -1402,15 +1888,19 @@ static void join_mgmt(const uint8_t *f, size_t n)
         if (jstate != J_ASSOC || n < 30) return;
         if (b[2] | b[3] << 8) { join_fail("the access point refused the association (status %u)", (unsigned)(b[2] | b[3] << 8)); return; }
         jcap = (uint16_t)(b[0] | b[1] << 8);
-        jaid = (uint16_t)((b[4] | b[5] << 8) & 0x3fff);
-        kprintf("ath: join: associated, id %u\n", jaid);
+        int nss_vht = ((hw_rf_chains ? hw_rf_chains : 2) >= 2 && (jb.vht_rx_mcs & (3 << 2)) != (3 << 2)) ? 2 : 1;
+        const char *assoc_phy = (!is2g(jb.freq) && jb.has_vht)
+            ? (nss_vht == 2 ? " (802.11ac VHT80 2x2 MIMO)" : " (802.11ac VHT80)")
+            : ((jb.has_ht && jb.ht_mcs1) ? " (802.11n 2x2 MIMO)" : jb.has_ht ? " (802.11n HT)" : "");
+        kprintf("ath: join: associated, id %u%s\n", jaid, assoc_phy);
         send_peer_assoc();
         send_vdev_up();
         if (jb.secure == 2) { jstate = J_KEYS; jsent = timer_ms(); }
-        else { send_peer_param(3, 1); jstate = J_UP; kprintf("ath: join: connected to %s (open)\n", jb.ssid); wlan0_up(); }
+        else { send_peer_param(3, 1); jstate = J_UP; reconn_tries = 0; kprintf("ath: join: connected to %s (open)\n", jb.ssid); wlan0_up(); }
         break;
     case 0xc0: case 0xa0:                                   /* deauthentication, disassociation */
-        if (jstate >= J_AUTH && jstate <= J_UP) join_fail("the access point sent us away (reason %u)", n >= 26 ? (unsigned)(b[0] | b[1] << 8) : 0);
+        if (jstate == J_UP) join_lost("the access point sent us away (reason %u)", n >= 26 ? (unsigned)(b[0] | b[1] << 8) : 0);
+        else if (jstate >= J_START) join_fail("the access point sent us away (reason %u)", n >= 26 ? (unsigned)(b[0] | b[1] << 8) : 0);
         break;
     }
 }
@@ -1421,20 +1911,30 @@ static void join_vdev_started(uint32_t status)
     if (status) { join_fail("the radio did not tune to the channel (status %u)", status); return; }
     send_peer_create();
     send_ps_off();
-    jstate = J_AUTH; jtries = 0;
-    send_auth();
+    if (jakm == 8) sae_start();                             /* WPA3: SAE before the association */
+    else { jstate = J_AUTH; jtries = 0; send_auth(); }      /* open or WPA2: open-system authentication */
 }
 
 /* Retries and time limits, from the poll. */
 static void join_poll(void)
 {
     uint64_t now = timer_ms();
+    if (jstate == J_IDLE) {                                 /* a pending reconnect */
+        if (reconn_at && now >= reconn_at) { reconn_at = 0; jstate = J_FIND; jsent = now; if (!scanning) send_start_scan(); }
+        return;
+    }
     switch (jstate) {
     case J_FIND:
         if (!scanning) { if (join_pick() && jstate == J_FIND) join_fail("no network named that was found", 0); }
         break;
     case J_START:
         if (now - jsent > 3000) join_fail("no answer to the channel change", 0);
+        break;
+    case J_SAE_COMMIT:
+    case J_SAE_CONFIRM:
+        if (now - jsent < 500) break;
+        if (++jtries >= 5) { join_fail("no answer to the SAE exchange", 0); break; }
+        if (jstate == J_SAE_COMMIT) send_sae_commit(); else send_sae_confirm();
         break;
     case J_AUTH:
     case J_ASSOC:
@@ -1458,6 +1958,7 @@ int qcom_ath_connect(const char *ssid, const char *pass)
     memcpy(jssid, ssid, sl + 1);
     memcpy(jpass, pass, pl + 1);
     jwhy[0] = 0;
+    jauto = 1; reconn_tries = 0; reconn_at = 0;
     jstate = J_FIND;
     if (!vdev_up) { send_chan_list(); send_vdev_create(); vdev_up = 1; }
     if (!scanning) send_start_scan();
@@ -1468,6 +1969,13 @@ size_t qcom_ath_join_report(char *buf, size_t len)
 {
     if (jstate == J_IDLE) return 0;
     if (jstate == J_FAILED) return (size_t)ksnprintf(buf, len, "join %s: failed: %s\n", jssid, jwhy);
+    if (jstate == J_UP) {
+        int nss_vht = ((hw_rf_chains ? hw_rf_chains : 2) >= 2 && (jb.vht_rx_mcs & (3 << 2)) != (3 << 2)) ? 2 : 1;
+        const char *phy = (!is2g(jb.freq) && jb.has_vht)
+            ? (nss_vht == 2 ? " (802.11ac VHT80 2x2 MIMO, 867 Mbps)" : " (802.11ac VHT80, 433 Mbps)")
+            : ((jb.has_ht && jb.ht_mcs1) ? " (802.11n 2x2 MIMO, 144 Mbps)" : jb.has_ht ? " (802.11n, 72 Mbps)" : "");
+        return (size_t)ksnprintf(buf, len, "join %s: %s%s\n", jssid, join_names[jstate], phy);
+    }
     return (size_t)ksnprintf(buf, len, "join %s: %s\n", jssid, join_names[jstate]);
 }
 
@@ -1506,6 +2014,9 @@ static void wmi_event(const uint8_t *m, size_t n)
     case EV_SERVICE_READY: {
         if (stage != A_SVC_READY || !svc) break;
         uint32_t nreq; memcpy(&nreq, svc + 4 * 18, 4);       /* after fw_build_vers, abi (6), 11 more */
+        memcpy(&hw_rf_chains, svc + 4 * 9, 4);
+        memcpy(&hw_vht_cap, svc + 4 * 11, 4);
+        memcpy(&hw_vht_mcs, svc + 4 * 12, 4);
         nchunks = 0;
         for (const uint8_t *q = memreqs; q && q + 4 + 16 <= memreqs + memreqs_len && nchunks < MAX_CHUNKS; ) {
             uint32_t h; memcpy(&h, q, 4);
@@ -1523,7 +2034,8 @@ static void wmi_event(const uint8_t *m, size_t n)
             q += 4 + (h & 0xffff);
         }
         if (regcaps) memcpy(&eeprom_rd, regcaps, 4);
-        kprintf("ath: service ready (%u memory requests, %d given, regdomain %x)\n", nreq, nchunks, eeprom_rd);
+        kprintf("ath: service ready (%u memory requests, %d given, regdomain %x, chains %u, vht %08x)\n",
+                nreq, nchunks, eeprom_rd, hw_rf_chains, hw_vht_cap);
         send_init();
         stage = A_WMI_READY;
         break;
@@ -1560,7 +2072,7 @@ static void wmi_event(const uint8_t *m, size_t n)
             memcpy(&chan, rxhdr, 4); memcpy(&snr, rxhdr + 4, 4); memcpy(&buflen, rxhdr + 16, 4); memcpy(&status, rxhdr + 20, 4);
             mgmt_rx++;
             size_t fl = buflen < frame_len ? buflen : frame_len;
-            if (!(status & 1)) { saw_frame(frame, fl, (int)snr - 95, (int)chan); join_mgmt(frame, fl); }
+            if (!(status & 1)) { saw_frame(frame, fl, (int)snr - 95, chan_to_freq((int)chan)); join_mgmt(frame, fl); }
         }
         break;
     case EV_VDEV_START_RESP:
@@ -1571,7 +2083,8 @@ static void wmi_event(const uint8_t *m, size_t n)
         mgmt_done++;
         break;
     case EV_PEER_KICKOUT:
-        if (jstate >= J_AUTH && jstate <= J_UP) join_fail("the access point stopped answering", 0);
+        if (jstate == J_UP) join_lost("the access point stopped answering", 0);
+        else if (jstate >= J_START) join_fail("the access point stopped answering", 0);
         break;
     case EV_CHAN_INFO:
         if (chinfo) {                                       /* err, freq, flags, noise floor, rx clear, cycles */
@@ -1770,17 +2283,19 @@ size_t qcom_ath_report(char *buf, size_t len)
     if (stage == A_UP && n < len) n += qcom_ath_join_report(buf + n, len - n);
     if (mgmt_sent && n < len) n += (size_t)ksnprintf(buf + n, len - n, "  management frames: %u sent, %u completions\n", mgmt_sent, mgmt_done);
     if (htt_stage && n < len)
-        n += (size_t)ksnprintf(buf + n, len - n, "  htt: %s %u.%u, %u messages (types %x), %u sent\n",
-                               htt_stage == 2 ? "configured" : "version asked", htt_major, htt_minor, htt_rx_msgs, htt_types, pipes[4].tx_count);
+        n += (size_t)ksnprintf(buf + n, len - n, "  htt: %s %u.%u, %u messages (types %x), %u sent; peer %u, sec %u, frag %u, offload %u, other %u\n",
+                               htt_stage == 2 ? "configured" : "version asked", htt_major, htt_minor, htt_rx_msgs, htt_types, pipes[4].tx_count,
+                               htt_peer_evts, htt_sec_ind_n, htt_frag_n, htt_offload_n, htt_misc);
     if (chinfo_n && n < len)
         n += (size_t)ksnprintf(buf + n, len - n, "  channels: %u reports, noise floor %d..%d dBm, busy count up to %u, last %u MHz (%u cycles)\n",
                                chinfo_n, nf_min == 1000 ? 0 : nf_min, nf_max == -1000 ? 0 : nf_max, clear_max, last_freq, last_cycles);
     if (rx_frames && n < len)
-        n += (size_t)ksnprintf(buf + n, len - n, "  data rx: %u frames (%u bad, %u lost, %u offloaded); eapol %u, arp %u, ip %u, other %u (last ethertype %04x)\n",
-                               rx_frames, rx_bad, rx_lost, rx_offload, rx_eapol, rx_arp, rx_ip, rx_other, rx_last_type);
+        n += (size_t)ksnprintf(buf + n, len - n, "  data rx: %u frames (%u qos, %u a-msdu sub, %u bad, %u lost, %u offloaded); eapol %u, arp %u, ip %u, other %u (last ethertype %04x)\n",
+                               rx_frames, rx_qos, rx_amsdu, rx_bad, rx_lost, rx_offload, rx_eapol, rx_arp, rx_ip, rx_other, rx_last_type);
     if ((eapol_rx_n || htt_tx_n) && n < len)
-        n += (size_t)ksnprintf(buf + n, len - n, "  handshake: %u eapol in, %u out; htt tx %u (%u done)%s\n",
-                               eapol_rx_n, eapol_tx_n, htt_tx_n, htt_tx_compl, hs == 2 ? ", keys installed" : "");
+        n += (size_t)ksnprintf(buf + n, len - n, "  handshake: %u eapol in, %u out, %u replays dropped; %u group rekeys; htt tx %u (%u done)%s%s\n",
+                               eapol_rx_n, eapol_tx_n, eapol_replays, group_rekeys, htt_tx_n, htt_tx_compl,
+                               hs == 2 ? ", keys installed" : "", (jakm == 8 && sae_confirmed) ? ", SAE confirmed" : "");
     if (wlan0_registered && n < len)
         n += (size_t)ksnprintf(buf + n, len - n, "  wlan0: %s; out %u sent, %u dropped (%u with every slot busy); in %u dropped\n",
                                wlan0.flags & IFF_RUNNING ? "running" : "down", out_sent, out_drop, htt_tx_busy, in_drop);
