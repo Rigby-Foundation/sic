@@ -188,11 +188,12 @@ static int tcp_send_seg(struct socket *s, uint32_t seq, uint8_t flags, const voi
     if (flags & TH_SYN)
         optlen = syn_options(t, opts);
     else if (with_sack)
-        optlen = sack_options(t, opts, t->ooo ? t->ooo->seq : 0);
+        optlen = sack_options(t, opts, t->ooo_newest ? t->ooo_newest : (t->ooo ? t->ooo->seq : 0));
     if (flags & TH_ACK) {           /* every ACK we send covers what was pending */
         t->ack_pending = 0;
         t->ack_segs = 0;
         t->delack_at = 0;
+        t->ooo_newest = 0;
     }
     return tcp_emit(s->local_ip, s->remote_ip, s->local_port, s->remote_port,
                     seq, t->rcv_nxt, flags, (uint16_t)wnd, data, len, opts, optlen);
@@ -256,6 +257,7 @@ static void tcp_set_closed(struct socket *s, int err)
         return;
     t->state = TCP_CLOSED;
     t->rto_at = 0;
+    ooo_flush(t);
     if (err && !s->err)
         s->err = err;
     if (s->listener) {              /* never accepted: drop it from the backlog */
@@ -493,19 +495,53 @@ static uint32_t rcv_append(struct tcp_pcb *t, const uint8_t *data, uint32_t len)
     return n;
 }
 
-/* After rcv_nxt moved: pull now-contiguous out-of-order segments in. */
-static void ooo_drain(struct tcp_pcb *t)
+static int tcp_check_fin(struct socket *s)
 {
+    struct tcp_pcb *t = s->tcp;
+    if (!t) return 0;
+    if (t->has_fin && t->rcv_nxt == t->fin_seq && !t->fin_rcvd) {
+        t->fin_rcvd = 1;
+        t->rcv_nxt++;
+        switch (t->state) {
+        case TCP_SYN_RCVD: case TCP_ESTABLISHED: t->state = TCP_CLOSE_WAIT; break;
+        case TCP_FIN_WAIT_1:
+            if (fin_acked(t)) { t->state = TCP_TIME_WAIT; t->timewait_at = timer_ms() + TIME_WAIT_MS; }
+            else t->state = TCP_CLOSING;
+            break;
+        case TCP_FIN_WAIT_2: t->state = TCP_TIME_WAIT; t->timewait_at = timer_ms() + TIME_WAIT_MS; break;
+        default: break;
+        }
+        waitqueue_wake_all(&s->wq);
+        return 1;
+    }
+    return 0;
+}
+
+/* After rcv_nxt moved: pull now-contiguous out-of-order segments in. */
+static void ooo_drain(struct socket *s)
+{
+    struct tcp_pcb *t = s->tcp;
+    if (!t) return;
     while (t->ooo && SEQ_LEQ(t->ooo->seq, t->rcv_nxt)) {
         struct tcp_ooo *o = t->ooo;
         uint32_t skip = t->rcv_nxt - o->seq;
-        if (skip < o->len)
-            rcv_append(t, o->data + skip, o->len - skip);   /* always fits: it was inside the window */
+        if (skip < o->len) {
+            uint32_t n = rcv_append(t, o->data + skip, o->len - skip);
+            if (n < o->len - skip) {
+                uint32_t consumed = skip + n;
+                o->seq += consumed;
+                o->len -= consumed;
+                memmove(o->data, o->data + consumed, o->len);
+                t->ooo_bytes -= consumed;
+                break;
+            }
+        }
         t->ooo = o->next;
         t->ooo_bytes -= o->len;
         kfree(o->data);
         kfree(o);
     }
+    tcp_check_fin(s);
 }
 
 static void tcp_passive_open(struct socket *l, struct pkt *p, struct tcp_hdr *th, const struct tcp_opts *o)
@@ -714,9 +750,12 @@ void tcp_rx(struct pkt *p)
             }
             if (seq == t->rcv_nxt && !s->shut_rd) {
                 uint32_t n = rcv_append(t, data, datalen);
-                if (n < datalen) flags &= ~TH_FIN;       /* FIN not yet reached */
-                ooo_drain(t);
-                if (t->ooo || old) ack_now = 1; else ack_delayed = 1;
+                if (n < datalen) {
+                    ooo_insert(t, seq + n, data + n, datalen - n);
+                    ack_now = 1;
+                }
+                ooo_drain(s);
+                if (t->ooo || old || n < datalen) ack_now = 1; else ack_delayed = 1;
                 waitqueue_wake_all(&s->wq);
             } else if (seq == t->rcv_nxt) {
                 t->rcv_nxt += datalen;                  /* reader gone: discard */
@@ -726,29 +765,20 @@ void tcp_rx(struct pkt *p)
                     uint32_t n = datalen;
                     if (SEQ_GT(seq + n, t->rcv_nxt + wnd)) n = t->rcv_nxt + wnd - seq;
                     ooo_insert(t, seq, data, n);
+                    t->ooo_newest = seq;
                 }
-                flags &= ~TH_FIN;
                 ack_now = 1;
             }
         } else if (datalen) {
             ack_now = 1;
-            flags &= ~TH_FIN;
         }
-        if ((flags & TH_FIN) && fin_seq == t->rcv_nxt && !t->fin_rcvd) {
-            t->fin_rcvd = 1;
-            t->rcv_nxt++;
+        if (flags & TH_FIN) {
+            t->has_fin = 1;
+            t->fin_seq = fin_seq;
+        }
+        if (tcp_check_fin(s)) {
             ack_now = 1;
             ack_delayed = 0;
-            switch (t->state) {
-            case TCP_SYN_RCVD: case TCP_ESTABLISHED: t->state = TCP_CLOSE_WAIT; break;
-            case TCP_FIN_WAIT_1:
-                if (fin_acked(t)) { t->state = TCP_TIME_WAIT; t->timewait_at = timer_ms() + TIME_WAIT_MS; }
-                else t->state = TCP_CLOSING;
-                break;
-            case TCP_FIN_WAIT_2: t->state = TCP_TIME_WAIT; t->timewait_at = timer_ms() + TIME_WAIT_MS; break;
-            default: break;
-            }
-            waitqueue_wake_all(&s->wq);
         }
         if (ack_now)
             tcp_send_ack(s);
@@ -874,9 +904,14 @@ int tcp_recv(struct socket *s, void *buf, size_t len, int peek)
 {
     struct tcp_pcb *t = s->tcp;
     if (!t) return -ENOTCONN;
+    if (t->rcv_len == 0 && t->ooo && SEQ_LEQ(t->ooo->seq, t->rcv_nxt)) {
+        ooo_drain(s);
+        tcp_check_fin(s);
+    }
     if (t->rcv_len == 0) {
+        if (t->fin_rcvd) return 0;
         if (t->state == TCP_CLOSED && s->err) { int e = s->err; if (!peek) s->err = 0; return -e; }
-        if (t->fin_rcvd || t->state == TCP_CLOSED || s->shut_rd) return 0;
+        if (t->state == TCP_CLOSED || s->shut_rd) return 0;
         if (t->state == TCP_SYN_SENT || t->state == TCP_SYN_RCVD) return -EAGAIN;
         return -EAGAIN;
     }
@@ -887,14 +922,17 @@ int tcp_recv(struct socket *s, void *buf, size_t len, int peek)
     if (!peek) {
         t->rcv_head = (t->rcv_head + n) % TCP_BUF_SIZE;
         t->rcv_len -= n;
+        ooo_drain(s);
+        int fin_accepted = tcp_check_fin(s);
         /* Window update (receiver-side SWS avoidance): the sender only knows
          * the window from our last segment. Once we've opened it by a full
          * segment or half the buffer, tell it now rather than when the next
          * (possibly delayed) ACK happens to go out. A sender stalled on a
          * small window otherwise waits out the delayed-ACK timer each time. */
-        uint32_t space = rcv_space(t);
-        if (t->state != TCP_CLOSED && space > t->rcv_wnd_adv &&
-            (space - t->rcv_wnd_adv >= t->mss || space - t->rcv_wnd_adv >= TCP_BUF_SIZE / 2))
+        uint32_t cur_wnd = rcv_space(t);
+        if (cur_wnd > 65535) cur_wnd = 65535;
+        if (t->state != TCP_CLOSED && (fin_accepted || (cur_wnd > t->rcv_wnd_adv &&
+            (cur_wnd - t->rcv_wnd_adv >= t->mss || cur_wnd - t->rcv_wnd_adv >= cur_wnd / 2))))
             tcp_send_ack(s);
     }
     return (int)n;

@@ -284,6 +284,8 @@ long sys_socket(long domain, long type, long proto)
     int fd = fd_install(f);
     if (fd < 0)
         file_close(f);
+    else if (flags & SOCK_CLOEXEC)
+        task_current()->fdt->cloexec |= (1ULL << fd);
     return fd;
 }
 
@@ -434,6 +436,8 @@ long sys_accept4(long fd, uint64_t uaddr, uint64_t ulenp, long flags)
     int r = addr_out(uaddr, ulenp, c->remote_ip, c->remote_port);
     int nfd = r ? r : fd_install(cf);
     if (nfd < 0) file_close(cf);
+    else if (flags & SOCK_CLOEXEC)
+        task_current()->fdt->cloexec |= (1ULL << nfd);
     return nfd;
 }
 

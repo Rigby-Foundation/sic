@@ -111,7 +111,7 @@ void tcp_timer(uint64_t now_ms);
 enum tcp_state { TCP_CLOSED, TCP_LISTEN, TCP_SYN_SENT, TCP_SYN_RCVD, TCP_ESTABLISHED,
                  TCP_FIN_WAIT_1, TCP_FIN_WAIT_2, TCP_CLOSE_WAIT, TCP_CLOSING, TCP_LAST_ACK, TCP_TIME_WAIT };
 
-#define TCP_BUF_SIZE (32 * 1024)
+#define TCP_BUF_SIZE (128 * 1024)
 void tcp_dump(void);    /* connections per state, for the Scroll Lock dump */
 #define TCP_MSS      1460
 #define TCP_MAX_SACK 8
@@ -137,6 +137,9 @@ struct tcp_pcb {
     int      sack_ok;               /* negotiated on the SYN */
     struct tcp_ooo *ooo;            /* sorted by seq, non-overlapping */
     uint32_t ooo_bytes;
+    uint32_t ooo_newest;
+    int      has_fin;
+    uint32_t fin_seq;
     struct { uint32_t start, end; } sacked[TCP_MAX_SACK];
     int      nsacked;
     uint32_t recover;               /* fast retransmit: only holes below this are resent */

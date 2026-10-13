@@ -58,6 +58,8 @@ long unix_socket(int type, int flags)
     if (!f) { kfree(s->un); kfree(s); return -ENOMEM; }
     int fd = fd_install(f);
     if (fd < 0) file_close(f);
+    else if (flags & SOCK_CLOEXEC)
+        task_current()->fdt->cloexec |= (1ULL << fd);
     return fd;
 }
 
@@ -79,6 +81,9 @@ long unix_socketpair(int type, int flags, int *sv)
     for (int i = 0; i < 2; i++) {
         if (!(f[i] = sock_file(s[i], flags))) goto fail;
         if ((fd[i] = fd_install(f[i])) < 0) goto fail;
+    }
+    if (flags & SOCK_CLOEXEC) {
+        task_current()->fdt->cloexec |= (1ULL << fd[0]) | (1ULL << fd[1]);
     }
     sv[0] = fd[0];
     sv[1] = fd[1];
