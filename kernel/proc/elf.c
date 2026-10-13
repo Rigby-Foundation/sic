@@ -10,6 +10,7 @@
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "fs/vfs.h"
+#include "fs/fdtable.h"
 #include "mm/heap.h"
 #include "drivers/keyboard.h"
 #include "asm/timer.h"
@@ -144,30 +145,47 @@ struct image {
     char exe[256];                        /* where the file is, absolute */
 };
 
-static int elf_load(struct image *im, const void *data, size_t size)
+static int elf_load(struct image *im, struct vnode *n)
 {
-    const struct elf_ehdr *eh = data;
-    if (size < sizeof(*eh) || memcmp(eh->ident, "\x7f" "ELF", 4) != 0 || eh->ident[4] != ELFCLASS_NATIVE)
+    uint64_t size = n->size;
+    struct elf_ehdr eh;
+    if (size < sizeof(eh) || vfs_pread(n, &eh, sizeof(eh), 0) != (long)sizeof(eh))
         return -ENOEXEC;
-    if (eh->machine != EM_NATIVE || eh->type != ET_EXEC)
+    if (memcmp(eh.ident, "\x7f" "ELF", 4) != 0 || eh.ident[4] != ELFCLASS_NATIVE)
         return -ENOEXEC;
-    if (eh->ident[EI_OSABI] != ELFOSABI_SIC || eh->ident[EI_ABIVERSION] != 0) {
-        kprintf("exec: not a sic executable (OS/ABI %u)\n", eh->ident[EI_OSABI]);
+    if (eh.machine != EM_NATIVE || eh.type != ET_EXEC)
+        return -ENOEXEC;
+    if (eh.ident[EI_OSABI] != ELFOSABI_SIC || eh.ident[EI_ABIVERSION] != 0) {
+        kprintf("exec: not a sic executable (OS/ABI %u)\n", eh.ident[EI_OSABI]);
         return -ENOEXEC;
     }
-    if (eh->phoff + (uint64_t)eh->phnum * sizeof(struct elf_phdr) > size)
+    if (eh.phnum == 0 || eh.phnum > 128)
+        return -ENOEXEC;
+    size_t phbytes = (size_t)eh.phnum * sizeof(struct elf_phdr);
+    if (eh.phoff + phbytes > size)
         return -ENOEXEC;
 
-    const struct elf_phdr *ph = (const void *)((const uint8_t *)data + eh->phoff);
+    struct elf_phdr *ph = kmalloc(phbytes);
+    if (!ph)
+        return -ENOMEM;
+    if (vfs_pread(n, ph, phbytes, eh.phoff) != (long)phbytes) {
+        kfree(ph);
+        return -ENOEXEC;
+    }
+
     uint64_t top = 0;
     int code = 0;
-    for (uint16_t i = 0; i < eh->phnum; i++) {
+    for (uint16_t i = 0; i < eh.phnum; i++) {
         if (ph[i].type != PT_LOAD || ph[i].memsz == 0)
             continue;
-        if (ph[i].offset + ph[i].filesz > size)
+        if (ph[i].offset + ph[i].filesz > size) {
+            kfree(ph);
             return -ENOEXEC;
-        if (ph[i].vaddr < USER_BASE || ph[i].vaddr + ph[i].memsz > MMAP_BASE)
+        }
+        if (ph[i].vaddr < USER_BASE || ph[i].vaddr + ph[i].memsz > MMAP_BASE) {
+            kfree(ph);
             return -ENOEXEC;
+        }
 
         uint64_t start = PAGE_ALIGN_DOWN(ph[i].vaddr);
         uint64_t end   = PAGE_ALIGN_UP(ph[i].vaddr + ph[i].memsz);
@@ -175,10 +193,33 @@ static int elf_load(struct image *im, const void *data, size_t size)
         if (ph[i].flags & PF_W)   flags |= PTE_WRITE;
         if (!(ph[i].flags & PF_X)) flags |= PTE_NX;
 
-        if (map_zeroed(im->pgd, start, (end - start) / PAGE_SIZE, flags) != 0)
+        if (map_zeroed(im->pgd, start, (end - start) / PAGE_SIZE, flags) != 0) {
+            kfree(ph);
             return -ENOMEM;
-        if (copy_to_space(im->pgd, ph[i].vaddr, (const uint8_t *)data + ph[i].offset, ph[i].filesz) != 0)
-            return -ENOMEM;
+        }
+
+        uint64_t file_off = ph[i].offset;
+        uint64_t vaddr = ph[i].vaddr;
+        size_t remaining = ph[i].filesz;
+        while (remaining > 0) {
+            uint64_t phys = vmm_translate_in(im->pgd, vaddr);
+            if (!phys) {
+                kfree(ph);
+                return -ENOMEM;
+            }
+            size_t chunk = PAGE_SIZE - (vaddr & 0xFFF);
+            if (chunk > remaining)
+                chunk = remaining;
+            long r = vfs_pread(n, P2V(phys), chunk, file_off);
+            if (r != (long)chunk) {
+                kfree(ph);
+                return -EIO;
+            }
+            vaddr += chunk;
+            file_off += chunk;
+            remaining -= chunk;
+        }
+
         if (ph[i].flags & PF_X) {
             /* the frames may have held another program's code: make the
              * new code what instruction fetches see */
@@ -196,38 +237,31 @@ static int elf_load(struct image *im, const void *data, size_t size)
     /* AT_PHDR must be where the program headers really are in memory: the
      * libc derives the load base from it (AT_PHDR - PT_PHDR.p_vaddr) and
      * finds PT_TLS through it. Normally the first PT_LOAD covers them. */
-    size_t phbytes = (size_t)eh->phnum * sizeof(struct elf_phdr);
+    size_t phbytes_req = (size_t)eh.phnum * sizeof(struct elf_phdr);
     uint64_t phdr_addr = 0;
-    for (uint16_t i = 0; i < eh->phnum; i++)
-        if (ph[i].type == PT_LOAD && ph[i].offset <= eh->phoff &&
-            eh->phoff + phbytes <= ph[i].offset + ph[i].filesz)
-            phdr_addr = ph[i].vaddr + (eh->phoff - ph[i].offset);
+    for (uint16_t i = 0; i < eh.phnum; i++)
+        if (ph[i].type == PT_LOAD && ph[i].offset <= eh.phoff &&
+            eh.phoff + phbytes_req <= ph[i].offset + ph[i].filesz)
+            phdr_addr = ph[i].vaddr + (eh.phoff - ph[i].offset);
     if (!phdr_addr) {
         /* Not loaded: give the libc a private copy after the image. */
         phdr_addr = top + PAGE_SIZE;
-        if (map_zeroed(im->pgd, phdr_addr, PAGE_ALIGN_UP(phbytes) / PAGE_SIZE, PTE_NX) != 0 ||
-            copy_to_space(im->pgd, phdr_addr, ph, phbytes) != 0)
+        if (map_zeroed(im->pgd, phdr_addr, PAGE_ALIGN_UP(phbytes_req) / PAGE_SIZE, PTE_NX) != 0 ||
+            copy_to_space(im->pgd, phdr_addr, ph, phbytes_req) != 0) {
+            kfree(ph);
             return -ENOMEM;
-        top = phdr_addr + PAGE_ALIGN_UP(phbytes);
+        }
+        top = phdr_addr + PAGE_ALIGN_UP(phbytes_req);
     }
 
-    im->entry = eh->entry;
+    im->entry = eh.entry;
     im->phdr_addr = phdr_addr;
-    im->phnum = eh->phnum;
+    im->phnum = eh.phnum;
     im->phent = sizeof(struct elf_phdr);
     im->brk = top + PAGE_SIZE;                              /* guard page, then the heap */
+    kfree(ph);
     return 0;
 }
-
-/* Kernel-side copy of argv/envp: a fixed arena so nothing is borrowed from
- * the address space we're about to tear down. */
-struct argpack {
-    int    argc, envc;
-    char  *argv[ARG_MAX + 1];
-    char  *envp[ARG_MAX + 1];
-    char   data[ARG_BYTES];
-    size_t used;
-};
 
 static int pack_list(struct argpack *ap, const char *const list[], char **out, int *count)
 {
@@ -336,16 +370,11 @@ static int build_image(const char *path, const struct argpack *ap, struct image 
         return -ENOENT;
     if (n->type != VNODE_FILE)
         return -EACCES;
-    size_t size;
-    void *data = vfs_read_all(n, &size);
-    if (!data)
-        return -ENOMEM;
 
     memset(im, 0, sizeof(*im));
     if (vfs_path_of(n, im->exe, sizeof(im->exe)) != 0) { size_t k = strlen(path); if (k > sizeof(im->exe) - 1) k = sizeof(im->exe) - 1; memcpy(im->exe, path, k); }
     im->pgd = vmm_create_address_space();
-    int rc = elf_load(im, data, size);
-    kfree(data);
+    int rc = elf_load(im, n);
     if (rc == 0)
         rc = build_stack(im, ap, rsp);
     if (rc != 0) {
@@ -481,39 +510,52 @@ static int script(struct argpack *ap, const char **path)
         }
     }
     if (!*interp) return -ENOEXEC;
-    const char **list = kmalloc((ARG_MAX + 1) * sizeof *list);
-    if (!list) return -ENOMEM;
-    int k = 0;
-    list[k++] = interp;
-    if (arg) list[k++] = arg;
-    list[k++] = *path;
-    for (int i = 1; i < ap->argc && k < ARG_MAX; i++) list[k++] = ap->argv[i];
-    list[k] = NULL;
-    struct argpack *old = kmalloc(sizeof *old);
-    if (!old) { kfree(list); return -ENOMEM; }
-    memcpy(old, ap, sizeof *old);           /* list[] points into the old copy's strings */
-    for (int i = 0; i < k; i++)
-        if (list[i] >= ap->data && list[i] < ap->data + ARG_BYTES) list[i] = old->data + (list[i] - ap->data);
-    ap->used = 0;
-    int rc = pack_list(ap, list, ap->argv, &ap->argc);
-    if (rc == 0) rc = pack_list(ap, (const char *const *)old->envp, ap->envp, &ap->envc);
-    kfree(old);
-    kfree(list);
-    if (rc) return rc;
-    *path = ap->argv[0];
+
+    size_t ilen = strlen(interp) + 1;
+    size_t alen = arg ? strlen(arg) + 1 : 0;
+    size_t plen = strlen(*path) + 1;
+    if (ap->used + ilen + alen + plen > ARG_BYTES) return -E2BIG;
+
+    int prefix_count = arg ? 3 : 2;
+    if (ap->argc - 1 + prefix_count > ARG_MAX) return -E2BIG;
+
+    char *new_interp = ap->data + ap->used;
+    memcpy(new_interp, interp, ilen);
+    ap->used += ilen;
+
+    char *new_arg = NULL;
+    if (arg) {
+        new_arg = ap->data + ap->used;
+        memcpy(new_arg, arg, alen);
+        ap->used += alen;
+    }
+
+    char *new_path = ap->data + ap->used;
+    memcpy(new_path, *path, plen);
+    ap->used += plen;
+
+    int shift = prefix_count - 1;
+    for (int i = ap->argc - 1; i >= 1; i--)
+        ap->argv[i + shift] = ap->argv[i];
+
+    ap->argv[0] = new_interp;
+    if (arg) {
+        ap->argv[1] = new_arg;
+        ap->argv[2] = new_path;
+    } else {
+        ap->argv[1] = new_path;
+    }
+    ap->argc += shift;
+    ap->argv[ap->argc] = NULL;
+
+    *path = new_interp;
     return 1;
 }
 
-long process_exec(const char *path, const char *const argv[], const char *const envp[])
+long process_exec_ap(const char *path, struct argpack *ap)
 {
     struct task *t = task_current();
-    struct argpack *ap = kzalloc(sizeof(*ap));
-    if (!ap)
-        return -ENOMEM;
-    const char *const dflt_argv[] = { path, NULL };
-    int rc = pack_list(ap, argv ? argv : dflt_argv, ap->argv, &ap->argc);
-    if (rc == 0)
-        rc = pack_list(ap, envp, ap->envp, &ap->envc);
+    int rc = 0;
     for (int depth = 0; rc == 0; depth++) {      /* scripts, maybe run by scripts: a few levels */
         int s = script(ap, &path);
         if (s <= 0) { rc = s; break; }
@@ -547,9 +589,26 @@ long process_exec(const char *path, const char *const argv[], const char *const 
         t->tgid = t->id;
     }
     signal_exec(t);
+    fdt_close_on_exec(t->fdt);
     arch_task_init_user(t);
     mm_put(old);
     arch_exec_enter(t, im.entry, rsp);
+}
+
+long process_exec(const char *path, const char *const argv[], const char *const envp[])
+{
+    struct argpack *ap = kzalloc(sizeof(*ap));
+    if (!ap)
+        return -ENOMEM;
+    const char *const dflt_argv[] = { path, NULL };
+    int rc = pack_list(ap, argv ? argv : dflt_argv, ap->argv, &ap->argc);
+    if (rc == 0)
+        rc = pack_list(ap, envp, ap->envp, &ap->envc);
+    if (rc != 0) {
+        kfree(ap);
+        return rc;
+    }
+    return process_exec_ap(path, ap);
 }
 
 /* ---- fork --------------------------------------------------------------------------- */

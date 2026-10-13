@@ -23,6 +23,7 @@
 #define ESRCH        3
 #define EINTR        4
 #define EIO          5
+#define ENXIO        6
 #define EBADF        9
 #define ECHILD      10
 #define EAGAIN      11
@@ -89,24 +90,65 @@ struct abi_flock {                  /* musl x86_64 / ppc: short l_type, l_whence
     int32_t l_pid;
 };
 #define F_SETFL         4
+#define FD_CLOEXEC      1
 #define F_DUPFD_CLOEXEC 1030
 
 /* ioctl: the tty and block numbers are _IOC()-encoded, and PowerPC encodes
  * them differently (13 size bits, direction bits NONE=1 READ=2 WRITE=4). */
 #ifdef __powerpc__
 #define TCGETS     0x402C7413
+#define TCSETS     0x802C7414
+#define TCSETSW    0x802C7415
+#define TCSETSF    0x802C7416
 #define TIOCGWINSZ 0x40087468
+#define TIOCSWINSZ 0x80087467
+#define FIONREAD   0x4004667F
+#define FIONBIO    0x8004667E
 #define BLKRRPART  0x2000125F
 #define BLKGETSIZE64 0x40041272
 #define TIOCGPGRP  0x40047477
 #define TIOCSPGRP  0x80047476
+#define TIOCGPTN   0x40045430
+#define TIOCSPTLCK 0x80045431
 #else
 #define TCGETS     0x5401
+#define TCSETS     0x5402
+#define TCSETSW    0x5403
+#define TCSETSF    0x5404
 #define TIOCGWINSZ 0x5413
+#define TIOCSWINSZ 0x5414
+#define FIONREAD   0x541B
+#define FIONBIO    0x5421
 #define BLKRRPART  0x125F
 #define BLKGETSIZE64 0x80081272
 #define TIOCGPGRP  0x540F
 #define TIOCSPGRP  0x5410
+#define TIOCGPTN   0x80045430
+#define TIOCSPTLCK 0x40045431
+#endif
+
+#ifdef __powerpc__
+struct abi_termios {
+    uint32_t c_iflag;
+    uint32_t c_oflag;
+    uint32_t c_cflag;
+    uint32_t c_lflag;
+    uint8_t  c_cc[19];
+    uint8_t  c_line;
+    uint32_t c_ispeed;
+    uint32_t c_ospeed;
+};
+#else
+struct abi_termios {
+    uint32_t c_iflag;
+    uint32_t c_oflag;
+    uint32_t c_cflag;
+    uint32_t c_lflag;
+    uint8_t  c_line;
+    uint8_t  c_cc[32];
+    uint32_t c_ispeed;
+    uint32_t c_ospeed;
+};
 #endif
 
 struct winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; };
@@ -224,9 +266,11 @@ struct abi_utsname { char sysname[65], nodename[65], release[65], version[65], m
 #define ARCH_GET_GS 0x1004
 
 /* wait4 */
-#define WNOHANG 1
+#define WNOHANG    1
+#define WUNTRACED  2
 #define W_EXITCODE(code) (((code) & 0xFF) << 8)
 #define W_SIGNALED(sig)  ((sig) & 0x7F)
+#define W_STOPCODE(sig)  (((sig) << 8) | 0x7F)
 #define SIGSEGV 11
 #define SIGILL   4
 #define SIGFPE   8

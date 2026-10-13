@@ -1,7 +1,7 @@
 # sic
 
-sic is a monolithic kernel written in C for x86_64 and 32-bit big-endian
-PowerPC (G4 PowerMacs): SMP, preemptive scheduling of
+sic is a monolithic kernel written in C for x86_64, 32-bit big-endian
+PowerPC (G4 PowerMacs) and 64-bit ARM: SMP, preemptive scheduling of
 processes and threads, POSIX signals and pipes, sound (Intel HD Audio,
 `/dev/dsp`), a VFS with tmpfs, its own
 on-disk filesystem (zaefs), FAT and ext2/3/4, NVMe/AHCI/IDE/UFS disks with GPT and MBR

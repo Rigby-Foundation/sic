@@ -63,9 +63,9 @@ static int is_idle(struct task *t)
     return 0;
 }
 
-/* ---- reaping (called from idle with interrupts on, lock not held) ------------------- */
+/* ---- reaping ------------------------------------------------------------------------ */
 
-static void reap_zombies(void)
+void task_reap_zombies(void)
 {
     struct task *dead = NULL;
 
@@ -180,7 +180,7 @@ static void idle_main(void *arg)
     (void)arg;
     uint32_t me = this_cpu()->index;        /* an idle task never leaves its CPU */
     for (;;) {
-        reap_zombies();
+        task_reap_zombies();
         if (dump_requested && __atomic_exchange_n(&dump_requested, 0, __ATOMIC_SEQ_CST)) {
             sched_dump();
             heap_dump();
@@ -356,6 +356,10 @@ static void wake_hint(struct task *t)
 void task_wake(struct task *t)
 {
     uint64_t f = spin_lock_irqsave(&sched_lock);
+    if (t->state == TASK_STOPPED) {
+        spin_unlock_irqrestore(&sched_lock, f);
+        return;
+    }
     if (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) {
         rq_push(t);
         wake_hint(t);
@@ -363,6 +367,30 @@ void task_wake(struct task *t)
         t->wake_pending = 1;
     }
     spin_unlock_irqrestore(&sched_lock, f);
+}
+
+void task_continue(struct task *t)
+{
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    if (t->state == TASK_STOPPED) {
+        t->stop_sig = 0;
+        t->stop_reported = 0;
+        rq_push(t);
+        wake_hint(t);
+    }
+    spin_unlock_irqrestore(&sched_lock, f);
+}
+
+void task_stop(struct task *t, int sig)
+{
+    t->stop_sig = sig;
+    t->stop_reported = 0;
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    t->state = TASK_STOPPED;
+    spin_unlock_irqrestore(&sched_lock, f);
+    struct task *parent = task_find(t->parent_id);
+    if (parent) task_wake(parent);
+    task_yield();
 }
 
 /* The list walk must be locked: the reaper on another CPU unlinks zombies
@@ -386,7 +414,7 @@ void task_foreach(void (*fn)(struct task *t, void *arg), void *arg)
     spin_unlock_irqrestore(&sched_lock, f);
 }
 
-long task_collect_child(long pid, int *status)
+long task_collect_child_opts(long pid, int *status, int options)
 {
     uint64_t f = spin_lock_irqsave(&sched_lock);
     long ret = -1;
@@ -401,10 +429,23 @@ long task_collect_child(long pid, int *status)
             ret = t->id;
             break;
         }
+        if ((options & WUNTRACED) && t->state == TASK_STOPPED && !t->stop_reported) {
+            t->stop_reported = 1;
+            *status = (t->stop_sig << 8) | 0x7f;
+            ret = t->id;
+            break;
+        }
         ret = 0;                        /* a live child exists */
     }
     spin_unlock_irqrestore(&sched_lock, f);
+    if (ret > 0)
+        task_reap_zombies();
     return ret;
+}
+
+long task_collect_child(long pid, int *status)
+{
+    return task_collect_child_opts(pid, status, 0);
 }
 
 /* CLONE_CHILD_CLEARTID: tell a joiner we're gone. */
@@ -419,13 +460,24 @@ static void clear_child_tid(struct task *t)
     }
 }
 
-/* Drop the file table now rather than when the zombie is reaped: the other
- * end of a pipe or socket must see the hangup as soon as we are gone. */
+/* Drop the file table and address space now rather than when the zombie is
+ * reaped: pipes/sockets see EOF immediately and user physical memory is freed. */
 static void release_files(struct task *t)
 {
     struct fdtable *fdt = t->fdt;
     t->fdt = NULL;
     fdt_put(fdt);
+}
+
+static void release_mm(struct task *t)
+{
+    struct mm *mm = t->mm;
+    if (!mm)
+        return;
+    t->mm = NULL;
+    t->pgd = vmm_kernel_pgd();
+    vmm_activate(t->pgd);
+    mm_put(mm);
 }
 
 void task_exit_code(int code)
@@ -435,6 +487,7 @@ void task_exit_code(int code)
         task_exit_group(code);              /* the leader leaving ends the process */
     clear_child_tid(t);
     release_files(t);
+    release_mm(t);
     spin_lock_irqsave(&sched_lock);
     t->exit_code = code;
     CUR->state = TASK_ZOMBIE;
@@ -478,10 +531,23 @@ void task_exit_group(int code)
             task_send_signal(parent, SIGCHLD);
     }
 #endif
+    /* Reparent children whose parent died: since the parent is dead and can never wait on them,
+     * mark dead children as reaped so task_reap_zombies can reclaim them. */
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    for (struct task *c = all_tasks; c; c = c->next) {
+        if (c->parent_id == self->tgid) {
+            c->parent_id = 1;
+            if (c->state == TASK_ZOMBIE)
+                c->reaped = 1;
+        }
+    }
+    spin_unlock_irqrestore(&sched_lock, f);
+
     /* The leader's zombie is what the parent waits for; a thread that called
      * exit_group ends itself here, and the leader dies at its next delivery point. */
     clear_child_tid(self);
     release_files(self);
+    release_mm(self);
     spin_lock_irqsave(&sched_lock);
     self->state = TASK_ZOMBIE;
     schedule();

@@ -13,6 +13,7 @@
 #include "mm/heap.h"
 #include "module.h"
 #include "fs/pipe.h"
+#include "fs/eventfd.h"
 #include "fs/blkdev.h"
 #include "proc/signal.h"
 #include "proc/futex.h"
@@ -89,6 +90,7 @@ static int fd_alloc_from(struct file *f, int from)
     for (int i = from; i < MAX_FDS; i++)
         if (!t->files[i]) {
             t->files[i] = f;
+            t->cloexec &= ~(1ULL << i);
             spin_unlock(&t->lock);
             return i;
         }
@@ -166,6 +168,62 @@ static long sys_readv(long fd, uint64_t uiov, long cnt)
     return total;
 }
 
+static long sys_pread64(long fd, uint64_t buf, uint64_t len, long offset)
+{
+    if (offset < 0) return -EINVAL;
+    struct file *f = fd_get(fd);
+    if (!f) return -EBADF;
+    if (len == 0) return 0;
+    if (!user_ok(buf, len)) return -EFAULT;
+    long r = file_pread(f, (void *)buf, len, (uint64_t)offset);
+    return r == -1 ? -EIO : r;
+}
+
+static long sys_pwrite64(long fd, uint64_t buf, uint64_t len, long offset)
+{
+    if (offset < 0) return -EINVAL;
+    struct file *f = fd_get(fd);
+    if (!f) return -EBADF;
+    if (len == 0) return 0;
+    if (!user_ok(buf, len)) return -EFAULT;
+    long r = file_pwrite(f, (const void *)buf, len, (uint64_t)offset);
+    return r == -1 ? -EIO : r;
+}
+
+static long sys_preadv(long fd, uint64_t uiov, long cnt, long offset)
+{
+    if (offset < 0) return -EINVAL;
+    if (cnt < 0 || !user_ok(uiov, (uint64_t)cnt * sizeof(struct abi_iovec)))
+        return -EFAULT;
+    const struct abi_iovec *iov = (const void *)uiov;
+    long total = 0;
+    for (long i = 0; i < cnt; i++) {
+        if (iov[i].iov_len == 0) continue;
+        long r = sys_pread64(fd, iov[i].iov_base, iov[i].iov_len, offset + total);
+        if (r < 0) return total ? total : r;
+        total += r;
+        if ((uint64_t)r < iov[i].iov_len) break;
+    }
+    return total;
+}
+
+static long sys_pwritev(long fd, uint64_t uiov, long cnt, long offset)
+{
+    if (offset < 0) return -EINVAL;
+    if (cnt < 0 || !user_ok(uiov, (uint64_t)cnt * sizeof(struct abi_iovec)))
+        return -EFAULT;
+    const struct abi_iovec *iov = (const void *)uiov;
+    long total = 0;
+    for (long i = 0; i < cnt; i++) {
+        if (iov[i].iov_len == 0) continue;
+        long r = sys_pwrite64(fd, iov[i].iov_base, iov[i].iov_len, offset + total);
+        if (r < 0) return total ? total : r;
+        total += r;
+        if ((uint64_t)r < iov[i].iov_len) break;
+    }
+    return total;
+}
+
 static long sys_openat(long dirfd, uint64_t upath, long flags)
 {
     char path[VFS_PATH_MAX];
@@ -184,6 +242,8 @@ static long sys_openat(long dirfd, uint64_t upath, long flags)
     if (!f) return -ENOENT;
     int fd = fd_alloc_from(f, 0);
     if (fd < 0) file_close(f);
+    else if (flags & O_CLOEXEC)
+        task_current()->fdt->cloexec |= (1ULL << fd);
     return fd;
 }
 
@@ -192,6 +252,7 @@ static long sys_close(long fd)
     struct file *f = fd_get(fd);
     if (!f) return -EBADF;
     FILES[fd] = NULL;
+    task_current()->fdt->cloexec &= ~(1ULL << fd);
     file_close(f);
     return 0;
 }
@@ -202,7 +263,8 @@ static long sys_lseek(long fd, long off, long whence)
 {
     struct file *f = fd_get(fd);
     if (!f) return -EBADF;
-    if (f->node->type != VNODE_FILE && !(f->node->type == VNODE_DEV && (f->node->is_block || f->node->seekable)))
+    if (f->node->type != VNODE_FILE && f->node->type != VNODE_DIR &&
+        !(f->node->type == VNODE_DEV && (f->node->is_block || f->node->seekable)))
         return -ESPIPE;                     /* block devices are seekable, the console isn't */
     long r = file_seek(f, off, (int)whence);
     return r < 0 ? -EINVAL : r;
@@ -213,7 +275,7 @@ static void fill_stat(struct vnode *n, struct abi_stat *st)
     memset(st, 0, sizeof(*st));
     st->st_dev = n->mnt ? ((uint64_t)(uintptr_t)n->mnt >> 4) & 0xffffffffu : 0;   /* one number per mounted filesystem */
     st->st_ino = n->ino;
-    st->st_nlink = 1;
+    st->st_nlink = vfs_nlink(n);
     st->st_mode = n->type == VNODE_DIR ? S_IFDIR | 0755
                 : n->type == VNODE_LINK ? S_IFLNK | 0777
                 : n->type == VNODE_DEV ? (n->is_block ? S_IFBLK : n->is_sock ? S_IFSOCK : S_IFCHR) | 0666
@@ -291,6 +353,7 @@ static long sys_newfstatat(long dirfd, uint64_t upath, uint64_t ust, long flags)
         if (!f) return -EBADF;
         n = f->node;
     } else {
+        if (!path[0]) return -ENOENT;
         struct vnode *dir = at_dir(dirfd);
         if (!dir) return -EBADF;
         n = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_lookup_nofollow(dir, path) : vfs_lookup(dir, path);
@@ -319,22 +382,26 @@ static long sys_getdents64(long fd, uint64_t ubuf, uint64_t len)
     uint8_t *out = (uint8_t *)ubuf;
     uint64_t used = 0;
     struct dirent d;
-    while (file_readdir(f, f->pos, &d) == 1) {
+    uint64_t next_pos = f->pos;
+    while (file_readdir(f, &next_pos, &d) == 1) {
         size_t namelen = strlen(d.name);
         uint16_t reclen = (uint16_t)((sizeof(struct abi_dirent64) + namelen + 1 + 7) & ~7UL);
         if (used + reclen > len)
             break;
         struct abi_dirent64 *e = (void *)(out + used);
         e->d_ino = d.ino;
-        e->d_off = (int64_t)f->pos + 1;
+        e->d_off = (int64_t)next_pos;
         e->d_reclen = reclen;
         e->d_type = d.type == VNODE_DIR ? DT_DIR : d.type == VNODE_LINK ? DT_LNK : d.type == VNODE_DEV ? DT_CHR : DT_REG;
         memcpy(e->d_name, d.name, namelen + 1);
         used += reclen;
-        f->pos++;
+        f->pos = next_pos;
     }
-    if (used == 0 && file_readdir(f, f->pos, &d) == 1)
-        return -EINVAL;                     /* buffer too small for one entry */
+    if (used == 0) {
+        uint64_t peek = f->pos;
+        if (file_readdir(f, &peek, &d) == 1)
+            return -EINVAL;                     /* buffer too small for one entry */
+    }
     return (long)used;
 }
 
@@ -350,11 +417,25 @@ static long sys_renameat(long olddirfd, uint64_t uold, long newdirfd, uint64_t u
     return vfs_rename(od, old, nd, new);
 }
 
+static long sys_linkat(long olddirfd, uint64_t uold, long newdirfd, uint64_t unew, long flags)
+{
+    (void)flags;
+    char old[VFS_PATH_MAX], new[VFS_PATH_MAX];
+    long rc = user_str(uold, old, sizeof old);
+    if (rc) return rc;
+    rc = user_str(unew, new, sizeof new);
+    if (rc) return rc;
+    struct vnode *od = at_dir(olddirfd), *nd = at_dir(newdirfd);
+    if (!od || !nd) return -EBADF;
+    return vfs_link(od, old, nd, new);
+}
+
 static long path_op(long dirfd, uint64_t upath, int op)
 {
     char path[VFS_PATH_MAX];
     long rc = user_str(upath, path, sizeof(path));
     if (rc) return rc;
+    if (!path[0]) return -ENOENT;
     struct vnode *dir = at_dir(dirfd);
     if (!dir) return -EBADF;
     struct vnode *n = op <= 1 ? vfs_lookup_nofollow(dir, path) : vfs_lookup(dir, path);   /* mkdir, unlink: a link is itself */
@@ -365,12 +446,12 @@ static long path_op(long dirfd, uint64_t upath, int op)
     case 1: /* unlink */
         if (!n) return -ENOENT;
         if (n->type == VNODE_DIR) return -EISDIR;
-        return vfs_unlink(dir, path) == 0 ? 0 : -EACCES;
+        return vfs_unlink(dir, path) == 0 ? 0 : -EIO;
     case 2: /* rmdir */
         if (!n) return -ENOENT;
         if (n->type != VNODE_DIR) return -ENOTDIR;
         if (n->children) return -ENOTEMPTY;
-        return vfs_unlink(dir, path) == 0 ? 0 : -EACCES;
+        return vfs_unlink(dir, path) == 0 ? 0 : -ENOTEMPTY;
     case 3: /* access */
         return n ? 0 : -ENOENT;
     case 4: /* chdir */
@@ -441,12 +522,15 @@ static long sys_dup(long fd)
 
 static long sys_dup3(long fd, long nfd, long flags)
 {
-    (void)flags;
     struct file *f = fd_get(fd);
     if (!f || nfd < 0 || nfd >= MAX_FDS) return -EBADF;
     if (fd == nfd) return nfd;
     struct file *old = FILES[nfd];
     FILES[nfd] = file_dup(f);
+    if (flags & O_CLOEXEC)
+        task_current()->fdt->cloexec |= (1ULL << nfd);
+    else
+        task_current()->fdt->cloexec &= ~(1ULL << nfd);
     if (old)
         file_close(old);
     return nfd;
@@ -462,10 +546,18 @@ static long sys_fcntl(long fd, long cmd, long arg)
         if (arg < 0 || arg >= MAX_FDS) return -EINVAL;
         int nfd = fd_alloc_from(file_dup(f), (int)arg);
         if (nfd < 0) file_close(f);
+        else if (cmd == F_DUPFD_CLOEXEC)
+            task_current()->fdt->cloexec |= (1ULL << nfd);
         return nfd;
     }
-    case F_GETFD: return 0;
-    case F_SETFD: return 0;
+    case F_GETFD: return (task_current()->fdt->cloexec & (1ULL << fd)) ? FD_CLOEXEC : 0;
+    case F_SETFD: {
+        if (arg & FD_CLOEXEC)
+            task_current()->fdt->cloexec |= (1ULL << fd);
+        else
+            task_current()->fdt->cloexec &= ~(1ULL << fd);
+        return 0;
+    }
     case F_GETFL: return f->flags & (O_ACCMODE | O_APPEND | O_NONBLOCK);
     case F_SETFL: f->flags = (f->flags & ~(O_APPEND | O_NONBLOCK)) | (int)(arg & (O_APPEND | O_NONBLOCK)); return 0;
     case F_GETLK: case F_SETLK: case F_SETLKW: case F_OFD_GETLK: case F_OFD_SETLK: case F_OFD_SETLKW:
@@ -522,6 +614,35 @@ static long sys_ioctl(long fd, long ureq, uint64_t arg)
     struct file *f = fd_get(fd);
     uint32_t req = (uint32_t)ureq;          /* the libc passes an int: strip sign extension */
     if (!f) return -EBADF;
+    if (req == FIONBIO) {
+        if (!user_ok(arg, sizeof(int))) return -EFAULT;
+        int on = *(const int *)arg;
+        if (on) f->flags |= O_NONBLOCK;
+        else f->flags &= ~O_NONBLOCK;
+        return 0;
+    }
+    if (req == FIONREAD) {
+        if (!user_ok(arg, sizeof(int))) return -EFAULT;
+        int avail = 0;
+#ifdef CONFIG_NET
+        if (f->node->is_sock) {
+            struct socket *s = f->node->priv;
+            if (s) {
+                spin_lock(&net_lock);
+                if (s->type == SOCK_STREAM && s->tcp) avail = (int)s->tcp->rcv_len;
+                spin_unlock(&net_lock);
+            }
+        }
+#endif
+        *(int *)arg = avail;
+        return 0;
+    }
+    if (req == 0x5452 /* FIOASYNC */) return 0;
+    if (req == 0x8905 /* SIOCATMARK */) {
+        if (!user_ok(arg, sizeof(int))) return -EFAULT;
+        *(int *)arg = 0;
+        return 0;
+    }
     if (f->node->type != VNODE_DEV) return -ENOTTY;
     if (f->node->dev && f->node->dev->ioctl) {
         long r = f->node->dev->ioctl(f, req, arg);
@@ -556,6 +677,14 @@ static long sys_ioctl(long fd, long ureq, uint64_t arg)
         return 0;
     }
 #ifdef CONFIG_KEYBOARD
+    if (req == TCGETS) {
+        if (!user_ok(arg, sizeof(struct abi_termios))) return -EFAULT;
+        return keyboard_get_termios((struct abi_termios *)arg);
+    }
+    if (req == TCSETS || req == TCSETSW || req == TCSETSF) {
+        if (!user_ok(arg, sizeof(struct abi_termios))) return -EFAULT;
+        return keyboard_set_termios((const struct abi_termios *)arg);
+    }
     if (req == TIOCSPGRP) {
         if (!user_ok(arg, 4)) return -EFAULT;
         keyboard_set_foreground(*(const uint32_t *)arg);
@@ -707,11 +836,14 @@ static long sys_select(long n, uint64_t urd, uint64_t uwr, uint64_t uex, uint64_
 #ifdef CONFIG_PIPES
 static long sys_pipe2(uint64_t ufds, long flags)
 {
-    (void)flags;
     if (!user_ok(ufds, 8)) return -EFAULT;
     struct file *r, *w;
     long rc = pipe_create(&r, &w);
     if (rc) return rc;
+    if (flags & O_NONBLOCK) {
+        r->flags |= O_NONBLOCK;
+        w->flags |= O_NONBLOCK;
+    }
     int rfd = fd_alloc_from(r, 0);
     int wfd = rfd >= 0 ? fd_alloc_from(w, 0) : -EMFILE;
     if (rfd < 0 || wfd < 0) {
@@ -720,9 +852,28 @@ static long sys_pipe2(uint64_t ufds, long flags)
         file_close(w);
         return -EMFILE;
     }
+    if (flags & O_CLOEXEC) {
+        task_current()->fdt->cloexec |= (1ULL << rfd) | (1ULL << wfd);
+    }
     ((int *)ufds)[0] = rfd;
     ((int *)ufds)[1] = wfd;
     return 0;
+}
+
+static long sys_eventfd(unsigned int initval, int flags)
+{
+    struct file *f = NULL;
+    int rc = eventfd_create(initval, flags, &f);
+    if (rc) return rc;
+    int fd = fd_alloc_from(f, 0);
+    if (fd < 0) {
+        file_close(f);
+        return -EMFILE;
+    }
+    if (flags & EFD_CLOEXEC) {
+        task_current()->fdt->cloexec |= (1ULL << fd);
+    }
+    return fd;
 }
 #endif
 
@@ -846,16 +997,16 @@ out:
 static long sys_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
 {
     char path[VFS_PATH_MAX];
-    static const int cap = ARG_BYTES;
-    char *data = kmalloc(cap);
-    const char **argv = kmalloc((ARG_MAX + 1) * sizeof *argv), **envp = kmalloc((ARG_MAX + 1) * sizeof *envp);
-    size_t used = 0;
     long rc = user_str(upath, path, sizeof(path));
-    if (!data || !argv || !envp) { kfree(data); kfree(argv); kfree(envp); return -ENOMEM; }
+    if (rc != 0)
+        return rc;
 
-    /* Pull the vectors into a kernel buffer; process_exec copies them again
-     * into its own arena, so we can free this on any path. */
-    const char **lists[2] = { argv, envp };
+    struct argpack *ap = kzalloc(sizeof(*ap));
+    if (!ap)
+        return -ENOMEM;
+
+    char **lists[2] = { ap->argv, ap->envp };
+    int *counts[2] = { &ap->argc, &ap->envc };
     uint64_t uv[2] = { uargv, uenvp };
     for (int l = 0; rc == 0 && l < 2; l++) {
         int n = 0;
@@ -864,24 +1015,36 @@ static long sys_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
             if (!user_ok(slot, sizeof(unsigned long))) { rc = -EFAULT; break; }
             uint64_t sp = *(const unsigned long *)(uintptr_t)slot;
             if (!sp) break;
-            rc = user_str(sp, data + used, cap - used);
+            rc = user_str(sp, ap->data + ap->used, ARG_BYTES - ap->used);
             if (rc == -ENAMETOOLONG) rc = -E2BIG;
             if (rc) break;
-            lists[l][n] = data + used;
-            used += strlen(data + used) + 1;
+            lists[l][n] = ap->data + ap->used;
+            ap->used += strlen(ap->data + ap->used) + 1;
         }
-        if (rc == 0 && n == ARG_MAX) {              /* more than we take: say so rather than cut */
+        if (rc == 0 && n == ARG_MAX) {
             uint64_t slot = uv[l] + (uint64_t)n * sizeof(unsigned long);
             if (user_ok(slot, sizeof(unsigned long)) && *(const unsigned long *)(uintptr_t)slot) rc = -E2BIG;
         }
         lists[l][n] = NULL;
+        *counts[l] = n;
     }
-    if (rc == 0)
-        rc = process_exec(path, argv, envp);        /* only returns on failure */
-    kfree(data);
-    kfree(argv);
-    kfree(envp);
-    return rc;
+    if (rc == 0 && ap->argc == 0) {
+        size_t pl = strlen(path) + 1;
+        if (ap->used + pl <= ARG_BYTES) {
+            memcpy(ap->data + ap->used, path, pl);
+            ap->argv[0] = ap->data + ap->used;
+            ap->argv[1] = NULL;
+            ap->argc = 1;
+            ap->used += pl;
+        } else {
+            rc = -E2BIG;
+        }
+    }
+    if (rc != 0) {
+        kfree(ap);
+        return rc;
+    }
+    return process_exec_ap(path, ap);
 }
 
 static long sys_wait4(long pid, uint64_t ustatus, long options, uint64_t rusage)
@@ -891,10 +1054,14 @@ static long sys_wait4(long pid, uint64_t ustatus, long options, uint64_t rusage)
     if (pid == 0 || pid < -1) pid = -1;             /* no process groups: treat as any child */
     for (;;) {
         int code = 0;
-        long r = task_collect_child(pid, &code);
+        long r = task_collect_child_opts(pid, &code, (int)options);
         if (r > 0) {
-            if (ustatus)
-                *(int *)ustatus = code >= 128 && code < 128 + 32 ? W_SIGNALED(code - 128) : W_EXITCODE(code);
+            if (ustatus) {
+                if ((code & 0x7f) == 0x7f)
+                    *(int *)ustatus = code;
+                else
+                    *(int *)ustatus = code >= 128 && code < 128 + 32 ? W_SIGNALED(code - 128) : W_EXITCODE(code);
+            }
             return r;
         }
         if (r < 0) return -ECHILD;
@@ -1152,6 +1319,34 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_write:         ret = sys_write((long)a1, a2, a3); break;
     case SYS_readv:         ret = sys_readv((long)a1, a2, (long)a3); break;
     case SYS_writev:        ret = sys_writev((long)a1, a2, (long)a3); break;
+    case SYS_pread64:
+#ifdef __powerpc__
+        ret = sys_pread64((long)a1, a2, a3, (long)(((uint64_t)a5 << 32) | (uint32_t)a6));
+#else
+        ret = sys_pread64((long)a1, a2, a3, (long)a4);
+#endif
+        break;
+    case SYS_pwrite64:
+#ifdef __powerpc__
+        ret = sys_pwrite64((long)a1, a2, a3, (long)(((uint64_t)a5 << 32) | (uint32_t)a6));
+#else
+        ret = sys_pwrite64((long)a1, a2, a3, (long)a4);
+#endif
+        break;
+    case SYS_preadv:
+#ifdef __powerpc__
+        ret = sys_preadv((long)a1, a2, (long)a3, (long)(((uint64_t)a5 << 32) | (uint32_t)a6));
+#else
+        ret = sys_preadv((long)a1, a2, (long)a3, (long)a4);
+#endif
+        break;
+    case SYS_pwritev:
+#ifdef __powerpc__
+        ret = sys_pwritev((long)a1, a2, (long)a3, (long)(((uint64_t)a5 << 32) | (uint32_t)a6));
+#else
+        ret = sys_pwritev((long)a1, a2, (long)a3, (long)a4);
+#endif
+        break;
     case SYS_open:          ret = sys_openat(AT_FDCWD, a1, (long)a2); break;
     case SYS_openat:        ret = sys_openat((long)a1, a2, (long)a3); break;
     case SYS_close:         ret = sys_close((long)a1); break;
@@ -1174,8 +1369,8 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_getcwd:        ret = sys_getcwd(a1, a2); break;
     case SYS_symlink:       ret = sys_symlinkat(a1, AT_FDCWD, a2); break;
     case SYS_symlinkat:     ret = sys_symlinkat(a1, (long)a2, a3); break;
-    case SYS_link: case SYS_linkat:
-        ret = -EPERM; break;                /* no hard links: a name is its file here (cp falls back to copying) */
+    case SYS_link:          ret = sys_linkat(AT_FDCWD, a1, AT_FDCWD, a2, 0); break;
+    case SYS_linkat:        ret = sys_linkat((long)a1, a2, (long)a3, a4, (long)a5); break;
     case SYS_readlink:      ret = sys_readlinkat(AT_FDCWD, a1, a2, a3); break;
     case SYS_readlinkat:    ret = sys_readlinkat((long)a1, a2, a3, a4); break;
     case SYS_dup:           ret = sys_dup((long)a1); break;
@@ -1192,6 +1387,8 @@ int syscall_dispatch(struct syscall_frame *f)
 #ifdef CONFIG_PIPES
     case SYS_pipe:          ret = sys_pipe2(a1, 0); break;
     case SYS_pipe2:         ret = sys_pipe2(a1, (long)a2); break;
+    case SYS_eventfd:       ret = sys_eventfd((unsigned int)a1, 0); break;
+    case SYS_eventfd2:      ret = sys_eventfd((unsigned int)a1, (int)a2); break;
 #endif
     case SYS_chmod: case SYS_fchmod: case SYS_fchmodat:
     case SYS_chown: case SYS_fchown: case SYS_fchownat: case SYS_lchown:

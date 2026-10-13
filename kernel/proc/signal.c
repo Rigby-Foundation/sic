@@ -80,8 +80,7 @@ void signal_exec(struct task *t)
 
 static int default_ignored(int sig)
 {
-    return sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT ||
-           sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU;
+    return sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH;
 }
 
 int task_send_signal(struct task *t, int sig)
@@ -90,6 +89,13 @@ int task_send_signal(struct task *t, int sig)
         return -EINVAL;
     if (!t->is_user)
         return -EPERM;
+    if (sig == SIGCONT) {
+        __atomic_fetch_and(&t->sig_pending, ~(BIT(SIGSTOP) | BIT(SIGTSTP) | BIT(SIGTTIN) | BIT(SIGTTOU)), __ATOMIC_SEQ_CST);
+        task_continue(t);
+    }
+    if (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU) {
+        __atomic_fetch_and(&t->sig_pending, ~BIT(SIGCONT), __ATOMIC_SEQ_CST);
+    }
     /* Ignored signals are discarded at send time (as on Linux), so they never
      * interrupt a sleep or a wait. */
     uint64_t h = ACT(t, sig).handler;
@@ -161,6 +167,10 @@ static void deliver(struct sigregs *r, uint64_t fault_addr)
 
         if (h == SIG_IGN || (h == SIG_DFL && default_ignored(sig)))
             continue;
+        if (h == SIG_DFL && (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU)) {
+            task_stop(t, sig);
+            continue;
+        }
         if (h == SIG_DFL) {
             kprintf("[%s (pid %u) terminated by signal %d]\n", t->name, t->tgid, sig);
             t->killed_sig = sig;
@@ -346,6 +356,11 @@ long sys_kill(long pid, int sig)
     if (pid > 0 || pid == 0) {
         /* A process is addressed by its thread group id: signal the leader. */
         struct task *t = pid == 0 ? task_find(self->tgid) : task_find((uint32_t)pid);
+        if (!t || !t->is_user || t->is_thread || t->state == TASK_ZOMBIE) return -ESRCH;
+        return sig ? task_send_signal(t, sig) : 0;
+    }
+    if (pid < -1) {
+        struct task *t = task_find((uint32_t)(-pid));
         if (!t || !t->is_user || t->is_thread || t->state == TASK_ZOMBIE) return -ESRCH;
         return sig ? task_send_signal(t, sig) : 0;
     }

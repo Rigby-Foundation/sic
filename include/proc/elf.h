@@ -8,12 +8,21 @@
 #define ARG_MAX   4096      /* argv + envp entries (each list) */
 #define ARG_BYTES (256 * 1024)   /* their strings: compilers and linkers get long command lines */
 
+struct argpack {
+    int    argc, envc;
+    char  *argv[ARG_MAX + 1];
+    char  *envp[ARG_MAX + 1];
+    char   data[ARG_BYTES];
+    size_t used;
+};
+
 /* Start `path` (an ELF in the VFS) as a new user process with stdio on the
  * console; used by the kernel to launch init. argv/envp may be NULL. */
 struct task *process_spawn(const char *path, const char *const argv[], const char *const envp[]);
 
 /* Replace the calling process's image. Only returns (with -errno) on failure. */
 long process_exec(const char *path, const char *const argv[], const char *const envp[]);
+long process_exec_ap(const char *path, struct argpack *ap);
 
 /* Duplicate the calling process; `f` is its syscall frame. Returns the
  * child's pid to the parent (the child sees 0 through its own frame). */

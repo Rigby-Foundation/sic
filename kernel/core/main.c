@@ -22,6 +22,7 @@
 #include "module.h"
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
+#include "drivers/pty.h"
 #include "drivers/virtio_gpu.h"
 #include "proc/sched.h"
 #include "mm/pmm.h"
@@ -161,6 +162,7 @@ void kernel_main(struct zaeboot_info *info)
     extern void mem_devices_init(void);
     mem_devices_init();             /* /dev/null, zero, full, random, urandom */
     shm_init();
+    pty_init();
 #ifdef CONFIG_FB_CONSOLE
     fb_dev_init();
 #endif

@@ -13,3 +13,6 @@ int  keyboard_get_mode(void);
 void keyboard_release(struct file *f);
 void     keyboard_set_foreground(uint32_t pid);
 uint32_t keyboard_get_foreground(void);
+struct abi_termios;
+int      keyboard_get_termios(struct abi_termios *tio);
+int      keyboard_set_termios(const struct abi_termios *tio);

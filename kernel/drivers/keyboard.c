@@ -58,6 +58,56 @@ static void push_char(char c)
     waitqueue_wake_all(&readers);
 }
 
+static struct abi_termios termios = {
+    .c_iflag = 0,
+    .c_oflag = 0,
+    .c_cflag = 0,
+#ifdef __powerpc__
+    .c_lflag = 0x00000080 | 0x00000100 | 0x00000008, /* ISIG | ICANON | ECHO */
+#else
+    .c_lflag = 0x01 | 0x02 | 0x08, /* ISIG | ICANON | ECHO */
+#endif
+};
+
+int keyboard_get_termios(struct abi_termios *tio)
+{
+    uint64_t f = spin_lock_irqsave(&kbd_lock);
+    *tio = termios;
+    spin_unlock_irqrestore(&kbd_lock, f);
+    return 0;
+}
+
+int keyboard_set_termios(const struct abi_termios *tio)
+{
+    uint64_t f = spin_lock_irqsave(&kbd_lock);
+    termios = *tio;
+    spin_unlock_irqrestore(&kbd_lock, f);
+    return 0;
+}
+
+static inline int is_canon(void)
+{
+#ifdef __powerpc__
+    return (termios.c_lflag & 0x00000100) != 0;
+#else
+    return (termios.c_lflag & 0x02) != 0;
+#endif
+}
+
+static inline int is_echo(void)
+{
+    return (termios.c_lflag & 0x08) != 0;
+}
+
+static inline int is_sig(void)
+{
+#ifdef __powerpc__
+    return (termios.c_lflag & 0x00000080) != 0;
+#else
+    return (termios.c_lflag & 0x01) != 0;
+#endif
+}
+
 #include "drivers/fb.h"
 
 /* Cooked input is line-edited here: typed characters collect in a line
@@ -70,11 +120,16 @@ static int line_len;
 static void cooked_char(char c, int echo)
 {
     if (fb_is_graphics_mode()) { push_char(c); return; }
-    if (c == '\b') {
-        if (line_len) { line_len--; kputc('\b'); }
+    if (!is_canon()) {
+        if (echo && is_echo()) kputc(c);
+        push_char(c);
         return;
     }
-    if (echo) kputc(c);
+    if (c == '\b') {
+        if (line_len) { line_len--; if (echo && is_echo()) kputc('\b'); }
+        return;
+    }
+    if (echo && is_echo()) kputc(c);
     if (line_len < (int)sizeof line) line[line_len++] = c;
     if (c == '\n' || line_len == (int)sizeof line) {
         for (int i = 0; i < line_len; i++) push_char(line[i]);
@@ -86,12 +141,21 @@ void keyboard_push_char(char c)
 {
     if (kbd_mode == K_RAW)                              /* serial input has no scancodes to offer */
         return;
-    if (c == 3) {                                       /* ^C from serial */
-        kputs("^C\n");
-        struct task *t = fg_pid ? task_find(fg_pid) : NULL;
-        if (t)
-            task_send_signal(t, SIGINT);
-        return;
+    if (is_sig()) {
+        if (c == 3) {                                       /* ^C from serial */
+            kputs("^C\n");
+            struct task *t = fg_pid ? task_find(fg_pid) : NULL;
+            if (t)
+                task_send_signal(t, SIGINT);
+            return;
+        }
+        if (c == 26) {                                      /* ^Z from serial */
+            kputs("^Z\n");
+            struct task *t = fg_pid ? task_find(fg_pid) : NULL;
+            if (t)
+                task_send_signal(t, SIGTSTP);
+            return;
+        }
     }
     cooked_char(c, 1);
 }
@@ -117,8 +181,10 @@ static void drain_serial(void)
     uint64_t f = spin_lock_irqsave(&serial_in_lock);
     int c;
     while ((c = serial_getc()) >= 0) {
-        if (c == '\r') c = '\n';
-        if (c == 0x7F) c = '\b';
+        if (is_canon()) {
+            if (c == '\r') c = '\n';
+            if (c == 0x7F) c = '\b';
+        }
         keyboard_push_char((char)c);
     }
     spin_unlock_irqrestore(&serial_in_lock, f);
@@ -190,6 +256,11 @@ void keyboard_release(struct file *f)
 {
     if (f == kbd_owner)
         keyboard_set_mode(NULL, K_XLATE);
+#ifdef __powerpc__
+    termios.c_lflag = 0x00000080 | 0x00000100 | 0x00000008;
+#else
+    termios.c_lflag = 0x01 | 0x02 | 0x08;
+#endif
 }
 
 static int e0;
@@ -234,12 +305,24 @@ void keyboard_scancode(uint8_t raw)
     char c = map_lower[sc];
     if (!c)
         return;
-    if (ctrl && c == 'c') {                             /* ^C -> SIGINT to the foreground process */
-        kputs("^C\n");
-        line_len = 0;
-        struct task *t = fg_pid ? task_find(fg_pid) : NULL;
-        if (t)
-            task_send_signal(t, SIGINT);
+    if (ctrl && c >= 'a' && c <= 'z') {
+        if (is_sig()) {
+            if (c == 'c') {                             /* ^C -> SIGINT to the foreground process */
+                kputs("^C\n");
+                line_len = 0;
+                struct task *t = fg_pid ? task_find(fg_pid) : NULL;
+                if (t) task_send_signal(t, SIGINT);
+                return;
+            }
+            if (c == 'z') {                             /* ^Z -> SIGTSTP to the foreground process */
+                kputs("^Z\n");
+                line_len = 0;
+                struct task *t = fg_pid ? task_find(fg_pid) : NULL;
+                if (t) task_send_signal(t, SIGTSTP);
+                return;
+            }
+        }
+        cooked_char(c - 'a' + 1, 0);
         return;
     }
     int upper = shift;

@@ -24,6 +24,12 @@
 #include "string.h"
 #include "printf.h"
 #include "abi/abi.h"
+#include "proc/signal.h"
+#ifdef CONFIG_KEYBOARD
+#include "drivers/keyboard.h"
+#endif
+
+extern void arch_reboot_mode(const char *mode);
 
 /* The clock controller (SM6115/KHAJE offsets). */
 #define GCC_USB30_PRIM_GDSC     0x1a004
@@ -212,7 +218,21 @@ static void rx_char(uint8_t c)
         if (rx_len) { rx_len--; tx_put((const uint8_t *)"\b \b", 3); }
         return;
     }
-    if (c == 0x03) { rx_len = 0; tx_put((const uint8_t *)"^C\n", 3); return; }
+    if (c == 0x03) {
+        rx_len = 0;
+        tx_put((const uint8_t *)"^C\n", 3);
+#ifdef CONFIG_KEYBOARD
+        uint32_t fg = keyboard_get_foreground();
+        struct task *t = fg ? task_find(fg) : NULL;
+        if (t) task_send_signal(t, SIGINT);
+#endif
+        return;
+    }
+    if (c == 0x02) { /* Ctrl+B: emergency reboot to bootloader */
+        tx_put((const uint8_t *)"^B [reboot bootloader]\n", 23);
+        arch_reboot_mode("bootloader");
+        return;
+    }
     if (c == '\n' || rx_len < sizeof rxline - 1) {
         rxline[rx_len++] = c;
         tx_put(&c, 1);

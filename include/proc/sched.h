@@ -9,7 +9,7 @@
 #include "mm/vmm.h"
 #include "asm/task.h"
 
-enum task_state { TASK_READY, TASK_RUNNING, TASK_SLEEPING, TASK_BLOCKED, TASK_ZOMBIE };
+enum task_state { TASK_READY, TASK_RUNNING, TASK_SLEEPING, TASK_BLOCKED, TASK_STOPPED, TASK_ZOMBIE };
 
 struct cpu;
 
@@ -35,6 +35,8 @@ struct task {
     uint64_t clear_child_tid;   /* CLONE_CHILD_CLEARTID / set_tid_address */
     volatile int group_exit;    /* the process is exiting: die at the next delivery point */
     int      killed_sig;        /* nonzero if terminated by a fault */
+    int      stop_sig;          /* signal that stopped the task */
+    int      stop_reported;     /* stopped state was reported to parent */
     /* the last TASK_TRACE system calls (number, first argument, result): printed when a fault kills the task */
 #define TASK_TRACE 16
     struct { uint16_t nr; unsigned long a1; long ret; } trace[TASK_TRACE];
@@ -85,6 +87,8 @@ int  task_alive(uint32_t id);
  * child's id and stores its exit code, 0 if children exist but none exited
  * yet, -1 if there are no children. */
 long task_collect_child(long pid, int *status);
+long task_collect_child_opts(long pid, int *status, int options);
+void task_reap_zombies(void);
 struct task *task_find(uint32_t id);    /* not locked: only for read-mostly use */
 /* Call fn for every task (under the scheduler lock; fn must not block). */
 void task_foreach(void (*fn)(struct task *t, void *arg), void *arg);
@@ -92,6 +96,8 @@ void task_foreach(void (*fn)(struct task *t, void *arg), void *arg);
 /* Block/wake: block puts the current task to sleep until task_wake() on it. */
 void task_block(void);
 void task_wake(struct task *t);
+void task_continue(struct task *t);
+void task_stop(struct task *t, int sig);
 
 /* Called from the timer interrupt and the IRQ epilogue respectively. */
 void sched_tick(void);
