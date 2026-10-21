@@ -89,6 +89,8 @@ long sys_rt_sigaction(int sig, uint64_t uact, uint64_t uoact, uint64_t setsize);
 long sys_rt_sigprocmask(int how, uint64_t uset, uint64_t uoset, uint64_t setsize);
 long sys_rt_sigpending(uint64_t uset, uint64_t setsize);
 long sys_rt_sigsuspend(uint64_t uset, uint64_t setsize);
+long sigmask_wait_begin(uint64_t uset, uint64_t setsize, uint64_t *old);
+void sigmask_wait_end(uint64_t old, long ret);
 long sys_rt_sigreturn(struct syscall_frame *f);
 long sys_kill(long pid, int sig);
 long sys_tkill(long tid, int sig);

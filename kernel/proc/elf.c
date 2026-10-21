@@ -53,9 +53,11 @@ struct elf_phdr {
 #endif
 
 #define PT_LOAD   1
+#define PT_INTERP 3
 #define PF_X      1
 #define PF_W      2
 #define ET_EXEC   2
+#define ET_DYN    3
 #define EM_X86_64 62
 #define EM_PPC    20
 #define EM_AARCH64 183
@@ -69,6 +71,14 @@ struct elf_phdr {
 typedef uintptr_t elf_word_t;           /* the size of a pointer on the initial stack */
 
 #define MMAP_BASE USER_MMAP_BASE
+/* Where a position-independent executable (ET_DYN) goes: where the static
+ * ones are linked, so the two kinds share one layout. The interpreter
+ * (PT_INTERP, musl's ld.so) goes at the start of the mmap area. */
+#if BITS_PER_LONG == 64
+#define PIE_BASE 0x8000000000UL
+#else
+#define PIE_BASE 0x10000000UL
+#endif
 
 
 /* ---- address-space helpers ------------------------------------------------- */
@@ -142,18 +152,32 @@ static int copy_to_space(uint64_t pgd, uint64_t virt, const void *src, size_t le
 struct image {
     uint64_t pgd, entry, brk;
     uint64_t phdr_addr, phnum, phent;     /* for auxv */
+    uint64_t start;                       /* where the thread begins: the entry, or the interpreter's */
+    uint64_t interp_base;                 /* AT_BASE: the interpreter's load address, 0 without one */
+    uint64_t mmap_next;                   /* the mmap area starts after the interpreter */
+    uint64_t arg_start, arg_end;          /* the argv strings, contiguous, argv[0] first */
     char exe[256];                        /* where the file is, absolute */
 };
 
-static int elf_load(struct image *im, struct vnode *n)
+/* One ELF object, as the kernel maps it: an executable, or the dynamic
+ * linker named by its PT_INTERP. */
+struct loaded {
+    uint64_t entry, phdr, phnum, top, bias;
+    char interp[128];                     /* PT_INTERP, or "" */
+};
+
+/* Map `n` into `pgd`. ET_EXEC goes where it is linked; ET_DYN is moved so
+ * its lowest segment starts at `dyn_base`. */
+static int load_object(uint64_t pgd, struct vnode *n, uint64_t dyn_base, struct loaded *lo)
 {
     uint64_t size = n->size;
     struct elf_ehdr eh;
+    memset(lo, 0, sizeof(*lo));
     if (size < sizeof(eh) || vfs_pread(n, &eh, sizeof(eh), 0) != (long)sizeof(eh))
         return -ENOEXEC;
     if (memcmp(eh.ident, "\x7f" "ELF", 4) != 0 || eh.ident[4] != ELFCLASS_NATIVE)
         return -ENOEXEC;
-    if (eh.machine != EM_NATIVE || eh.type != ET_EXEC)
+    if (eh.machine != EM_NATIVE || (eh.type != ET_EXEC && eh.type != ET_DYN))
         return -ENOEXEC;
     if (eh.ident[EI_OSABI] != ELFOSABI_SIC || eh.ident[EI_ABIVERSION] != 0) {
         kprintf("exec: not a sic executable (OS/ABI %u)\n", eh.ident[EI_OSABI]);
@@ -173,36 +197,59 @@ static int elf_load(struct image *im, struct vnode *n)
         return -ENOEXEC;
     }
 
+    /* The bias: 0 for ET_EXEC; for ET_DYN, what puts the lowest segment at dyn_base. */
+    uint64_t bias = 0, lo_vaddr = ~0ULL;
+    for (uint16_t i = 0; i < eh.phnum; i++)
+        if (ph[i].type == PT_LOAD && ph[i].memsz && PAGE_ALIGN_DOWN(ph[i].vaddr) < lo_vaddr)
+            lo_vaddr = PAGE_ALIGN_DOWN(ph[i].vaddr);
+    if (lo_vaddr == ~0ULL) {
+        kfree(ph);
+        return -ENOEXEC;
+    }
+    if (eh.type == ET_DYN)
+        bias = dyn_base - lo_vaddr;
+    uint64_t limit = eh.type == ET_DYN ? USER_STACK_TOP - USER_STACK_MAX - PAGE_SIZE : MMAP_BASE;
+
     uint64_t top = 0;
     int code = 0;
     for (uint16_t i = 0; i < eh.phnum; i++) {
+        if (ph[i].type == PT_INTERP) {
+            if (ph[i].filesz < 2 || ph[i].filesz > sizeof(lo->interp) || ph[i].offset + ph[i].filesz > size ||
+                vfs_pread(n, lo->interp, ph[i].filesz, ph[i].offset) != (long)ph[i].filesz) {
+                kfree(ph);
+                return -ENOEXEC;
+            }
+            lo->interp[sizeof(lo->interp) - 1] = 0;
+            continue;
+        }
         if (ph[i].type != PT_LOAD || ph[i].memsz == 0)
             continue;
         if (ph[i].offset + ph[i].filesz > size) {
             kfree(ph);
             return -ENOEXEC;
         }
-        if (ph[i].vaddr < USER_BASE || ph[i].vaddr + ph[i].memsz > MMAP_BASE) {
+        uint64_t seg = ph[i].vaddr + bias;
+        if (seg < USER_BASE || seg + ph[i].memsz > limit || seg + ph[i].memsz < seg) {
             kfree(ph);
             return -ENOEXEC;
         }
 
-        uint64_t start = PAGE_ALIGN_DOWN(ph[i].vaddr);
-        uint64_t end   = PAGE_ALIGN_UP(ph[i].vaddr + ph[i].memsz);
+        uint64_t start = PAGE_ALIGN_DOWN(seg);
+        uint64_t end   = PAGE_ALIGN_UP(seg + ph[i].memsz);
         uint64_t flags = 0;
         if (ph[i].flags & PF_W)   flags |= PTE_WRITE;
         if (!(ph[i].flags & PF_X)) flags |= PTE_NX;
 
-        if (map_zeroed(im->pgd, start, (end - start) / PAGE_SIZE, flags) != 0) {
+        if (map_zeroed(pgd, start, (end - start) / PAGE_SIZE, flags) != 0) {
             kfree(ph);
             return -ENOMEM;
         }
 
         uint64_t file_off = ph[i].offset;
-        uint64_t vaddr = ph[i].vaddr;
+        uint64_t vaddr = seg;
         size_t remaining = ph[i].filesz;
         while (remaining > 0) {
-            uint64_t phys = vmm_translate_in(im->pgd, vaddr);
+            uint64_t phys = vmm_translate_in(pgd, vaddr);
             if (!phys) {
                 kfree(ph);
                 return -ENOMEM;
@@ -224,7 +271,7 @@ static int elf_load(struct image *im, struct vnode *n)
             /* the frames may have held another program's code: make the
              * new code what instruction fetches see */
             for (uint64_t va = start; va < end; va += PAGE_SIZE) {
-                uint64_t pa = vmm_translate_in(im->pgd, va);
+                uint64_t pa = vmm_translate_in(pgd, va);
                 if (pa) arch_dcache_clean(P2V(pa & ~(uint64_t)(PAGE_SIZE - 1)), PAGE_SIZE);
             }
             code = 1;
@@ -237,29 +284,67 @@ static int elf_load(struct image *im, struct vnode *n)
     /* AT_PHDR must be where the program headers really are in memory: the
      * libc derives the load base from it (AT_PHDR - PT_PHDR.p_vaddr) and
      * finds PT_TLS through it. Normally the first PT_LOAD covers them. */
-    size_t phbytes_req = (size_t)eh.phnum * sizeof(struct elf_phdr);
     uint64_t phdr_addr = 0;
     for (uint16_t i = 0; i < eh.phnum; i++)
         if (ph[i].type == PT_LOAD && ph[i].offset <= eh.phoff &&
-            eh.phoff + phbytes_req <= ph[i].offset + ph[i].filesz)
-            phdr_addr = ph[i].vaddr + (eh.phoff - ph[i].offset);
+            eh.phoff + phbytes <= ph[i].offset + ph[i].filesz)
+            phdr_addr = ph[i].vaddr + bias + (eh.phoff - ph[i].offset);
     if (!phdr_addr) {
         /* Not loaded: give the libc a private copy after the image. */
         phdr_addr = top + PAGE_SIZE;
-        if (map_zeroed(im->pgd, phdr_addr, PAGE_ALIGN_UP(phbytes_req) / PAGE_SIZE, PTE_NX) != 0 ||
-            copy_to_space(im->pgd, phdr_addr, ph, phbytes_req) != 0) {
+        if (map_zeroed(pgd, phdr_addr, PAGE_ALIGN_UP(phbytes) / PAGE_SIZE, PTE_NX) != 0 ||
+            copy_to_space(pgd, phdr_addr, ph, phbytes) != 0) {
             kfree(ph);
             return -ENOMEM;
         }
-        top = phdr_addr + PAGE_ALIGN_UP(phbytes_req);
+        top = phdr_addr + PAGE_ALIGN_UP(phbytes);
     }
 
-    im->entry = eh.entry;
-    im->phdr_addr = phdr_addr;
-    im->phnum = eh.phnum;
-    im->phent = sizeof(struct elf_phdr);
-    im->brk = top + PAGE_SIZE;                              /* guard page, then the heap */
+    lo->entry = eh.entry + bias;
+    lo->phdr = phdr_addr;
+    lo->phnum = eh.phnum;
+    lo->top = top;
+    lo->bias = bias;
     kfree(ph);
+    return 0;
+}
+
+/* The program, and its dynamic linker if it names one (PT_INTERP): the
+ * thread starts in the linker, which finds the program through AT_PHDR,
+ * AT_ENTRY and its own load address in AT_BASE. */
+static int elf_load(struct image *im, struct vnode *n)
+{
+    struct loaded prog;
+    int rc = load_object(im->pgd, n, PIE_BASE, &prog);
+    if (rc != 0)
+        return rc;
+    im->entry = prog.entry;
+    im->phdr_addr = prog.phdr;
+    im->phnum = prog.phnum;
+    im->phent = sizeof(struct elf_phdr);
+    im->brk = prog.top + PAGE_SIZE;                         /* guard page, then the heap */
+    im->start = prog.entry;
+    im->interp_base = 0;
+    im->mmap_next = MMAP_BASE;
+    if (!prog.interp[0])
+        return 0;
+
+    struct vnode *ld = vfs_lookup(task_current()->cwd, prog.interp);
+    if (!ld || ld->type != VNODE_FILE) {
+        kprintf("exec: %s: no dynamic linker %s\n", im->exe, prog.interp);
+        return -ENOENT;
+    }
+    struct loaded interp;
+    rc = load_object(im->pgd, ld, MMAP_BASE, &interp);
+    if (rc != 0)
+        return rc;
+    if (interp.interp[0] || interp.bias == 0) {             /* a linker must be ET_DYN and need none */
+        kprintf("exec: %s: %s is not a dynamic linker\n", im->exe, prog.interp);
+        return -ENOEXEC;
+    }
+    im->start = interp.entry;
+    im->interp_base = interp.bias;
+    im->mmap_next = interp.top + PAGE_SIZE;
     return 0;
 }
 
@@ -316,7 +401,12 @@ static int build_stack(const struct image *im, const struct argpack *ap, uint64_
 
 #define PUSH_BYTES(src, len) do { sp -= (len); if (copy_to_space(im->pgd, sp, (src), (len)) != 0) goto out; } while (0)
     for (int i = 0; i < ap->envc; i++) { PUSH_BYTES(ap->envp[i], strlen(ap->envp[i]) + 1); envp_ptrs[i] = (elf_word_t)sp; }
-    for (int i = 0; i < ap->argc; i++) { PUSH_BYTES(ap->argv[i], strlen(ap->argv[i]) + 1); argv_ptrs[i] = (elf_word_t)sp; }
+    /* argv last-to-first, so the strings lie in order (argv[0] lowest) as one
+     * block, like Linux's: /proc/<pid>/cmdline is that block. */
+    uint64_t args_hi = sp;
+    for (int i = ap->argc - 1; i >= 0; i--) { PUSH_BYTES(ap->argv[i], strlen(ap->argv[i]) + 1); argv_ptrs[i] = (elf_word_t)sp; }
+    ((struct image *)im)->arg_start = sp;
+    ((struct image *)im)->arg_end = args_hi;
     argv_ptrs[ap->argc] = 0;
     envp_ptrs[ap->envc] = 0;
 
@@ -330,6 +420,7 @@ static int build_stack(const struct image *im, const struct argpack *ap, uint64_
         AT_PHENT,  (elf_word_t)im->phent,
         AT_PHNUM,  (elf_word_t)im->phnum,
         AT_PAGESZ, PAGE_SIZE,
+        AT_BASE,   (elf_word_t)im->interp_base,
         AT_ENTRY,  (elf_word_t)im->entry,
         AT_UID, 0, AT_EUID, 0, AT_GID, 0, AT_EGID, 0,
         AT_SECURE, 0,
@@ -404,7 +495,9 @@ static struct mm *apply_image(struct task *t, const struct image *im)
     if (!mm)
         return NULL;
     mm->brk_start = mm->brk_end = im->brk;
-    mm->mmap_next = MMAP_BASE;
+    mm->mmap_next = im->mmap_next;
+    mm->arg_start = im->arg_start;
+    mm->arg_end = im->arg_end;
     memcpy(mm->exe, im->exe, sizeof(mm->exe));
     struct mm *old = t->mm;
     t->mm = mm;
@@ -447,7 +540,7 @@ struct task *process_spawn(const char *path, const char *const argv[], const cha
         kfree(sa);
         return NULL;
     }
-    sa->entry = im.entry;
+    sa->entry = im.start;
 
     struct task *t = task_alloc(path, spawn_thunk, sa);
     if (!t) {
@@ -592,7 +685,7 @@ long process_exec_ap(const char *path, struct argpack *ap)
     fdt_close_on_exec(t->fdt);
     arch_task_init_user(t);
     mm_put(old);
-    arch_exec_enter(t, im.entry, rsp);
+    arch_exec_enter(t, im.start, rsp);
 }
 
 long process_exec(const char *path, const char *const argv[], const char *const envp[])
@@ -614,7 +707,9 @@ long process_exec(const char *path, const char *const argv[], const char *const 
 /* ---- fork --------------------------------------------------------------------------- */
 
 
-long process_fork(struct syscall_frame *f)
+/* fork, the child resuming on `stack` instead of the parent's stack pointer
+ * when it is non-zero (a clone(CLONE_VM) process, see process_clone). */
+static long process_fork_on(struct syscall_frame *f, uint64_t stack)
 {
     struct task *parent = task_current();
 
@@ -634,10 +729,12 @@ long process_fork(struct syscall_frame *f)
     mm->brk_start = parent->mm->brk_start;
     mm->brk_end = parent->mm->brk_end;
     mm->mmap_next = parent->mm->mmap_next;
+    mm->arg_start = parent->mm->arg_start;
+    mm->arg_end = parent->mm->arg_end;
     memcpy(mm->exe, parent->mm->exe, sizeof(mm->exe));
     spin_unlock(&parent->mm->lock);
 
-    arch_task_fork(child, parent, f, 0, 0);
+    arch_task_fork(child, parent, f, stack, 0);
     child->mm = mm;
     child->pgd = pgd;
     child->fdt = fdt;
@@ -648,6 +745,11 @@ long process_fork(struct syscall_frame *f)
 
     task_start(child);
     return child->id;
+}
+
+long process_fork(struct syscall_frame *f)
+{
+    return process_fork_on(f, 0);
 }
 
 /* ---- clone (threads) ---------------------------------------------------------------- */
@@ -667,8 +769,15 @@ long process_clone(struct syscall_frame *f, uint64_t flags, uint64_t stack, uint
     struct task *parent = task_current();
     if (!(flags & CLONE_VM))
         return process_fork(f);         /* plain clone(SIGCHLD) is fork */
-    if (!(flags & CLONE_THREAD) || !stack)
-        return -EINVAL;                 /* shared-VM non-thread clones: not supported */
+    if (!stack)
+        return -EINVAL;
+    /* A shared-VM process, not a thread: what musl's posix_spawn (and so
+     * clang starting the linker) does, CLONE_VM|CLONE_VFORK, to run a stub on
+     * `stack` that execs. Like vfork, a copy-on-write fork resumed on that
+     * stack is a valid stand-in: the stub only reads what the parent set up
+     * and reports back through a pipe, never through the shared memory. */
+    if (!(flags & CLONE_THREAD))
+        return process_fork_on(f, stack);
 
     struct task *t = task_alloc(parent->name, NULL, NULL);
     if (!t)
@@ -700,4 +809,44 @@ long process_clone(struct syscall_frame *f, uint64_t flags, uint64_t stack, uint
         vmm_translate_in(parent->mm->pgd, ctid))
         *(volatile uint32_t *)ctid = t->id;
     return t->id;
+}
+
+
+/* ---- for /proc ------------------------------------------------------------------ */
+
+/* Copy up to `len` bytes at `virt` in another address space (through the
+ * direct map); stops at the first unmapped page. Returns the bytes copied. */
+size_t process_read_mem(struct mm *mm, uint64_t virt, void *buf, size_t len)
+{
+    size_t done = 0;
+    while (done < len) {
+        uint64_t phys = vmm_translate_in(mm->pgd, virt + done);
+        if (!phys) break;
+        size_t chunk = PAGE_SIZE - ((virt + done) & 0xFFF);
+        if (chunk > len - done) chunk = len - done;
+        memcpy((uint8_t *)buf + done, P2V(phys), chunk);
+        done += chunk;
+    }
+    return done;
+}
+
+static uint64_t count_present(struct mm *mm, uint64_t lo, uint64_t hi)
+{
+    uint64_t n = 0;
+    if (hi > lo + (8ULL << 30)) hi = lo + (8ULL << 30);     /* a sanity bound on the walk */
+    for (uint64_t va = lo & ~(uint64_t)(PAGE_SIZE - 1); va < hi; va += PAGE_SIZE)
+        if (vmm_translate_in(mm->pgd, va)) n++;
+    return n;
+}
+
+/* Resident pages and address-space size, over the regions a process uses:
+ * image and heap, the mmap area (libraries, mappings), the stack. */
+void process_mem_stats(struct mm *mm, uint64_t *resident, uint64_t *size)
+{
+    uint64_t image_lo = PIE_BASE, heap_hi = mm->brk_end > image_lo ? mm->brk_end : image_lo;
+    uint64_t mmap_hi = mm->mmap_next > MMAP_BASE ? mm->mmap_next : MMAP_BASE;
+    *resident = count_present(mm, image_lo, heap_hi)
+              + count_present(mm, MMAP_BASE, mmap_hi)
+              + count_present(mm, USER_STACK_TOP - USER_STACK_MAX, USER_STACK_TOP);
+    *size = (heap_hi - image_lo) + (mmap_hi - MMAP_BASE) + USER_STACK_SIZE;
 }

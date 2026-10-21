@@ -141,6 +141,7 @@ void kernel_main(struct zaeboot_info *info)
     vfs_init();
     vfs_create(vfs_root(), "/dev", VNODE_DIR);
     vfs_create(vfs_root(), "/proc", VNODE_DIR);
+    procfs_init();
     vfs_mkdev("/proc/kmsg", &kmsg_ops, NULL);   /* the kernel log, for dmesg over a remote shell */
     vfs_create(vfs_root(), "/tmp", VNODE_DIR);
     vfs_create(vfs_root(), "/mnt", VNODE_DIR);

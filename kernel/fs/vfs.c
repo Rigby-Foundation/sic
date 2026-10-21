@@ -548,10 +548,10 @@ void file_close(struct file *f)
         } else {
             if (n && n->type == VNODE_DEV && n->dev && n->dev->release)
                 n->dev->release(f);
-            else if (n && n->ops && n->ops->sync)
-                n->ops->sync(n);
             if (n) {
                 spin_lock(&vfs_lock);
+                if (n->type != VNODE_DEV && n->ops && n->ops->sync)
+                    n->ops->sync(n);
                 if (__atomic_sub_fetch(&n->open_count, 1, __ATOMIC_SEQ_CST) == 0 && n->unlinked) {
                     if (n->ops && n->ops->release)
                         n->ops->release(n);
@@ -677,6 +677,26 @@ int file_poll(struct file *f, struct waitqueue **wq)
     if (n->type == VNODE_DEV && n->dev && n->dev->poll)
         return n->dev->poll(f, wq);
     return POLLIN | POLLOUT;
+}
+
+/* A disk filesystem's inode and block cache are shared by every CPU: what
+ * reaches them goes through vfs_lock, these two included. */
+int vfs_sync(struct vnode *n)
+{
+    if (!n->ops || !n->ops->sync) return 0;
+    spin_lock(&vfs_lock);
+    int r = n->ops->sync(n);
+    spin_unlock(&vfs_lock);
+    return r;
+}
+
+int vfs_truncate(struct vnode *n, uint64_t len)
+{
+    if (!n->ops || !n->ops->truncate) return -1;
+    spin_lock(&vfs_lock);
+    int r = n->ops->truncate(n, len);
+    spin_unlock(&vfs_lock);
+    return r;
 }
 
 int file_readdir(struct file *f, uint64_t *pos, struct dirent *out)

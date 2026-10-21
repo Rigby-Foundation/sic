@@ -287,6 +287,7 @@ struct abi_utsname { char sysname[65], nodename[65], release[65], version[65], m
 #define AT_PHENT  4
 #define AT_PHNUM  5
 #define AT_PAGESZ 6
+#define AT_BASE   7
 #define AT_ENTRY  9
 #define AT_UID    11
 #define AT_EUID   12
@@ -337,6 +338,7 @@ struct abi_pollfd { int32_t fd; int16_t events; int16_t revents; };
 #define SOCK_STREAM   1
 #define SOCK_DGRAM    2
 #define SOCK_RAW      3
+#define SOCK_SEQPACKET 5
 #define SOCK_TYPE_MASK 0xF
 #define SOCK_NONBLOCK 04000
 #define SOCK_CLOEXEC  02000000

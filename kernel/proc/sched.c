@@ -5,6 +5,7 @@
 #include "proc/sched.h"
 #include "asm/cpu.h"
 #include "mm/heap.h"
+#include "proc/mm.h"
 #ifdef CONFIG_NET
 #include "net/net.h"
 #endif
@@ -236,10 +237,14 @@ struct task *task_alloc_reserve(const char *name, task_entry_t entry, void *arg,
     return t;
 }
 
+static uint64_t forks;                       /* tasks ever started (/proc/stat "processes") */
+
 void task_start(struct task *t)
 {
     uint64_t f = spin_lock_irqsave(&sched_lock);
     t->id = next_id++;
+    t->start_tick = timer_ticks();
+    forks++;
     if (!t->is_thread)
         t->tgid = t->id;
     t->next = all_tasks;
@@ -632,3 +637,161 @@ void sched_dump(void)
 }
 
 void sched_dump_request(void) { dump_requested = 1; }
+
+
+/* ---- accounting and introspection (/proc, sysinfo) ------------------------- */
+
+static uint64_t cpu_user[MAX_CPUS], cpu_sys[MAX_CPUS], cpu_idle[MAX_CPUS];
+
+/* Load average as Linux keeps it: exponentially decayed counts of runnable
+ * tasks, sampled every 5 s, fixed point with 11 fraction bits. */
+#define FSHIFT  11
+#define FIXED_1 (1UL << FSHIFT)
+static unsigned long loadavg[3];
+static const unsigned long load_exp[3] = { 1884, 2014, 2037 };   /* 1, 5, 15 minutes */
+
+/* Timer tick on every CPU, with whether it interrupted user mode. */
+void sched_account(int user_mode)
+{
+    if (!started)
+        return;
+    struct cpu *c = this_cpu();
+    uint32_t i = c->index < MAX_CPUS ? c->index : 0;
+    spin_lock(&sched_lock);
+    struct task *t = CUR;
+    if (is_idle(t))
+        cpu_idle[i]++;
+    else if (user_mode) {
+        cpu_user[i]++;
+        t->utime++;
+    } else {
+        cpu_sys[i]++;
+        t->stime++;
+    }
+    if (i == 0 && timer_ticks() % (5 * TIMER_HZ) == 0) {
+        unsigned long n = 0;
+        for (struct task *u = all_tasks; u; u = u->next)
+            if ((u->state == TASK_RUNNING || u->state == TASK_READY) && !is_idle(u) && u->is_user)
+                n++;
+        for (int k = 0; k < 3; k++)
+            loadavg[k] = (loadavg[k] * load_exp[k] + n * FIXED_1 * (FIXED_1 - load_exp[k])) >> FSHIFT;
+    }
+    spin_unlock(&sched_lock);
+}
+
+static char state_char(const struct task *t)
+{
+    switch (t->state) {
+    case TASK_READY: case TASK_RUNNING: return 'R';
+    case TASK_SLEEPING: case TASK_BLOCKED: return 'S';
+    case TASK_STOPPED: return 'T';
+    case TASK_ZOMBIE: return 'Z';
+    }
+    return 'S';
+}
+
+/* sched_lock held: the process `leader` with its threads folded in. */
+static void fill_info(const struct task *leader, struct proc_info *o)
+{
+    memset(o, 0, sizeof(*o));
+    o->pid = leader->tgid;
+    o->ppid = leader->parent_id;
+    memcpy(o->name, leader->name, sizeof(o->name));
+    o->name[sizeof(o->name) - 1] = 0;
+    o->state = state_char(leader);
+    o->start_tick = leader->start_tick;
+    for (struct task *t = all_tasks; t; t = t->next) {
+        if (!t->is_user || t->tgid != leader->tgid || t->reaped)
+            continue;
+        o->utime += t->utime;
+        o->stime += t->stime;
+        o->threads++;
+        if (state_char(t) == 'R')
+            o->state = 'R';                 /* any thread running makes the process running */
+    }
+}
+
+static int is_process(const struct task *t)
+{
+    return t->is_user && !t->is_thread && !t->reaped && t->tgid == t->id;
+}
+
+int sched_proc_list(struct proc_info *out, int max)
+{
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    int n = 0;
+    for (struct task *t = all_tasks; t && n < max; t = t->next)
+        if (is_process(t))
+            fill_info(t, &out[n++]);
+    spin_unlock_irqrestore(&sched_lock, f);
+    return n;
+}
+
+int sched_proc_get(uint32_t pid, struct proc_info *out)
+{
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    int rc = -1;
+    for (struct task *t = all_tasks; t; t = t->next)
+        if (t->id == pid && is_process(t)) {
+            fill_info(t, out);
+            rc = 0;
+            break;
+        }
+    spin_unlock_irqrestore(&sched_lock, f);
+    return rc;
+}
+
+struct mm *sched_proc_mm(uint32_t pid)
+{
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    struct mm *mm = NULL;
+    for (struct task *t = all_tasks; t; t = t->next)
+        if (t->id == pid && is_process(t) && t->mm && t->state != TASK_ZOMBIE) {
+            mm = mm_get(t->mm);
+            break;
+        }
+    spin_unlock_irqrestore(&sched_lock, f);
+    return mm;
+}
+
+int sched_vnode_is_cwd(const struct vnode *n)
+{
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    int used = 0;
+    for (struct task *t = all_tasks; t && !used; t = t->next)
+        used = t->cwd == n;
+    spin_unlock_irqrestore(&sched_lock, f);
+    return used;
+}
+
+void sched_cpu_times(struct cpu_times *out, int ncpu)
+{
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    for (int i = 0; i < ncpu && i < MAX_CPUS; i++) {
+        out[i].user = cpu_user[i];
+        out[i].system = cpu_sys[i];
+        out[i].idle = cpu_idle[i];
+    }
+    spin_unlock_irqrestore(&sched_lock, f);
+}
+
+void sched_loadavg(unsigned long avg[3])
+{
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    for (int k = 0; k < 3; k++) avg[k] = loadavg[k];
+    spin_unlock_irqrestore(&sched_lock, f);
+}
+
+int sched_nr_running(void)
+{
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    int n = 0;
+    for (struct task *t = all_tasks; t; t = t->next)
+        if ((t->state == TASK_RUNNING || t->state == TASK_READY) && t->is_user && !is_idle(t))
+            n++;
+    spin_unlock_irqrestore(&sched_lock, f);
+    return n;
+}
+
+uint32_t sched_last_pid(void) { return next_id ? next_id - 1 : 0; }
+uint64_t sched_forks(void) { return forks; }

@@ -37,3 +37,7 @@ int  process_grow_stack(struct task *t, uint64_t addr);   /* demand-grow the use
 int  process_map_anon(struct task *t, uint64_t virt, size_t pages, int prot);
 int  process_protect(struct task *t, uint64_t virt, size_t pages, int prot);
 void process_unmap(struct task *t, uint64_t virt, size_t pages);
+/* For /proc: another process's memory, and its resident/total size in pages/bytes. */
+struct mm;
+size_t process_read_mem(struct mm *mm, uint64_t virt, void *buf, size_t len);
+void   process_mem_stats(struct mm *mm, uint64_t *resident_pages, uint64_t *size_bytes);

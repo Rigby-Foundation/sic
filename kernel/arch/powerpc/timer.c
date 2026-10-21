@@ -33,6 +33,7 @@ void ppc_decrementer(struct interrupt_frame *f)
     mtdec(dec_reload);
     ticks++;
     prof_tick(f);
+    sched_account(FRAME_FROM_USER(f));         /* user/system/idle time for /proc */
     sched_tick();
     sched_preempt();
 }

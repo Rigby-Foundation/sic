@@ -127,6 +127,7 @@ int pipe_create(struct file **rd, struct file **wr)
     struct pipe *p = kzalloc(sizeof(*p));
     struct vnode *n = vnode_alloc("pipe", 4, VNODE_DEV, NULL);
     struct file *r = kzalloc(sizeof(*r)), *w = kzalloc(sizeof(*w));
+    if (n) n->is_fifo = 1;            /* fstat: S_IFIFO (make's and cargo's jobserver check) */
     if (!p || !n || !r || !w || !(p->buf = kmalloc(PIPE_SIZE))) {
         if (p) kfree(p->buf);
         kfree(p); kfree(n); kfree(r); kfree(w);

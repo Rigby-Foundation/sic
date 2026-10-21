@@ -58,6 +58,8 @@ struct vnode {
     void    *priv;                  /* filesystem private data (tmpfs buffer, on-disk inode, ...) */
     int      is_block;              /* VNODE_DEV backed by a block device */
     int      is_sock;               /* VNODE_DEV that is a socket (priv = struct socket) */
+    int      is_fifo;               /* VNODE_DEV that is a pipe: stat says S_IFIFO */
+    int      is_proc;               /* VNODE_DEV that is a /proc text file: stat says S_IFREG */
     int      seekable;              /* VNODE_DEV with a position (framebuffer, initrd) */
     int      open_count;            /* open file handles referencing this vnode */
     int      unlinked;              /* unlinked while open */
@@ -77,10 +79,12 @@ struct vfs_mount {
 
 /* A filesystem driver. `mount` gets the device vnode (may be NULL for
  * memory filesystems) and returns the root vnode, or NULL. */
+struct fs_stats { uint64_t bsize, blocks, bfree, files, ffree; uint32_t magic; };
 struct fs_type {
     const char *name;
     struct vnode *(*mount)(struct vfs_mount *mnt, struct vnode *dev, const char *opts);
     int (*unmount)(struct vfs_mount *mnt);
+    void (*statfs)(struct vfs_mount *mnt, struct fs_stats *out);   /* optional: space and inodes (statfs) */
     struct fs_type *next;
 };
 
@@ -124,6 +128,7 @@ struct dirent {
 };
 
 void          vfs_init(void);
+void          procfs_init(void);          /* fs/procfs.c: the Linux-format files in /proc */
 struct vnode *vfs_root(void);
 
 /* Filesystem drivers and mounting. */
@@ -150,6 +155,8 @@ int           vfs_path_of(struct vnode *n, char *buf, size_t len);
 void          vfs_load_tar(const void *tar, size_t size);
 uint64_t      vfs_now_ms(void);                 /* the date, for file times */
 void          vfs_touch(struct vnode *n);       /* contents changed: mtime and ctime = now */
+int           vfs_sync(struct vnode *n);        /* the filesystem's copy of the inode, under the lock */
+int           vfs_truncate(struct vnode *n, uint64_t len);
 
 /* File objects (refcounted, shared across fork). */
 struct file  *vfs_open(struct vnode *cwd, const char *path, int flags);

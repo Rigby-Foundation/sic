@@ -375,8 +375,18 @@ static int zaefs_truncate(struct vnode *n, uint64_t size)
 {
     struct zinode *zi = zi_of(n);
     if (!zi) return -1;
-    if (size != 0)
-        return -1;              /* only truncate-to-zero for now */
+    if (size != 0) {
+        /* Growing: the new range is a hole, and holes read as zeros (no
+         * blocks until written). This is how linkers size their output
+         * before filling it. Shrinking to a non-zero size is not supported
+         * yet (it would have to free the tail blocks). */
+        if (size < zi->di.size)
+            return -1;
+        zi->di.size = size;
+        n->size = size;
+        zi->dirty = 1;
+        return zi_flush(n);
+    }
     free_all_blocks(fs_of(n), zi);
     zi->di.size = 0;
     n->size = 0;
@@ -743,4 +753,10 @@ static int zaefs_unmount(struct vfs_mount *mnt)
     return 0;
 }
 
-struct fs_type zaefs_type = { .name = "zaefs", .mount = zaefs_mount, .unmount = zaefs_unmount };
+static void zaefs_statfs(struct vfs_mount *mnt, struct fs_stats *out)
+{
+    struct zaefs *fs = mnt->priv;
+    *out = (struct fs_stats){ BS, fs->sb.total_blocks, fs->sb.free_blocks, fs->sb.inode_count, fs->sb.free_inodes, 0x7a414546 };
+}
+
+struct fs_type zaefs_type = { .name = "zaefs", .mount = zaefs_mount, .unmount = zaefs_unmount, .statfs = zaefs_statfs };

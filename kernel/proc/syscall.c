@@ -278,7 +278,7 @@ static void fill_stat(struct vnode *n, struct abi_stat *st)
     st->st_nlink = vfs_nlink(n);
     st->st_mode = n->type == VNODE_DIR ? S_IFDIR | 0755
                 : n->type == VNODE_LINK ? S_IFLNK | 0777
-                : n->type == VNODE_DEV ? (n->is_block ? S_IFBLK : n->is_sock ? S_IFSOCK : S_IFCHR) | 0666
+                : n->type == VNODE_DEV ? (n->is_block ? S_IFBLK : n->is_sock ? S_IFSOCK : n->is_fifo ? S_IFIFO : n->is_proc ? S_IFREG : S_IFCHR) | (n->is_proc ? 0444 : 0666)
                 : S_IFREG | 0755;
     st->st_size = (int64_t)n->size;
     st->st_blksize = 4096;
@@ -325,7 +325,7 @@ static long sys_utimensat(long dirfd, uint64_t upath, uint64_t utimes, long flag
         n->mtime_ms = nsec == UTIME_NOW ? now : (uint64_t)t[1].tv_sec * 1000 + (uint64_t)nsec / 1000000;
     }
     n->ctime_ms = now;
-    if (n->ops && n->ops->sync) n->ops->sync(n);  /* a disk filesystem keeps them */
+    vfs_sync(n);                                  /* a disk filesystem keeps them */
     return 0;
 }
 
@@ -335,7 +335,7 @@ static long do_truncate(struct vnode *n, long len)
     if (len < 0) return -EINVAL;
     if (n->type == VNODE_DIR) return -EISDIR;
     if (n->type != VNODE_FILE || !n->ops || !n->ops->truncate) return -EINVAL;
-    if (n->ops->truncate(n, (uint64_t)len) != 0) return -EIO;
+    if (vfs_truncate(n, (uint64_t)len) != 0) return -EIO;
     vfs_touch(n);
     return 0;
 }
@@ -361,6 +361,48 @@ static long sys_newfstatat(long dirfd, uint64_t upath, uint64_t ust, long flags)
     }
     fill_stat(n, (struct abi_stat *)ust);
     return 0;
+}
+
+/* Linux's struct statfs (LP64). Filesystems without numbers report zeros. */
+struct abi_statfs {
+    int64_t  f_type, f_bsize;
+    uint64_t f_blocks, f_bfree, f_bavail, f_files, f_ffree;
+    int32_t  f_fsid[2];
+    int64_t  f_namelen, f_frsize, f_flags, f_spare[4];
+};
+
+static long fill_statfs(struct vnode *n, uint64_t ubuf)
+{
+    if (!user_ok(ubuf, sizeof(struct abi_statfs))) return -EFAULT;
+    struct fs_stats fs = { 4096, 0, 0, 0, 0, 0x01021994 };     /* tmpfs's magic */
+    if (n->mnt && n->mnt->type && n->mnt->type->statfs) n->mnt->type->statfs(n->mnt, &fs);
+    struct abi_statfs *st = (void *)ubuf;
+    memset(st, 0, sizeof(*st));
+    st->f_type = fs.magic;
+    st->f_bsize = st->f_frsize = (int64_t)fs.bsize;
+    st->f_blocks = fs.blocks;
+    st->f_bfree = st->f_bavail = fs.bfree;
+    st->f_files = fs.files;
+    st->f_ffree = fs.ffree;
+    st->f_namelen = VFS_NAME_MAX - 1;
+    return 0;
+}
+
+static long sys_statfs(uint64_t upath, uint64_t ubuf)
+{
+    char path[VFS_PATH_MAX];
+    long rc = user_str(upath, path, sizeof(path));
+    if (rc) return rc;
+    struct vnode *n = vfs_lookup(task_current()->cwd, path);
+    if (!n) return -ENOENT;
+    return fill_statfs(n, ubuf);
+}
+
+static long sys_fstatfs(long fd, uint64_t ubuf)
+{
+    struct file *f = fd_get(fd);
+    if (!f) return -EBADF;
+    return fill_statfs(f->node, ubuf);
 }
 
 static long sys_fstat(long fd, uint64_t ust)
@@ -762,7 +804,7 @@ static long sys_poll(uint64_t ufds, long n, long timeout_ms)
     return do_poll((struct abi_pollfd *)ufds, (int)n, timeout_ms);
 }
 
-static long sys_ppoll(uint64_t ufds, long n, uint64_t uts)
+static long sys_ppoll(uint64_t ufds, long n, uint64_t uts, uint64_t usigmask, uint64_t sigsetsize)
 {
     long timeout = -1;
     if (uts) {
@@ -770,7 +812,14 @@ static long sys_ppoll(uint64_t ufds, long n, uint64_t uts)
         const struct abi_timespec *ts = (const void *)uts;
         timeout = ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
     }
-    return sys_poll(ufds, n, timeout);
+    if (!usigmask)
+        return sys_poll(ufds, n, timeout);
+    uint64_t old;
+    long ret = sigmask_wait_begin(usigmask, sigsetsize, &old);
+    if (ret) return ret;
+    ret = sys_poll(ufds, n, timeout);
+    sigmask_wait_end(old, ret);
+    return ret;
 }
 
 /* select on top of poll: fd_sets in, fd_sets out; timeout in ms, -1 = forever. */
@@ -809,7 +858,7 @@ static long do_select(long n, uint64_t urd, uint64_t uwr, uint64_t uex, long tim
     return total;
 }
 
-static long sys_pselect6(long n, uint64_t urd, uint64_t uwr, uint64_t uex, uint64_t uts)
+static long sys_pselect6(long n, uint64_t urd, uint64_t uwr, uint64_t uex, uint64_t uts, uint64_t usig)
 {
     long timeout = -1;
     if (uts) {
@@ -817,7 +866,22 @@ static long sys_pselect6(long n, uint64_t urd, uint64_t uwr, uint64_t uex, uint6
         const struct abi_timespec *ts = (const void *)uts;
         timeout = ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
     }
-    return do_select(n, urd, uwr, uex, timeout);
+    /* The sixth argument is { const sigset_t *set; size_t size; }, two longs. */
+    uint64_t uset = 0, setsize = 0;
+    if (usig) {
+        if (!user_ok(usig, 2 * sizeof(long))) return -EFAULT;
+        const unsigned long *w = (const void *)(uintptr_t)usig;
+        uset = w[0];
+        setsize = w[1];
+    }
+    if (!uset)
+        return do_select(n, urd, uwr, uex, timeout);
+    uint64_t old;
+    long ret = sigmask_wait_begin(uset, setsize, &old);
+    if (ret) return ret;
+    ret = do_select(n, urd, uwr, uex, timeout);
+    sigmask_wait_end(old, ret);
+    return ret;
 }
 
 /* The timeval flavour (musl's select() on x86_64); the remaining time is
@@ -882,6 +946,17 @@ static long sys_eventfd(unsigned int initval, int flags)
 /* Copy the contents of `f` at `off` into a freshly mapped (writable) range,
  * then apply the requested protection: MAP_PRIVATE file mappings are plain
  * copies here (no page cache, no sharing). */
+/* Code written through the data side (read from a file, relocated by ld.so)
+ * has to be made visible to instruction fetch before it runs (arm64). */
+static void sync_icache(struct task *t, uint64_t virt, size_t pages)
+{
+    for (size_t i = 0; i < pages; i++) {
+        uint64_t pa = vmm_translate_in(t->mm->pgd, virt + i * PAGE_SIZE);
+        if (pa) arch_dcache_clean(P2V(pa & ~(uint64_t)(PAGE_SIZE - 1)), PAGE_SIZE);
+    }
+    arch_icache_invalidate_all();
+}
+
 static long map_file(struct task *t, uint64_t virt, size_t pages, struct file *f, uint64_t off, int prot)
 {
     if (f->node->type != VNODE_FILE) return -EACCES;
@@ -898,6 +973,8 @@ static long map_file(struct task *t, uint64_t virt, size_t pages, struct file *f
     }
     f->pos = save;
     process_protect(t, virt, pages, prot);
+    if (prot & PROT_EXEC)
+        sync_icache(t, virt, pages);
     return 0;
 }
 
@@ -905,10 +982,9 @@ static long sys_mmap(uint64_t addr, uint64_t len, long prot, long flags, long fd
 {
     struct task *t = task_current();
     struct mm *mm = t->mm;
-    (void)addr;
     if (len == 0) return -EINVAL;
-    if (flags & MAP_FIXED) return -EINVAL;          /* not supported: we choose the address */
     if (off & 0xFFF) return -EINVAL;
+    if ((flags & MAP_FIXED) && (addr & 0xFFF)) return -EINVAL;
 
     struct file *f = NULL;
     if (!(flags & MAP_ANONYMOUS)) {
@@ -923,14 +999,30 @@ static long sys_mmap(uint64_t addr, uint64_t len, long prot, long flags, long fd
     }
 
     size_t pages = PAGE_ALIGN_UP(len) / PAGE_SIZE;
-    spin_lock(&mm->lock);
-    uint64_t virt = mm->mmap_next;
-    if (virt + pages * PAGE_SIZE > USER_STACK_TOP - USER_STACK_MAX - PAGE_SIZE) {
+    uint64_t virt;
+    if (flags & MAP_FIXED) {
+        /* Exactly here, replacing whatever was: how ld.so lays a library's
+         * segments into the span its first mapping reserved. */
+        virt = addr;
+        uint64_t end = virt + pages * PAGE_SIZE;
+        if (virt < USER_BASE || end < virt || end > USER_STACK_TOP - USER_STACK_MAX - PAGE_SIZE)
+            return -ENOMEM;
+        process_unmap(t, virt, pages);
+        vmm_flush_range(virt, pages);
+        spin_lock(&mm->lock);
+        if (virt >= USER_MMAP_BASE && end + PAGE_SIZE > mm->mmap_next)
+            mm->mmap_next = end + PAGE_SIZE;                 /* keep later bump allocations clear of it */
         spin_unlock(&mm->lock);
-        return -ENOMEM;
+    } else {
+        spin_lock(&mm->lock);
+        virt = mm->mmap_next;
+        if (virt + pages * PAGE_SIZE > USER_STACK_TOP - USER_STACK_MAX - PAGE_SIZE) {
+            spin_unlock(&mm->lock);
+            return -ENOMEM;
+        }
+        mm->mmap_next = virt + pages * PAGE_SIZE + PAGE_SIZE;    /* guard page between mappings */
+        spin_unlock(&mm->lock);
     }
-    mm->mmap_next = virt + pages * PAGE_SIZE + PAGE_SIZE;    /* guard page between mappings */
-    spin_unlock(&mm->lock);
     long rc = 0;
     if (f) {
         if (f->node->type == VNODE_DEV && f->node->dev && f->node->dev->mmap)
@@ -953,6 +1045,8 @@ static long sys_mprotect(uint64_t addr, uint64_t len, long prot)
     if (addr < USER_BASE || addr + len > USER_END) return -ENOMEM;
     if (process_protect(task_current(), addr, PAGE_ALIGN_UP(len) / PAGE_SIZE, (int)prot) != 0)
         return -ENOMEM;
+    if (prot & PROT_EXEC)
+        sync_icache(task_current(), addr, PAGE_ALIGN_UP(len) / PAGE_SIZE);
     return 0;
 }
 
@@ -963,6 +1057,57 @@ static long sys_munmap(uint64_t addr, uint64_t len)
     process_unmap(task_current(), addr, PAGE_ALIGN_UP(len) / PAGE_SIZE);
     vmm_flush_range(addr, PAGE_ALIGN_UP(len) / PAGE_SIZE);
     return 0;
+}
+
+/* mremap, as far as sic's flat mapping model allows. What callers depend on:
+ *  - an old range that is not mapped fails with EFAULT, not ENOMEM. musl's
+ *    pthread_getattr_np finds the main thread's stack by growing one page at a
+ *    time downwards until it gets something other than ENOMEM (CPython calls it
+ *    at startup); the whole stack region counts as mapped, since it grows on
+ *    demand up to USER_STACK_MAX;
+ *  - shrinking works in place;
+ *  - growing in place is not possible (mappings sit back to back with guard
+ *    pages), so it is ENOMEM unless MREMAP_MAYMOVE allows a new mapping, the
+ *    contents copied over (realloc of a large block). */
+#define MREMAP_MAYMOVE 1
+#define MREMAP_FIXED   2
+
+static int user_page_mapped(struct task *t, uint64_t page)
+{
+    if (page >= USER_STACK_TOP - USER_STACK_MAX && page < USER_STACK_TOP)
+        return 1;
+    return vmm_translate_in(t->mm->pgd, page) != 0;
+}
+
+static long sys_mremap(uint64_t old, uint64_t old_len, uint64_t new_len, long flags)
+{
+    struct task *t = task_current();
+    if ((old & 0xFFF) || !new_len || (flags & ~(MREMAP_MAYMOVE | MREMAP_FIXED))) return -EINVAL;
+    if (flags & MREMAP_FIXED) return -EINVAL;           /* not supported: we choose addresses */
+    old_len = PAGE_ALIGN_UP(old_len);
+    new_len = PAGE_ALIGN_UP(new_len);
+    if (old < USER_BASE || old_len > USER_END - old || !old_len) return -EFAULT;
+    for (uint64_t p = old; p < old + old_len; p += PAGE_SIZE)
+        if (!user_page_mapped(t, p)) return -EFAULT;
+
+    if (new_len <= old_len) {
+        if (new_len < old_len) {
+            process_unmap(t, old + new_len, (old_len - new_len) / PAGE_SIZE);
+            vmm_flush_range(old + new_len, (old_len - new_len) / PAGE_SIZE);
+        }
+        return (long)old;
+    }
+    if (!(flags & MREMAP_MAYMOVE))
+        return -ENOMEM;
+    /* Only plain memory moves: the stack region and device mappings stay put. */
+    if (old >= USER_STACK_TOP - USER_STACK_MAX) return -ENOMEM;
+    for (uint64_t p = old; p < old + old_len; p += PAGE_SIZE)
+        if (!vmm_translate_in(t->mm->pgd, p)) return -EFAULT;
+    long nw = sys_mmap(0, new_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (nw < 0) return nw;
+    memcpy((void *)(uintptr_t)nw, (const void *)(uintptr_t)old, old_len);
+    sys_munmap(old, old_len);
+    return nw;
 }
 
 static long sys_brk(uint64_t addr)
@@ -1226,6 +1371,32 @@ static long sys_nanosleep(uint64_t ureq, long flags, long clk)
     return 0;
 }
 
+static long sys_sysinfo(uint64_t ubuf)
+{
+    struct abi_sysinfo {                    /* Linux's struct sysinfo (LP64) */
+        int64_t  uptime;
+        uint64_t loads[3];                  /* fixed point, 1 << 16 */
+        uint64_t totalram, freeram, sharedram, bufferram, totalswap, freeswap;
+        uint16_t procs, pad;
+        uint64_t totalhigh, freehigh;
+        uint32_t mem_unit;
+        char     reserved[4];
+    };
+    if (!user_ok(ubuf, sizeof(struct abi_sysinfo))) return -EFAULT;
+    struct abi_sysinfo *si = (void *)ubuf;
+    memset(si, 0, sizeof(*si));
+    unsigned long avg[3];
+    sched_loadavg(avg);
+    for (int i = 0; i < 3; i++) si->loads[i] = (uint64_t)avg[i] << 5;   /* FSHIFT 11 -> 16 */
+    uint64_t total = pmm_total_pages(), used = pmm_used_pages();
+    si->uptime = (int64_t)(timer_ms() / 1000);
+    si->totalram = total * PAGE_SIZE;
+    si->freeram = total > used ? (total - used) * PAGE_SIZE : 0;
+    si->procs = (uint16_t)sched_nr_running();
+    si->mem_unit = 1;
+    return 0;
+}
+
 static long sys_uname(uint64_t ubuf)
 {
     if (!user_ok(ubuf, sizeof(struct abi_utsname))) return -EFAULT;
@@ -1312,6 +1483,7 @@ int syscall_dispatch(struct syscall_frame *f)
         if (a2 && user_ok(a2, 16)) { ((struct abi_timespec *)a2)->tv_sec = 0; ((struct abi_timespec *)a2)->tv_nsec = 1000000; }
         ret = 0; break;
     case SYS_uname:         ret = sys_uname(a1); break;
+    case SYS_sysinfo:       ret = sys_sysinfo(a1); break;
     case SYS_getrandom:     ret = sys_getrandom(a1, a2); break;
 
     /* files */
@@ -1354,6 +1526,8 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_stat:          ret = sys_newfstatat(AT_FDCWD, a1, a2, 0); break;
     case SYS_lstat:         ret = sys_newfstatat(AT_FDCWD, a1, a2, AT_SYMLINK_NOFOLLOW); break;
     case SYS_fstat:         ret = sys_fstat((long)a1, a2); break;
+    case SYS_statfs:        ret = sys_statfs(a1, a2); break;
+    case SYS_fstatfs:       ret = sys_fstatfs((long)a1, a2); break;
     case SYS_newfstatat:    ret = sys_newfstatat((long)a1, a2, a3, (long)a4); break;
     case SYS_getdents64:    ret = sys_getdents64((long)a1, a2, a3); break;
     case SYS_mkdir:         ret = path_op(AT_FDCWD, a1, 0); break;
@@ -1406,8 +1580,8 @@ int syscall_dispatch(struct syscall_frame *f)
         break;
     }
     case SYS_poll:          ret = sys_poll(a1, (long)a2, (long)(int)a3); break;
-    case SYS_ppoll:         ret = sys_ppoll(a1, (long)a2, a3); break;
-    case SYS_pselect6:      ret = sys_pselect6((long)a1, a2, a3, a4, a5); break;
+    case SYS_ppoll:         ret = sys_ppoll(a1, (long)a2, a3, a4, a5); break;
+    case SYS_pselect6:      ret = sys_pselect6((long)a1, a2, a3, a4, a5, a6); break;
     case SYS_select:        ret = sys_select((long)a1, a2, a3, a4, a5); break;
 
 #ifdef CONFIG_NET
@@ -1449,7 +1623,7 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_mprotect:      ret = sys_mprotect(a1, a2, (long)a3); break;
     case SYS_madvise: case SYS_msync:
         ret = 0; break;
-    case SYS_mremap:        ret = -ENOMEM; break;
+    case SYS_mremap:        ret = sys_mremap(a1, a2, a3, (long)a4); break;
 
 #ifdef CONFIG_SIGNALS
     case SYS_rt_sigaction:   ret = sys_rt_sigaction((int)a1, a2, a3, a4); break;

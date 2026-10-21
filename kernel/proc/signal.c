@@ -184,6 +184,12 @@ static void deliver(struct sigregs *r, uint64_t fault_addr)
         if (setup_frame(t, sig, fault_addr, r))
             return;                     /* one handler at a time; the rest wait for sigreturn */
     }
+    /* No handler frame took the mask saved by sigsuspend/pselect/ppoll (the
+     * signal was ignored): put it back here, or the temporary one would stay. */
+    if (t->sig_saved_mask_valid) {
+        t->sig_blocked = t->sig_saved_mask & ~UNCATCHABLE;
+        t->sig_saved_mask_valid = 0;
+    }
 }
 
 void signal_deliver_syscall(struct syscall_frame *f)
@@ -312,6 +318,30 @@ long sys_rt_sigsuspend(uint64_t uset, uint64_t setsize)
     t->sig_saved_mask = old;
     t->sig_saved_mask_valid = 1;
     return -EINTR;
+}
+
+/* pselect6 and ppoll wait with a temporary mask, swapped in atomically with
+ * the wait: the usual way to sleep until a blocked SIGCHLD arrives (make's
+ * job server). As with sigsuspend, an interrupted wait leaves the original
+ * mask for the handler frame to restore; any other outcome restores it now. */
+long sigmask_wait_begin(uint64_t uset, uint64_t setsize, uint64_t *old)
+{
+    struct task *t = task_current();
+    if (setsize != 8 || !user_range_ok(uset, 8)) return -EINVAL;
+    *old = t->sig_blocked;
+    t->sig_blocked = sigset_get(uset) & ~UNCATCHABLE;
+    return 0;
+}
+
+void sigmask_wait_end(uint64_t old, long ret)
+{
+    struct task *t = task_current();
+    if (ret == -EINTR) {
+        t->sig_saved_mask = old;
+        t->sig_saved_mask_valid = 1;
+    } else {
+        t->sig_blocked = old;
+    }
 }
 
 long sys_rt_sigreturn(struct syscall_frame *f)

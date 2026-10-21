@@ -61,8 +61,19 @@ static void fatal(struct pt_regs *r, const char *why)
 static void kill_user(struct pt_regs *r, int sig, uint64_t addr)
 {
 #ifdef CONFIG_SIGNALS
-    if (signal_fault((struct interrupt_frame *)r, sig, addr))
+    uint64_t pc = r->pc, lr = r->x[30], fp = r->x[29];
+    if (signal_fault((struct interrupt_frame *)r, sig, addr)) {    /* the program handles it: still say where */
+        kprintf("[%s (pid %u) signal %d: %s at pc=%llx, addr=%llx, lr=%llx, frames:", task_current()->name, task_current()->id,
+                sig, ec_name(ESR_EC(r->esr)), pc, addr, lr);
+        for (int i = 0; i < 12 && fp && !(fp & 7) && user_ok(fp, 16); i++) {   /* the frame-pointer chain */
+            const uint64_t *f = (const uint64_t *)(uintptr_t)fp;
+            kprintf(" %llx", f[1]);
+            if (f[0] <= fp) break;
+            fp = f[0];
+        }
+        kprintf("]\n");
         return;
+    }
 #endif
     kprintf("[%s (pid %u) killed: %s at pc=%llx, addr=%llx, esr=%llx]\n",
             task_current()->name, task_current()->id, ec_name(ESR_EC(r->esr)), r->pc, addr, r->esr);

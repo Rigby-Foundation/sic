@@ -1,7 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
 /* AF_UNIX stream sockets: a pair of ring buffers between two processes on
- * this machine, no packets, no checksums, no windows. Names are kept in a
+ * this machine, no packets, no checksums, no windows. socketpair() also
+ * makes SOCK_SEQPACKET pairs (Rust's std reports exec failures over one):
+ * the same rings, each message stored behind a 4-byte length so it is
+ * received whole and alone. Names are kept in a
  * kernel table rather than as filesystem nodes: bind() claims the path,
  * closing the socket gives it back, so there are no stale socket files.
  * net_lock and the socket's waitqueue serve here as for the IP sockets. */
@@ -22,6 +25,7 @@ struct unix_pcb {
     uint8_t *rx;                            /* what the peer sent us: a ring */
     uint32_t head, tail;                    /* read at head, write at tail, in bytes */
     int eof;                                /* the peer will not send more */
+    int seqpacket;                          /* message-preserving (SOCK_SEQPACKET) */
     struct socket *sock;
     struct socket *next_bound;
 };
@@ -30,6 +34,22 @@ static struct socket *bound;                /* named sockets (net_lock) */
 
 static uint32_t rx_count(struct unix_pcb *u) { return u->tail - u->head; }
 static uint32_t rx_space(struct unix_pcb *u) { return UNIX_BUF_SIZE - rx_count(u); }
+
+/* Ring access by byte offset from head/tail; the ring is UNIX_BUF_SIZE long. */
+static void ring_put(struct unix_pcb *d, const void *src, uint32_t n)
+{
+    uint32_t off = d->tail % UNIX_BUF_SIZE, first = UNIX_BUF_SIZE - off < n ? UNIX_BUF_SIZE - off : n;
+    memcpy(d->rx + off, src, first);
+    if (n > first) memcpy(d->rx, (const uint8_t *)src + first, n - first);
+    d->tail += n;
+}
+
+static void ring_peek(struct unix_pcb *u, uint32_t skip, void *dst, uint32_t n)
+{
+    uint32_t off = (u->head + skip) % UNIX_BUF_SIZE, first = UNIX_BUF_SIZE - off < n ? UNIX_BUF_SIZE - off : n;
+    memcpy(dst, u->rx + off, first);
+    if (n > first) memcpy((uint8_t *)dst + first, u->rx, n - first);
+}
 
 static struct unix_pcb *pcb_new(struct socket *s)
 {
@@ -67,7 +87,8 @@ long unix_socket(int type, int flags)
  * The fds go to sv[0] and sv[1] (a user pointer, checked by the caller). */
 long unix_socketpair(int type, int flags, int *sv)
 {
-    if ((type & SOCK_TYPE_MASK) != SOCK_STREAM) return -EPROTONOSUPPORT;
+    int kind = type & SOCK_TYPE_MASK;
+    if (kind != SOCK_STREAM && kind != SOCK_SEQPACKET) return -EPROTONOSUPPORT;
     struct socket *s[2] = { sock_create(SOCK_STREAM, 0), sock_create(SOCK_STREAM, 0) };
     struct file *f[2] = { NULL, NULL };
     int fd[2] = { -1, -1 };
@@ -75,6 +96,7 @@ long unix_socketpair(int type, int flags, int *sv)
         if (!s[i] || !pcb_new(s[i]) || pcb_rx_alloc(s[i]->un)) goto fail;
         s[i]->domain = AF_UNIX;
         s[i]->connected = 1;
+        s[i]->un->seqpacket = kind == SOCK_SEQPACKET;
     }
     s[0]->un->peer = s[1];
     s[1]->un->peer = s[0];
@@ -235,9 +257,38 @@ static int wait_for(struct socket *s, int want, long timeo_ms)
 
 static int nonblocking(struct file *f, int flags) { return (f->flags & O_NONBLOCK) || (flags & MSG_DONTWAIT); }
 
+static long unix_send_msg(struct file *f, struct socket *s, const void *buf, size_t len, int flags)
+{
+    if (len > UNIX_BUF_SIZE - 4) return -EMSGSIZE;
+    for (;;) {
+        spin_lock(&net_lock);
+        struct socket *peer = s->un->peer;
+        if (!peer || s->shut_wr) {
+            spin_unlock(&net_lock);
+            if (!(flags & MSG_NOSIGNAL)) task_send_signal(task_current(), 13);
+            return -EPIPE;
+        }
+        struct unix_pcb *d = peer->un;
+        if (rx_space(d) >= len + 4) {
+            uint32_t n = (uint32_t)len;
+            ring_put(d, &n, 4);
+            ring_put(d, buf, n);
+            waitqueue_wake_all(&peer->wq);
+            spin_unlock(&net_lock);
+            return (long)len;
+        }
+        spin_unlock(&net_lock);
+        if (nonblocking(f, flags)) return -EAGAIN;
+        int w = wait_for(s, POLLOUT | POLLHUP, s->sndtimeo_ms);
+        if (w) return w;
+    }
+}
+
 long unix_send(struct file *f, const void *buf, size_t len, int flags)
 {
     struct socket *s = f->node->priv;
+    if (s->un->seqpacket)
+        return unix_send_msg(f, s, buf, len, flags);
     const uint8_t *p = buf;
     size_t done = 0;
     while (done < len) {
@@ -276,7 +327,17 @@ long unix_recv(struct file *f, void *buf, size_t len, int flags)
         spin_lock(&net_lock);
         uint32_t avail = rx_count(u), n = len < avail ? (uint32_t)len : avail;
         long r;
-        if (n) {
+        if (u->seqpacket && avail >= 4) {
+            uint32_t mlen;
+            ring_peek(u, 0, &mlen, 4);
+            n = len < mlen ? (uint32_t)len : mlen;
+            if (n) ring_peek(u, 4, buf, n);
+            if (!(flags & MSG_PEEK)) {
+                u->head += 4 + mlen;                                /* the whole message */
+                if (u->peer) waitqueue_wake_all(&u->peer->wq);
+            }
+            r = n;
+        } else if (n && !u->seqpacket) {
             uint32_t off = u->head % UNIX_BUF_SIZE, first = UNIX_BUF_SIZE - off < n ? UNIX_BUF_SIZE - off : n;
             memcpy(buf, u->rx + off, first);
             if (n > first) memcpy((uint8_t *)buf + first, u->rx, n - first);

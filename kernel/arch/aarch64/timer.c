@@ -51,6 +51,7 @@ static void timer_irq(struct interrupt_frame *f)
     if (this_cpu()->index == 0)
         ticks++;
     prof_tick(f);
+    sched_account(FRAME_FROM_USER(f));         /* user/system/idle time for /proc */
     sched_tick();                               /* the switch happens after the acknowledge, in gic.c */
 }
 

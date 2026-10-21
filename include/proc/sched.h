@@ -26,6 +26,8 @@ struct task {
     uint64_t wake_at;           /* tick to wake at while sleeping */
     uint32_t slice_left;        /* ticks left in this quantum */
     uint64_t runtime;           /* ticks spent running */
+    uint64_t utime, stime;      /* of those: ticks in user mode, in the kernel (/proc) */
+    uint64_t start_tick;        /* when it was started (/proc/<pid>/stat) */
     int      is_user;
     int      exit_code;
     uint64_t user_rip, user_rsp; /* initial user context for processes */
@@ -72,7 +74,28 @@ void         task_start(struct task *t);
 struct task *task_current(void);
 int          sched_started(void);       /* tasks may sleep (past sched_init) */
 int          arch_task_backtrace(const struct task *t, uint64_t *pcs, int max);   /* a task that is switched out */
-void         sched_dump_request(void);  /* sched_dump with call chains, from the idle loop (any context) */
+void         sched_dump_request(void);
+
+/* Accounting and introspection for /proc and sysinfo(). */
+struct vnode;
+void         sched_account(int user_mode);  /* every timer tick, on every CPU */
+struct proc_info {
+    uint32_t pid, ppid;                     /* process (thread group) and parent */
+    char     name[24];
+    char     state;                         /* R S D T Z, as Linux reports it */
+    uint64_t utime, stime, start_tick;      /* summed over the process's threads */
+    uint32_t threads;
+};
+int          sched_proc_list(struct proc_info *out, int max);   /* processes, newest first */
+int          sched_proc_get(uint32_t pid, struct proc_info *out); /* 0, or -1 if gone */
+struct mm   *sched_proc_mm(uint32_t pid);   /* the process's mm, referenced (mm_put it), or NULL */
+int          sched_vnode_is_cwd(const struct vnode *n);           /* some task's working directory */
+struct cpu_times { uint64_t user, system, idle; };              /* ticks */
+void         sched_cpu_times(struct cpu_times *out, int ncpu);
+void         sched_loadavg(unsigned long avg[3]);              /* fixed point, 11 fraction bits */
+int          sched_nr_running(void);
+uint32_t     sched_last_pid(void);
+uint64_t     sched_forks(void);  /* sched_dump with call chains, from the idle loop (any context) */
 
 void task_yield(void);
 void task_sleep_ms(uint64_t ms);
