@@ -92,6 +92,7 @@ static int up, has_virgl;
 static void virgl_init(void);
 static uint32_t next_res_id = 2, next_ctx_id = 1;
 static uint32_t capset_id, capset_version, capset_size;
+static uint8_t host_caps[2048]; static int host_caps_ok;   /* the capset, fetched once (gpu_take held) */
 /* One command at a time (the present thread, FBIOPRESENT, /dev/gpu0), and
  * the waiting is sleeping, not spinning: a GL frame's readback or a whole
  * screen's upload takes the host milliseconds, and a spinlock around that
@@ -515,8 +516,63 @@ static struct gpu_res *res_find(struct gpu_file *g, uint32_t id)
     return NULL;
 }
 
+/* The host's capset, once: GET_CAPSET answers from it, and resource creation
+ * checks requests against it. Called with gpu_take held. */
+static int fetch_caps_locked(void)
+{
+    if (host_caps_ok) return 0;
+    if (capset_size > 2048 - sizeof(struct gpu_hdr)) return -EINVAL;     /* the response must fit the command buffer */
+    struct gpu_get_capset *c = (void *)cmdbuf;
+    hdr(c, CMD_GET_CAPSET);
+    c->capset_id = htole32(capset_id); c->capset_version = htole32(capset_version);
+    if (cmd(sizeof *c) != RESP_OK_CAPSET) return -EIO;
+    memcpy(host_caps, cmdbuf + 2048 + sizeof(struct gpu_hdr), capset_size);
+    host_caps_ok = 1;
+    return 0;
+}
+
+/* virgl capset (struct virgl_caps_v2) offsets: the sampler, render and
+ * depth-stencil format masks of v1, and v2's multisample formats; each mask
+ * is 512 bits. */
+#define CAPS_SAMPLER_MASK 4
+#define CAPS_RENDER_MASK 68
+#define CAPS_DS_MASK 132
+#define CAPS_MS_MASK 768
+#define CAPS_MASK_BITS 512
+
+static int caps_bit(uint32_t off, uint32_t fmt)
+{
+    if (off + CAPS_MASK_BITS / 8 > capset_size || fmt >= CAPS_MASK_BITS) return 0;
+    uint32_t w;
+    memcpy(&w, host_caps + off + fmt / 32 * 4, 4);
+    return (le32toh(w) >> (fmt % 32)) & 1;
+}
+
+/* What virglrenderer would refuse: QEMU (11.0) ignores its answer to
+ * RESOURCE_CREATE_3D and replies OK, so the program would get an id the host
+ * never made, and the first surface on it breaks the context for good.
+ * Checked here instead: a texture format the host has no use for, or
+ * multisampling a format it can't multisample. */
+static int host_accepts_locked(const struct gpu_res_create *rc)
+{
+    if (fetch_caps_locked() != 0) return 1;            /* nothing to check against */
+    if (rc->target == 0) return 1;                     /* PIPE_BUFFER: formatless */
+    if (rc->format >= CAPS_MASK_BITS) return 0;
+    int any = caps_bit(CAPS_SAMPLER_MASK, rc->format) | caps_bit(CAPS_RENDER_MASK, rc->format) | caps_bit(CAPS_DS_MASK, rc->format);
+    int known = 0;                                     /* a host that fills the masks at all */
+    for (uint32_t f = 1; f < 64 && !known; f++) known = caps_bit(CAPS_SAMPLER_MASK, f);
+    if (known && !any) return 0;
+    /* the multisample list exists when its VIRGL_FORMAT_NONE bit is set */
+    if (rc->nr_samples > 1 && caps_bit(CAPS_MS_MASK, 0) && !caps_bit(CAPS_MS_MASK, rc->format)) return 0;
+    return 1;
+}
+
 static long gpu_create_res(struct gpu_file *g, struct gpu_res_create *rc)
 {
+    gpu_take();
+    int accept = host_accepts_locked(rc);
+    gpu_give();
+    if (!accept) return -EINVAL;
     struct gpu_res *r = kzalloc(sizeof *r);
     if (!r) return -ENOMEM;
     r->id = next_res_id++;
@@ -700,14 +756,10 @@ static long gpu_dev_ioctl(struct file *f, long req, uint64_t arg)
         const struct gpu_capset *cs = (const void *)(uintptr_t)arg;
         if (cs->size < capset_size || !user_ok(cs->buf, capset_size) || capset_size > 2048 - sizeof(struct gpu_hdr)) return -EINVAL;
         gpu_take();
-        struct gpu_get_capset *c = (void *)cmdbuf;
-        hdr(c, CMD_GET_CAPSET);
-        c->capset_id = htole32(capset_id); c->capset_version = htole32(capset_version);
-        uint32_t rr = cmd(sizeof *c);
-        if (rr == RESP_OK_CAPSET)
-            memcpy((void *)(uintptr_t)cs->buf, cmdbuf + 2048 + sizeof(struct gpu_hdr), capset_size);
+        int rr = fetch_caps_locked();
+        if (rr == 0) memcpy((void *)(uintptr_t)cs->buf, host_caps, capset_size);
         gpu_give();
-        return rr == RESP_OK_CAPSET ? 0 : -EIO;
+        return rr;
     }
     default:
         return -ENOTTY;
