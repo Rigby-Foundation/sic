@@ -628,6 +628,46 @@ static long sys_fcntl(long fd, long cmd, long arg)
     return -EINVAL;
 }
 
+/* flock(2): advisory whole-file locks owned by the open file description
+ * (shared by dup and fork, released at its last close), separate from the
+ * fcntl record locks. A holder converts its lock in place; waiting is
+ * interruptible by signals. */
+extern spinlock_t flock_lock;                   /* vfs.c */
+#define LOCK_SH 1
+#define LOCK_EX 2
+#define LOCK_NB 4
+#define LOCK_UN 8
+static long sys_flock(long fd, long op)
+{
+    struct file *f = fd_get((int)fd);
+    if (!f) return -EBADF;
+    struct vnode *n = f->node;
+    if (!n) return -EINVAL;
+    int nb = (op & LOCK_NB) != 0;
+    op &= ~LOCK_NB;
+    if (op == LOCK_UN) { if (f->flock_mode) flock_drop(n, f); return 0; }
+    if (op != LOCK_SH && op != LOCK_EX) return -EINVAL;
+    for (;;) {
+        spin_lock(&flock_lock);
+        int mine_sh = f->flock_mode == LOCK_SH;
+        int ok = op == LOCK_SH ? (!n->flock_ex || n->flock_ex == f)
+                               : ((!n->flock_ex || n->flock_ex == f) && n->flock_sh == (uint32_t)mine_sh);
+        if (ok) {
+            /* drop what it held, take the new one */
+            if (f->flock_mode == LOCK_SH) n->flock_sh--;
+            else if (f->flock_mode == LOCK_EX) n->flock_ex = NULL;
+            if (op == LOCK_SH) n->flock_sh++; else n->flock_ex = f;
+            f->flock_mode = (int)op;
+            spin_unlock(&flock_lock);
+            return 0;
+        }
+        spin_unlock(&flock_lock);
+        if (nb) return -EWOULDBLOCK;
+        if (task_signal_pending(task_current())) return -EINTR;
+        task_sleep_ms(10);
+    }
+}
+
 /* `echo 1 > /proc/sysfail`: every failing system call goes to the kernel
  * log (pid, number, first arguments, -errno); 0 stops it. For finding out
  * what a ported program trips over. */
@@ -822,6 +862,215 @@ static long sys_ppoll(uint64_t ufds, long n, uint64_t uts, uint64_t usigmask, ui
     return ret;
 }
 
+/* ---- resource limits ---------------------------------------------------------------- */
+
+/* What sic has, as getrlimit sees it: the descriptor table's size, an 8 MiB
+ * main stack, no limit on the rest. Lowering a limit is accepted (nothing
+ * enforces it); raising one past what there is fails. */
+#define RLIMIT_STACK  3
+#define RLIMIT_NOFILE 7
+#define RLIM_NLIMITS  16
+#define RLIM_INFINITY (~0ULL)
+struct abi_rlimit { uint64_t cur, max; };
+
+static struct abi_rlimit rlimit_of(int res)
+{
+    if (res == RLIMIT_NOFILE) return (struct abi_rlimit){ MAX_FDS, MAX_FDS };
+    if (res == RLIMIT_STACK) return (struct abi_rlimit){ 8ULL << 20, RLIM_INFINITY };
+    return (struct abi_rlimit){ RLIM_INFINITY, RLIM_INFINITY };
+}
+
+static long sys_prlimit(long pid, int res, uint64_t unew, uint64_t uold)
+{
+    if (res < 0 || res >= RLIM_NLIMITS) return -EINVAL;
+    if (pid && pid != (long)task_current()->tgid && !task_find((uint32_t)pid)) return -ESRCH;
+    struct abi_rlimit have = rlimit_of(res);
+    if (uold) {
+        if (!user_ok(uold, sizeof have)) return -EFAULT;
+        memcpy((void *)uold, &have, sizeof have);
+    }
+    if (unew) {
+        if (!user_ok(unew, sizeof have)) return -EFAULT;
+        struct abi_rlimit n;
+        memcpy(&n, (const void *)unew, sizeof n);
+        if (n.cur > n.max) return -EINVAL;
+        if (n.max > have.max) return -EPERM;
+    }
+    return 0;
+}
+
+/* ---- epoll ----------------------------------------------------------------------- */
+
+/* An epoll instance is a file holding the descriptors it watches; waiting
+ * polls them (do_poll). Level-triggered; EPOLLET acts level-triggered too,
+ * which is what an edge-triggered user reading to EAGAIN needs; EPOLLONESHOT
+ * disarms an entry once it has been reported. Entries whose descriptor was
+ * closed (or now names another file) are dropped. */
+#if defined(__x86_64__)
+struct abi_epoll_event { uint32_t events; uint64_t data; } __attribute__((packed));
+#else
+struct abi_epoll_event { uint32_t events; uint64_t data; };
+#endif
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+#define EPOLLONESHOT (1u << 30)
+#define EPOLLET      (1u << 31)
+#define EPOLL_CLOEXEC 02000000
+
+struct epoll_item { int fd; struct file *f; uint32_t events; uint64_t data; int armed; };
+struct epoll { struct epoll_item *items; int n, cap; spinlock_t lock; };
+
+static void epoll_release(struct file *f)
+{
+    struct epoll *ep = f->node->priv;
+    kfree(ep->items);
+    kfree(ep);
+    vnode_free(f->node);
+}
+
+static int epoll_file_poll(struct file *f, struct waitqueue **wq)
+{
+    /* an epoll inside an epoll or poll: readable when something it watches is (not woken by changes) */
+    struct epoll *ep = f->node->priv;
+    *wq = NULL;
+    for (int i = 0; i < ep->n; i++) {
+        struct epoll_item *it = &ep->items[i];
+        struct file *g = fd_get(it->fd);
+        struct waitqueue *dummy;
+        if (it->armed && g == it->f && (file_poll(g, &dummy) & (it->events | POLLERR | POLLHUP))) return POLLIN;
+    }
+    return 0;
+}
+
+static const struct dev_ops epoll_dev_ops = { 0 };
+static const struct file_ops epoll_fops = { .release = epoll_release, .poll = epoll_file_poll };
+
+static long sys_epoll_create1(int flags)
+{
+    if (flags & ~EPOLL_CLOEXEC) return -EINVAL;
+    struct epoll *ep = kzalloc(sizeof *ep);
+    struct vnode *n = vnode_alloc("epoll", 5, VNODE_DEV, NULL);
+    struct file *f = kzalloc(sizeof *f);
+    if (!ep || !n || !f) { kfree(ep); kfree(n); kfree(f); return -ENOMEM; }
+    n->dev = &epoll_dev_ops;
+    n->priv = ep;
+    f->node = n; f->flags = O_RDWR; f->refs = 1; f->fops = &epoll_fops;
+    int fd = fd_alloc_from(f, 0);
+    if (fd < 0) { file_close(f); return -EMFILE; }
+    if (flags & EPOLL_CLOEXEC) task_current()->fdt->cloexec |= 1ULL << fd;
+    return fd;
+}
+
+static struct epoll *epoll_of(int epfd)
+{
+    struct file *f = fd_get(epfd);
+    return f && f->fops == &epoll_fops ? f->node->priv : NULL;
+}
+
+static long sys_epoll_ctl(int epfd, int op, int fd, uint64_t uev)
+{
+    struct epoll *ep = epoll_of(epfd);
+    if (!fd_get(epfd)) return -EBADF;
+    if (!ep) return -EINVAL;
+    struct file *f = fd_get(fd);
+    if (!f) return -EBADF;
+    if (fd == epfd) return -EINVAL;
+    struct abi_epoll_event ev = { 0, 0 };
+    if (op != EPOLL_CTL_DEL) {
+        if (!user_ok(uev, sizeof ev)) return -EFAULT;
+        memcpy(&ev, (const void *)uev, sizeof ev);
+    }
+    spin_lock(&ep->lock);
+    int k = -1;
+    for (int i = 0; i < ep->n; i++) if (ep->items[i].fd == fd && ep->items[i].f == f) { k = i; break; }
+    long rc = 0;
+    switch (op) {
+    case EPOLL_CTL_ADD:
+        if (k >= 0) { rc = -EEXIST; break; }
+        if (ep->n == ep->cap) {
+            int cap = ep->cap ? ep->cap * 2 : 8;
+            struct epoll_item *ni = krealloc(ep->items, sizeof *ni * (size_t)cap);
+            if (!ni) { rc = -ENOMEM; break; }
+            ep->items = ni; ep->cap = cap;
+        }
+        ep->items[ep->n++] = (struct epoll_item){ fd, f, ev.events, ev.data, 1 };
+        break;
+    case EPOLL_CTL_MOD:
+        if (k < 0) { rc = -ENOENT; break; }
+        ep->items[k].events = ev.events; ep->items[k].data = ev.data; ep->items[k].armed = 1;
+        break;
+    case EPOLL_CTL_DEL:
+        if (k < 0) { rc = -ENOENT; break; }
+        ep->items[k] = ep->items[--ep->n];
+        break;
+    default: rc = -EINVAL;
+    }
+    spin_unlock(&ep->lock);
+    return rc;
+}
+
+static long epoll_wait_ms(int epfd, uint64_t uevs, int maxevents, long timeout_ms)
+{
+    struct epoll *ep = epoll_of(epfd);
+    if (!fd_get(epfd)) return -EBADF;
+    if (!ep || maxevents <= 0) return -EINVAL;
+    if (!user_ok(uevs, (uint64_t)maxevents * sizeof(struct abi_epoll_event))) return -EFAULT;
+    struct abi_pollfd fds[POLL_MAX];
+    int map[POLL_MAX];
+    int n = 0;
+    spin_lock(&ep->lock);
+    for (int i = 0; i < ep->n; ) {
+        struct epoll_item *it = &ep->items[i];
+        if (fd_get(it->fd) != it->f) { ep->items[i] = ep->items[--ep->n]; continue; }   /* closed: forgotten */
+        if (it->armed && n < POLL_MAX) {
+            fds[n].fd = it->fd; fds[n].events = (int16_t)(it->events & 0xFFFF); fds[n].revents = 0;
+            map[n++] = i;
+        }
+        i++;
+    }
+    spin_unlock(&ep->lock);
+    long r = do_poll(fds, n, timeout_ms);
+    if (r <= 0) return r;
+    struct abi_epoll_event *out = (void *)uevs;
+    int cnt = 0;
+    spin_lock(&ep->lock);
+    for (int j = 0; j < n && cnt < maxevents; j++) {
+        if (!fds[j].revents || map[j] >= ep->n) continue;
+        struct epoll_item *it = &ep->items[map[j]];
+        if (it->fd != fds[j].fd) continue;               /* the list changed meanwhile */
+        uint32_t evs = (uint32_t)(uint16_t)fds[j].revents;
+        if (evs & POLLNVAL) continue;
+        struct abi_epoll_event e = { evs, it->data };
+        memcpy(&out[cnt++], &e, sizeof e);
+        if (it->events & EPOLLONESHOT) it->armed = 0;
+    }
+    spin_unlock(&ep->lock);
+    return cnt;
+}
+
+static long sys_epoll_pwait(int epfd, uint64_t uevs, int maxevents, long timeout_ms, uint64_t usigmask, uint64_t sigsetsize)
+{
+    if (!usigmask) return epoll_wait_ms(epfd, uevs, maxevents, timeout_ms);
+    uint64_t old;
+    long ret = sigmask_wait_begin(usigmask, sigsetsize, &old);
+    if (ret) return ret;
+    ret = epoll_wait_ms(epfd, uevs, maxevents, timeout_ms);
+    sigmask_wait_end(old, ret);
+    return ret;
+}
+
+static long sys_epoll_pwait2(int epfd, uint64_t uevs, int maxevents, uint64_t uts, uint64_t usigmask, uint64_t sigsetsize)
+{
+    long timeout = -1;
+    if (uts) {
+        if (!user_ok(uts, sizeof(struct abi_timespec))) return -EFAULT;
+        const struct abi_timespec *ts = (const void *)uts;
+        timeout = ts->tv_sec * 1000 + (ts->tv_nsec + 999999) / 1000000;
+    }
+    return sys_epoll_pwait(epfd, uevs, maxevents, timeout, usigmask, sigsetsize);
+}
+
 /* select on top of poll: fd_sets in, fd_sets out; timeout in ms, -1 = forever. */
 static long do_select(long n, uint64_t urd, uint64_t uwr, uint64_t uex, long timeout)
 {
@@ -993,8 +1242,8 @@ static long sys_mmap(uint64_t addr, uint64_t len, long prot, long flags, long fd
         if (f->node->type == VNODE_DEV) {
             if (!f->node->dev || !f->node->dev->mmap)
                 return -ENODEV;
-        } else {
-            if (flags & MAP_SHARED) return -ENOSYS;     /* shared file mappings need a page cache */
+        } else if ((flags & MAP_SHARED) && (prot & PROT_WRITE) && (f->flags & O_ACCMODE) != O_RDWR) {
+            return -EACCES;                             /* writing through it needs the file open for writing */
         }
     }
 
@@ -1027,8 +1276,21 @@ static long sys_mmap(uint64_t addr, uint64_t len, long prot, long flags, long fd
     if (f) {
         if (f->node->type == VNODE_DEV && f->node->dev && f->node->dev->mmap)
             rc = f->node->dev->mmap(f, virt, pages, (uint64_t)off, (int)prot);
-        else
+        else {
+            /* no page cache: a file mapping is a copy. A shared one that can be
+             * written is remembered and written back (msync, munmap, exit) */
             rc = map_file(t, virt, pages, f, (uint64_t)off, (int)prot);
+            if (rc == 0 && (flags & MAP_SHARED) && (prot & PROT_WRITE)) {
+                struct mm_shared *sh = kzalloc(sizeof *sh);
+                if (!sh) rc = -ENOMEM;
+                else {
+                    sh->virt = virt; sh->pages = pages; sh->f = file_dup(f); sh->off = (uint64_t)off;
+                    spin_lock(&mm->lock);
+                    sh->next = mm->shared; mm->shared = sh;
+                    spin_unlock(&mm->lock);
+                }
+            }
+        }
     } else {
         rc = (process_map_anon(t, virt, pages, (int)prot) != 0 ? -ENOMEM : 0);
     }
@@ -1054,6 +1316,7 @@ static long sys_munmap(uint64_t addr, uint64_t len)
 {
     if (addr & 0xFFF || !len) return -EINVAL;
     if (addr < USER_BASE || addr + len > USER_END) return -EINVAL;
+    if (task_current()->mm->shared) mm_shared_writeback(task_current()->mm, addr, PAGE_ALIGN_UP(len), 1);
     process_unmap(task_current(), addr, PAGE_ALIGN_UP(len) / PAGE_SIZE);
     vmm_flush_range(addr, PAGE_ALIGN_UP(len) / PAGE_SIZE);
     return 0;
@@ -1551,6 +1814,7 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_dup2:          ret = sys_dup3((long)a1, (long)a2, 0); break;
     case SYS_dup3:          ret = sys_dup3((long)a1, (long)a2, (long)a3); break;
     case SYS_fcntl:         ret = sys_fcntl((long)a1, (long)a2, (long)a3); break;
+    case SYS_flock:         ret = sys_flock((long)a1, (long)a2); break;
     case SYS_ioctl:         ret = sys_ioctl((long)a1, (long)a2, a3); break;
     case SYS_fsync: case SYS_fdatasync: case SYS_sync:
         ret = fd_get((long)a1) || SYSCALL_NR(f) == SYS_sync ? 0 : -EBADF;
@@ -1581,6 +1845,12 @@ int syscall_dispatch(struct syscall_frame *f)
     }
     case SYS_poll:          ret = sys_poll(a1, (long)a2, (long)(int)a3); break;
     case SYS_ppoll:         ret = sys_ppoll(a1, (long)a2, a3, a4, a5); break;
+    case SYS_epoll_create:  ret = (long)a1 <= 0 ? -EINVAL : sys_epoll_create1(0); break;
+    case SYS_epoll_create1: ret = sys_epoll_create1((int)a1); break;
+    case SYS_epoll_ctl:     ret = sys_epoll_ctl((int)a1, (int)a2, (int)a3, a4); break;
+    case SYS_epoll_wait:    ret = sys_epoll_pwait((int)a1, a2, (int)a3, (long)(int)a4, 0, 0); break;
+    case SYS_epoll_pwait:   ret = sys_epoll_pwait((int)a1, a2, (int)a3, (long)(int)a4, a5, a6); break;
+    case SYS_epoll_pwait2:  ret = sys_epoll_pwait2((int)a1, a2, (int)a3, a4, a5, a6); break;
     case SYS_pselect6:      ret = sys_pselect6((long)a1, a2, a3, a4, a5, a6); break;
     case SYS_select:        ret = sys_select((long)a1, a2, a3, a4, a5); break;
 
@@ -1621,7 +1891,10 @@ int syscall_dispatch(struct syscall_frame *f)
     case SYS_munmap:        ret = sys_munmap(a1, a2); break;
     case SYS_brk:           ret = sys_brk(a1); break;
     case SYS_mprotect:      ret = sys_mprotect(a1, a2, (long)a3); break;
-    case SYS_madvise: case SYS_msync:
+    case SYS_madvise:       ret = 0; break;
+    case SYS_msync:
+        if (a1 & 0xFFF) { ret = -EINVAL; break; }
+        if (task_current()->mm->shared) mm_shared_writeback(task_current()->mm, a1, PAGE_ALIGN_UP(a2), 0);
         ret = 0; break;
     case SYS_mremap:        ret = sys_mremap(a1, a2, a3, (long)a4); break;
 
@@ -1658,8 +1931,9 @@ int syscall_dispatch(struct syscall_frame *f)
         } else ret = -EFAULT;
         break;
     case SYS_membarrier:    ret = 0; break;
-    case SYS_prlimit64: case SYS_getrlimit: case SYS_setrlimit:
-        ret = -ENOSYS; break;
+    case SYS_getrlimit:     ret = sys_prlimit(0, (int)a1, 0, a2); break;
+    case SYS_setrlimit:     ret = sys_prlimit(0, (int)a1, a2, 0); break;
+    case SYS_prlimit64:     ret = sys_prlimit((long)a1, (int)a2, a3, a4); break;
 
     default:
         if (SYSCALL_NR(f) > SYS_sic_max)

@@ -119,21 +119,29 @@ static int submit(struct nvme *c, struct queue *q, struct sqe *cmd, uint32_t *re
     q->sq_tail = (q->sq_tail + 1) % QUEUE_DEPTH;
     doorbell_sq(c, q);
 
-    struct cqe *e = &q->cq[q->cq_head];
-    uint64_t deadline = timer_ticks() + 2000;
-    while ((le16toh(e->status) & 1) != q->phase) {
-        cpu_relax();
-        if (timer_ticks() > deadline)
-            return -1;
+    /* Only this command's completion counts: one that timed out earlier may
+     * still complete first, and taking it for ours would hand back the wrong
+     * data with no error. */
+    uint64_t deadline = timer_ticks() + 30000;
+    for (;;) {
+        struct cqe *e = &q->cq[q->cq_head];
+        while ((le16toh(e->status) & 1) != q->phase) {
+            cpu_relax();
+            if (timer_ticks() > deadline)
+                return -1;
+        }
+        int status = le16toh(e->status) >> 1;
+        uint16_t cid = le16toh(e->cid);
+        if (result && cid == cmd->cid)
+            *result = le32toh(e->result);
+        q->cq_head = (q->cq_head + 1) % QUEUE_DEPTH;
+        if (q->cq_head == 0)
+            q->phase ^= 1;
+        doorbell_cq(c, q);
+        if (cid == cmd->cid)
+            return status;
+        kprintf("nvme: late completion of command %u\n", cid);
     }
-    int status = le16toh(e->status) >> 1;
-    if (result)
-        *result = le32toh(e->result);
-    q->cq_head = (q->cq_head + 1) % QUEUE_DEPTH;
-    if (q->cq_head == 0)
-        q->phase ^= 1;
-    doorbell_cq(c, q);
-    return status;
 }
 
 static int nvme_rw(struct blkdev *d, uint64_t lba, uint32_t count, void *buf, int write)

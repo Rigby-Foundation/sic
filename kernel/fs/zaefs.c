@@ -26,13 +26,18 @@ struct zaefs {
     uint32_t sectors_per_block;
     struct cache_slot *cache;
     uint64_t block_hint, inode_hint;
+    struct zinode *inodes;          /* every inode some vnode holds */
 };
 
-/* Per-vnode private data: the in-memory copy of the inode. */
+/* The in-memory copy of an inode, shared by every vnode naming it (hard
+ * links): one copy, or a write through one name leaves the others with stale
+ * block pointers that later get written back or freed. */
 struct zinode {
     uint32_t ino;
     struct zaefs_inode di;
     int dirty;
+    int refs;
+    struct zinode *next;
 };
 
 /* ---- block cache (write-through) --------------------------------------------- */
@@ -44,6 +49,10 @@ static struct cache_slot *slot_for(struct zaefs *fs, uint64_t block)
 
 static int read_block(struct zaefs *fs, uint64_t block, void *buf)
 {
+    if (fs->sb.total_blocks && block >= fs->sb.total_blocks) {
+        kprintf("zaefs: read of block 0x%llx past the end\n", (unsigned long long)block);
+        return -1;
+    }
     struct cache_slot *s = slot_for(fs, block);
     if (!(s->valid && s->block == block)) {
         if (fs->dev->read(fs->dev, block * fs->sectors_per_block, fs->sectors_per_block, s->data) != 0)
@@ -198,12 +207,14 @@ static int inode_write(struct zaefs *fs, uint32_t ino, const struct zaefs_inode 
 static struct zaefs *fs_of(struct vnode *n) { return n->mnt->priv; }
 static struct zinode *zi_of(struct vnode *n) { return n->priv; }
 
+static void share(struct vnode *n);
+
 static int zi_flush(struct vnode *n)
 {
     struct zinode *zi = zi_of(n);
     if (!zi) return 0;
     uint64_t m = n->mtime_ms / 1000, c = n->ctime_ms / 1000;
-    if (zi->di.mtime != m || zi->di.ctime != c) { zi->di.mtime = m; zi->di.ctime = c; zi->dirty = 1; }   /* utimensat, writes */
+    if (zi->di.mtime != m || zi->di.ctime != c) { zi->di.mtime = m; zi->di.ctime = c; zi->dirty = 1; share(n); }   /* utimensat, writes */
     if (!zi->dirty) return 0;
     zi->dirty = 0;
     return inode_write(fs_of(n), zi->ino, &zi->di);
@@ -212,7 +223,24 @@ static int zi_flush(struct vnode *n)
 /* Logical block -> physical block, allocating index/data blocks if asked. */
 static int64_t bmap_indirect(struct zaefs *fs, struct zinode *zi, uint64_t lblk, int alloc, uint32_t *ptrs);
 
+/* A pointer outside the data area is damage, not a block to use. */
+static int64_t checked(struct zaefs *fs, struct zinode *zi, uint64_t lblk, int64_t b)
+{
+    if (b > 0 && ((uint64_t)b < fs->sb.data_start || (uint64_t)b >= fs->sb.total_blocks)) {
+        kprintf("zaefs: inode %u block %llu: bad pointer 0x%llx\n", zi->ino, (unsigned long long)lblk, (unsigned long long)b);
+        return -1;
+    }
+    return b;
+}
+
+static int64_t bmap1(struct zaefs *fs, struct zinode *zi, uint64_t lblk, int alloc);
+
 static int64_t bmap(struct zaefs *fs, struct zinode *zi, uint64_t lblk, int alloc)
+{
+    return checked(fs, zi, lblk, bmap1(fs, zi, lblk, alloc));
+}
+
+static int64_t bmap1(struct zaefs *fs, struct zinode *zi, uint64_t lblk, int alloc)
 {
     if (lblk < ZAEFS_NDIRECT) {
         if (!zi->di.direct[lblk] && alloc) {
@@ -222,7 +250,7 @@ static int64_t bmap(struct zaefs *fs, struct zinode *zi, uint64_t lblk, int allo
             zi->di.nblocks++;
             zi->dirty = 1;
         }
-        return zi->di.direct[lblk] ? zi->di.direct[lblk] : -1;
+        return zi->di.direct[lblk] ? (int64_t)zi->di.direct[lblk] : -1;   /* not uint32_t: a hole is -1, not block 0xffffffff */
     }
     uint32_t *ptrs = kmalloc(BS);
     if (!ptrs) return -1;
@@ -314,6 +342,56 @@ static void free_all_blocks(struct zaefs *fs, struct zinode *zi)
     zi->dirty = 1;
 }
 
+static struct zinode *zi_get(struct zaefs *fs, uint32_t ino)
+{
+    for (struct zinode *zi = fs->inodes; zi; zi = zi->next)
+        if (zi->ino == ino) { zi->refs++; return zi; }
+    struct zinode *zi = kzalloc(sizeof(*zi));
+    if (!zi) return NULL;
+    zi->ino = ino;
+    if (inode_read(fs, ino, &zi->di) != 0) { kfree(zi); return NULL; }
+    zi->refs = 1;
+    zi->next = fs->inodes;
+    fs->inodes = zi;
+    return zi;
+}
+
+/* The last vnode is gone: an inode no name links to dies with it. */
+static void zi_put(struct zaefs *fs, struct zinode *zi)
+{
+    if (--zi->refs > 0) return;
+    if (zi->di.links == 0) {
+        free_all_blocks(fs, zi);
+        free_inode(fs, zi->ino);
+    } else if (zi->dirty) {
+        inode_write(fs, zi->ino, &zi->di);
+    }
+    for (struct zinode **pp = &fs->inodes; *pp; pp = &(*pp)->next)
+        if (*pp == zi) { *pp = zi->next; break; }
+    kfree(zi);
+}
+
+/* Other names of a hard-linked inode see its size and times. */
+static void share_attrs(struct vnode *dir, struct vnode *n)
+{
+    for (struct vnode *c = dir->children; c; c = c->sibling) {
+        if (c->priv == n->priv && c != n) {
+            c->size = n->size;
+            c->mtime_ms = n->mtime_ms;
+            c->ctime_ms = n->ctime_ms;
+        }
+        if (c->type == VNODE_DIR && !c->mounted)
+            share_attrs(c, n);
+    }
+}
+
+static void share(struct vnode *n)
+{
+    struct zinode *zi = zi_of(n);
+    if (zi && zi->refs > 1 && n->mnt && n->mnt->root)
+        share_attrs(n->mnt->root, n);
+}
+
 /* ---- file data ---------------------------------------------------------------------- */
 
 static long zaefs_read(struct vnode *n, uint64_t pos, void *buf, size_t len)
@@ -361,11 +439,11 @@ static long zaefs_write(struct vnode *n, uint64_t pos, const void *buf, size_t l
         if (write_block(fs, (uint64_t)pb, blk) != 0) break;
         done += n_;
     }
-    if (pos + done > zi->di.size) {
+    if (pos + done > zi->di.size)
         zi->di.size = pos + done;
-        n->size = zi->di.size;
-    }
+    n->size = zi->di.size;
     vfs_touch(n);
+    share(n);
     zi->dirty = 1;
     zi_flush(n);
     return done ? (long)done : (len ? -1 : 0);
@@ -385,11 +463,13 @@ static int zaefs_truncate(struct vnode *n, uint64_t size)
         zi->di.size = size;
         n->size = size;
         zi->dirty = 1;
+        share(n);
         return zi_flush(n);
     }
     free_all_blocks(fs_of(n), zi);
     zi->di.size = 0;
     n->size = 0;
+    share(n);
     return zi_flush(n);
 }
 
@@ -401,14 +481,12 @@ struct dir_iter { uint8_t blk[BS]; uint64_t lblk; int64_t pb; uint32_t off; };
 static struct vnode *make_vnode(struct vnode *dir, const char *name, size_t len, uint32_t ino)
 {
     struct zaefs *fs = fs_of(dir);
-    struct zinode *zi = kzalloc(sizeof(*zi));
+    struct zinode *zi = zi_get(fs, ino);
     if (!zi) return NULL;
-    zi->ino = ino;
-    if (inode_read(fs, ino, &zi->di) != 0) { kfree(zi); return NULL; }
     enum vnode_type vt = zi->di.type == ZAEFS_TYPE_DIR ? VNODE_DIR :
                          zi->di.type == ZAEFS_TYPE_LINK ? VNODE_LINK : VNODE_FILE;
     struct vnode *n = vnode_alloc(name, len, vt, dir);
-    if (!n) { kfree(zi); return NULL; }
+    if (!n) { zi_put(fs, zi); return NULL; }
     n->ino = ino;
     n->size = zi->di.size;
     n->priv = zi;
@@ -533,18 +611,6 @@ static int dir_is_empty(struct vnode *dir)
     return 1;
 }
 
-static void sync_ino_links(struct vnode *dir, uint32_t ino, uint16_t links)
-{
-    for (struct vnode *c = dir->children; c; c = c->sibling) {
-        if (c->ino == ino && c->priv) {
-            struct zinode *zi = c->priv;
-            zi->di.links = links;
-        }
-        if (c->type == VNODE_DIR)
-            sync_ino_links(c, ino, links);
-    }
-}
-
 static struct vnode *zaefs_create(struct vnode *dir, const char *name, size_t len, enum vnode_type type)
 {
     struct zaefs *fs = fs_of(dir);
@@ -577,8 +643,6 @@ static int zaefs_link(struct vnode *dir, struct vnode *target, const char *name,
     zi->di.links++;
     zi->dirty = 1;
     zi_flush(target);
-    if (dir->mnt && dir->mnt->root)
-        sync_ino_links(dir->mnt->root, zi->ino, zi->di.links);
     if (!make_vnode(dir, name, len, zi->ino)) return -ENOMEM;
     return 0;
 }
@@ -593,8 +657,6 @@ static int zaefs_unlink(struct vnode *dir, struct vnode *n)
         zi->di.links--;
         zi->dirty = 1;
         zi_flush(n);
-        if (dir->mnt && dir->mnt->root)
-            sync_ino_links(dir->mnt->root, zi->ino, zi->di.links);
         return 0;
     }
     zi->di.links = 0;
@@ -604,14 +666,9 @@ static int zaefs_unlink(struct vnode *dir, struct vnode *n)
 
 static void zaefs_release(struct vnode *n)
 {
-    struct zaefs *fs = fs_of(n);
     struct zinode *zi = zi_of(n);
     if (!zi) return;
-    if (zi->di.links == 0) {
-        free_all_blocks(fs, zi);
-        free_inode(fs, zi->ino);
-    }
-    kfree(zi);
+    zi_put(fs_of(n), zi);
     n->priv = NULL;
 }
 
@@ -717,10 +774,8 @@ static struct vnode *zaefs_mount(struct vfs_mount *mnt, struct vnode *devnode, c
     mnt->priv = fs;
 
     struct vnode *root = vnode_alloc("", 0, VNODE_DIR, NULL);
-    struct zinode *zi = kzalloc(sizeof(*zi));
-    if (!root || !zi) { kfree(root); kfree(zi); kfree(fs->cache); kfree(fs); return NULL; }
-    zi->ino = (uint32_t)fs->sb.root_ino;
-    if (inode_read(fs, zi->ino, &zi->di) != 0) { kfree(root); kfree(zi); kfree(fs->cache); kfree(fs); return NULL; }
+    struct zinode *zi = root ? zi_get(fs, (uint32_t)fs->sb.root_ino) : NULL;
+    if (!root || !zi) { kfree(root); kfree(fs->cache); kfree(fs); return NULL; }
     root->mnt = mnt;
     root->ops = &zaefs_ops;
     root->ino = zi->ino;
@@ -740,7 +795,7 @@ static void drop_tree(struct vnode *n)
         drop_tree(c);
     }
     zi_flush(n);
-    kfree(n->priv);
+    if (n->priv) zi_put(n->mnt->priv, n->priv);
     vnode_free(n);
 }
 

@@ -581,7 +581,7 @@ static int script(struct argpack *ap, const char **path)
     struct vnode *n = vfs_lookup(task_current()->cwd, *path);
     if (!n || n->type != VNODE_FILE || !n->ops || !n->ops->read) return 0;
     char line[128];
-    long got = n->ops->read(n, 0, line, sizeof line - 1);
+    long got = vfs_pread(n, line, sizeof line - 1, 0);    /* under vfs_lock: the fs block cache is shared */
     if (got < 3 || line[0] != '#' || line[1] != '!') return 0;
     line[got] = 0;
     char *p = line + 2, *end = line;

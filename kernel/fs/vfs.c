@@ -538,11 +538,24 @@ struct file *file_dup(struct file *f)
     return f;
 }
 
+/* flock(2) state, for all files */
+spinlock_t flock_lock = SPINLOCK_INIT;
+
+void flock_drop(struct vnode *n, struct file *f)
+{
+    spin_lock(&flock_lock);
+    if (f->flock_mode == 2 && n->flock_ex == f) n->flock_ex = NULL;
+    else if (f->flock_mode == 1 && n->flock_sh) n->flock_sh--;
+    f->flock_mode = 0;
+    spin_unlock(&flock_lock);
+}
+
 void file_close(struct file *f)
 {
     if (f && __atomic_sub_fetch(&f->refs, 1, __ATOMIC_SEQ_CST) == 0) {
         struct vnode *n = f->node;
         if (n && n->lock_owner == f) n->lock_owner = NULL;   /* a record lock dies with its file */
+        if (n && f->flock_mode) flock_drop(n, f);           /* and so does a flock(2) one */
         if (f->fops && f->fops->release) {
             f->fops->release(f);
         } else {

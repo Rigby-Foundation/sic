@@ -66,6 +66,8 @@ struct vnode {
     struct vnode *mounted;          /* a filesystem's root mounted on this directory */
     struct file *lock_owner;        /* fcntl record lock: one whole-file lock per file, held by an open file */
     uint32_t lock_pid;
+    struct file *flock_ex;          /* flock(2): the open file holding the exclusive lock */
+    uint32_t flock_sh;              /* ... or how many hold shared ones */
     struct vnode *mountpoint;       /* for a mounted root: the directory it sits on */
     char    *link;                  /* VNODE_LINK: the path it points to (kmalloc'd) */
     uint64_t mtime_ms, ctime_ms;    /* last change of the contents / of anything; ms since 1970 */
@@ -112,7 +114,12 @@ struct file {
     void    *priv;                  /* generic per-open private state */
     void    *priv_gpu;              /* a device's per-open state (virtio-gpu contexts, shm segments) */
     uint32_t fb_gen;                /* /dev/fb0: the mode generation this file last read */
+    int      flock_mode;            /* the flock(2) lock this open file holds: 0, LOCK_SH or LOCK_EX */
 };
+
+/* flock(2): drop what an open file holds (vfs.c) */
+void flock_drop(struct vnode *n, struct file *f);
+
 
 struct stat {
     uint32_t type;      /* enum vnode_type */
